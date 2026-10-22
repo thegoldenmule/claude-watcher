@@ -538,28 +538,48 @@ private let transcriptSample = """
     #expect(!ClaudeHome.hasMarkedLine("no marker\n"))
 }
 
-@Test func claudeHomeProbeRunnerIsBounded() {
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "echo junk >&2; printf 'a\\nb'"]) == "a\nb")
-    // stdin is /dev/null, not our stdin.
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "cat"]) == "")
-    let start = Date()
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "printf x; sleep 30"], timeout: 0.3) == nil)
-    // A backgrounded job inheriting stdout doesn't hold the probe until the timeout: once the
-    // shell exits, what it printed is used (and the job is killed with the process group).
-    // (A long timeout, so falling back to it would fail the elapsed-time check.)
-    let bgStart = Date()
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "sleep 10 & printf y"], timeout: 8) == "y")
+@Test func claudeHomeProbeRunnerIsBounded() async throws {
+    // The probes block (~1 s in all), so they run on a dedicated thread, not the cooperative pool.
+    struct Results: Sendable {
+        var plain, stdin, timedOut, bgPlain, bgMarked, acceptedAtTimeout, partialAtTimeout, missing: String?
+        var bgElapsed, totalElapsed: TimeInterval
+    }
     let m = ClaudeHome.marker
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "echo motd; sleep 10 & printf '\\n%s%s\\n' '\(m)' /cfg"],
-                           timeout: 8).flatMap(ClaudeHome.markedValue) == "/cfg")
-    #expect(Date().timeIntervalSince(bgStart) < 6)
-    // At the timeout, output already holding a complete marker line is accepted; else nil.
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "printf '%s/cfg\\n' '\(m)'; sleep 30"], timeout: 0.3,
-                           acceptOnTimeout: ClaudeHome.hasMarkedLine).flatMap(ClaudeHome.markedValue) == "/cfg")
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "printf '%s/cfg' '\(m)'; sleep 30"], timeout: 0.3,
-                           acceptOnTimeout: ClaudeHome.hasMarkedLine) == nil)
-    #expect(Date().timeIntervalSince(start) < 5)
-    #expect(ClaudeHome.run("/nonexistent/shell", []) == nil)
+    let r = try await onDedicatedThread { () -> Results in
+        let plain = ClaudeHome.run("/bin/sh", ["-c", "echo junk >&2; printf 'a\\nb'"])
+        // stdin is /dev/null, not our stdin.
+        let stdin = ClaudeHome.run("/bin/sh", ["-c", "cat"])
+        let start = Date()
+        let timedOut = ClaudeHome.run("/bin/sh", ["-c", "printf x; sleep 30"], timeout: 0.3)
+        // A backgrounded job inheriting stdout doesn't hold the probe until the timeout: once the
+        // shell exits, what it printed is used (and the job is killed with the process group).
+        // (A long timeout, so falling back to it would fail the elapsed-time check.)
+        let bgStart = Date()
+        let bgPlain = ClaudeHome.run("/bin/sh", ["-c", "sleep 10 & printf y"], timeout: 8)
+        let bgMarked = ClaudeHome.run(
+            "/bin/sh", ["-c", "echo motd; sleep 10 & printf '\\n%s%s\\n' '\(m)' /cfg"], timeout: 8)
+        let bgElapsed = Date().timeIntervalSince(bgStart)
+        // At the timeout, output already holding a complete marker line is accepted; else nil.
+        let accepted = ClaudeHome.run("/bin/sh", ["-c", "printf '%s/cfg\\n' '\(m)'; sleep 30"], timeout: 0.3,
+                                      acceptOnTimeout: ClaudeHome.hasMarkedLine)
+        let partial = ClaudeHome.run("/bin/sh", ["-c", "printf '%s/cfg' '\(m)'; sleep 30"], timeout: 0.3,
+                                     acceptOnTimeout: ClaudeHome.hasMarkedLine)
+        let totalElapsed = Date().timeIntervalSince(start)
+        let missing = ClaudeHome.run("/nonexistent/shell", [])
+        return Results(plain: plain, stdin: stdin, timedOut: timedOut, bgPlain: bgPlain, bgMarked: bgMarked,
+                       acceptedAtTimeout: accepted, partialAtTimeout: partial, missing: missing,
+                       bgElapsed: bgElapsed, totalElapsed: totalElapsed)
+    }
+    #expect(r.plain == "a\nb")
+    #expect(r.stdin == "")
+    #expect(r.timedOut == nil)
+    #expect(r.bgPlain == "y")
+    #expect(r.bgMarked.flatMap(ClaudeHome.markedValue) == "/cfg")
+    #expect(r.bgElapsed < 6)
+    #expect(r.acceptedAtTimeout.flatMap(ClaudeHome.markedValue) == "/cfg")
+    #expect(r.partialAtTimeout == nil)
+    #expect(r.totalElapsed < 5)
+    #expect(r.missing == nil)
 }
 
 @Test func asyncClaudeHomeMatchesCachedValue() async {
@@ -628,14 +648,18 @@ private let transcriptSample = """
 // MARK: - Live check (CW_LIVE=1 swift test --filter liveDiscovery)
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["CW_LIVE"] == "1"))
-func liveDiscovery() async {
-    let probeStart = Date()
-    let launchctl = ClaudeHome.launchctlValue(), shell = ClaudeHome.shellValue()
+func liveDiscovery() async throws {
+    // The probes block (up to ~4 s), so they run on a dedicated thread, not the cooperative pool.
+    let (launchctl, shell, probeMs) = try await onDedicatedThread { () -> (String?, String?, Int) in
+        let probeStart = Date()
+        let launchctl = ClaudeHome.launchctlValue(), shell = ClaudeHome.shellValue()
+        return (launchctl, shell, Int(Date().timeIntervalSince(probeStart) * 1000))
+    }
+    let claudeHome = await SessionDiscovery.resolvedClaudeHome()
     print("LIVE: launchctl=\(launchctl.debugDescription) shell=\(shell.debugDescription) "
-          + "probes \(Int(Date().timeIntervalSince(probeStart) * 1000)) ms; "
-          + "defaultClaudeHome=\(SessionDiscovery.defaultClaudeHome.path)")
+          + "probes \(probeMs) ms; defaultClaudeHome=\(claudeHome.path)")
     let discovery = SessionDiscovery(
-        claudeHome: SessionDiscovery.defaultClaudeHome, hookStateDirectory: HookStateStore.defaultDirectory)
+        claudeHome: claudeHome, hookStateDirectory: HookStateStore.defaultDirectory)
     let start = Date()
     let sessions = await discovery.scan()
     let firstMs = Date().timeIntervalSince(start) * 1000

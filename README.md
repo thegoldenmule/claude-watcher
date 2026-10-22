@@ -5,6 +5,8 @@
 A macOS auto-hiding left-edge sidebar that lists your running [Claude Code](https://claude.com/claude-code)
 sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/desktops.
 
+<img src="docs/screenshot.png" width="299" alt="The ClaudeWatcher sidebar listing Claude Code sessions with their status, folder and git branch">
+
 ## Features
 
 - Auto-hiding bar on the left screen edge, revealed by moving the pointer there (like the Dock).

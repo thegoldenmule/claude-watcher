@@ -1,83 +1,46 @@
 import AppKit
 
-/// Talks to Ghostty's AppleScript dictionary (Ghostty ≥ 1.3: windows → tabs → terminals).
-public struct GhosttyScripting: Sendable {
-    public let runner: any AppleScriptExecuting
-    static let app = "Ghostty"
+// MARK: - Resolver strategies
 
-    public init(runner: any AppleScriptExecuting = AppleScriptRunner.shared) {
-        self.runner = runner
-    }
-
-    /// AppleScript that returns every terminal as `id US name US wd RS …` in one round of
-    /// bulk property fetches (3 Apple events regardless of terminal count).
-    public static let listScript = """
-        with timeout of 3 seconds
-          tell application id "\(AppActivation.ghosttyBundleID)"
-            set {ids, nms, wds} to {id, name, working directory} of every terminal
-          end tell
-        end timeout
-        if (count of ids) is not (count of nms) or (count of ids) is not (count of wds) then error "terminal list changed while reading" number -1700
-        set US to character id 31
-        set RS to character id 30
-        set out to ""
-        repeat with i from 1 to count of ids
-          set n to ""
-          set d to ""
-          try
-            set n to (item i of nms) as text
-          end try
-          try
-            set d to (item i of wds) as text
-          end try
-          set out to out & ((item i of ids) as text) & US & n & US & d & RS
-        end repeat
-        return out
-        """
-
-    /// AppleScript that focuses `terminal id <id>`, returning "ok" or "notfound".
-    public static func focusScript(terminalID: String) -> String {
-        let ref = "terminal id \(AppleScriptSource.quoted(terminalID))"
-        return """
-            with timeout of 3 seconds
-              tell application id "\(AppActivation.ghosttyBundleID)"
-                if not (exists \(ref)) then return "notfound"
-                focus \(ref)
-              end tell
-            end timeout
-            return "ok"
-            """
-    }
-
-    public func listTerminals() async throws(AppleScriptError) -> [GhosttyTerminalInfo] {
-        var lastError = AppleScriptError.timedOut
-        for _ in 0..<2 {  // one retry if the list changed mid-read
-            switch await runner.run(Self.listScript, app: Self.app, timeout: .seconds(5)) {
-            case .success(let out): return GhosttyMatcher.parseListing(out)
-            case .failure(.scriptError(-1700, _)): lastError = .scriptError(code: -1700, message: "list changed")
-            case .failure(let e): throw e
-            }
-        }
-        throw lastError
-    }
-
-    /// Returns true if focused, false if no such terminal.
-    public func focus(terminalID: String) async throws(AppleScriptError) -> Bool {
-        switch await runner.run(Self.focusScript(terminalID: terminalID), app: Self.app, timeout: .seconds(5)) {
-        case .success(let out): return out == "ok"
-        case .failure(let e): throw e
-        }
-    }
-}
-
-/// A strategy for mapping a session to a Ghostty terminal. Strategies run in order; the first
-/// `.unique` that still exists wins. Plug new ones (e.g. tty-based) into `GhosttyFocuser`.
+/// A strategy for mapping a session to a Ghostty terminal id. `GhosttyFocuser` runs its
+/// resolvers in order and focuses the first `.unique` id that is live (not missing / zombie).
 public protocol GhosttyTerminalResolver: Sendable {
+    /// Short name for diagnostics ("tty-property", "osc7-probe", …).
+    var name: String { get }
+    /// Whether a successful focus from this resolver should be cached under the session pid.
+    var cachesResult: Bool { get }
     func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution
 }
 
-/// Uses `session.ghosttyTerminalID` (recorded by the hook) when present.
+extension GhosttyTerminalResolver {
+    public var cachesResult: Bool { false }
+}
+
+/// 1. Ghostty's own `tty` terminal property (Ghostty > 1.3.1). Feature-detected once per
+///    Ghostty process; on 1.3.1 the lookup errors and the resolver turns itself off.
+public struct TTYPropertyResolver: GhosttyTerminalResolver {
+    public let name = "tty-property"
+    let support: GhosttyFeatureCache
+
+    public init(support: GhosttyFeatureCache = GhosttyFeatureCache()) {
+        self.support = support
+    }
+
+    public func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
+        guard let tty = session.tty, !tty.isEmpty,
+              let ghosttyPID = AppActivation.runningApp(bundleID: AppActivation.ghosttyBundleID)?.processIdentifier,
+              await support.ttyProperty(ghosttyPID: ghosttyPID) != false
+        else { return .notFound }
+        let ids = try await ghostty.terminalIDs(forTTY: AppleTerminalFocuser.normalizeTTY(tty))
+        await support.setTTYProperty(ids != nil, ghosttyPID: ghosttyPID)
+        guard let ids, ids.count == 1 else { return .notFound }
+        return .unique(terminalID: ids[0])
+    }
+}
+
+/// 2. `session.ghosttyTerminalID`, recorded by the hook when known.
 public struct KnownTerminalIDResolver: GhosttyTerminalResolver {
+    public let name = "hook-id"
     public init() {}
     public func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
         guard let id = session.ghosttyTerminalID, !id.isEmpty else { return .notFound }
@@ -85,49 +48,141 @@ public struct KnownTerminalIDResolver: GhosttyTerminalResolver {
     }
 }
 
-/// Lists all terminals in one script call and applies `GhosttyMatcher.match` (title + cwd).
+/// 3. In-memory pid → terminal id cache, filled by resolvers with `cachesResult`. The focus
+///    script validates existence; misses and zombies are evicted by `GhosttyFocuser`.
+public struct CachedTerminalResolver: GhosttyTerminalResolver {
+    public let name = "cache"
+    let cache: GhosttyTerminalCache
+    public init(cache: GhosttyTerminalCache) { self.cache = cache }
+    public func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
+        guard let id = await cache.terminalID(pid: session.pid, tty: session.tty) else { return .notFound }
+        return .unique(terminalID: id)
+    }
+}
+
+/// 4. OSC 7 nonce probe on the session's tty (see `OSC7Probe`). Skipped without a tty or
+///    inside tmux. Results are cached.
+public struct OSC7ProbeResolver: GhosttyTerminalResolver {
+    public let name = "osc7-probe"
+    public var cachesResult: Bool { true }
+    let coordinator: OSC7ProbeCoordinator
+
+    public init(coordinator: OSC7ProbeCoordinator = OSC7ProbeCoordinator()) {
+        self.coordinator = coordinator
+    }
+
+    public func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
+        guard let raw = session.tty, !raw.isEmpty, !ProcessTree.isInsideTmux(session.pid) else { return .notFound }
+        let tty = AppleTerminalFocuser.normalizeTTY(raw)
+        guard let id = try await coordinator.probe(tty: tty, pid: session.pid, restoreCwd: session.cwd, ghostty: ghostty)
+        else { return .notFound }
+        return .unique(terminalID: id)
+    }
+}
+
+/// 5. Title + cwd heuristic over a single listing call (`GhosttyMatcher.match`).
 public struct TitleCwdResolver: GhosttyTerminalResolver {
+    public let name = "title-cwd"
     public init() {}
     public func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
         GhosttyMatcher.match(session: session, in: try await ghostty.listTerminals())
     }
 }
 
-/// What to do when the resolvers only produce ambiguous candidates.
+// MARK: - Shared state
+
+/// pid → (tty, terminal id). Entries for dead pids are pruned on insert.
+public actor GhosttyTerminalCache {
+    private var entries: [Int32: (tty: String?, id: String)] = [:]
+
+    public init() {}
+
+    public func terminalID(pid: Int32, tty: String?) -> String? {
+        guard let e = entries[pid] else { return nil }
+        guard e.tty == tty else { entries[pid] = nil; return nil }
+        return e.id
+    }
+
+    public func store(pid: Int32, tty: String?, id: String) {
+        entries = entries.filter { kill($0.key, 0) == 0 || errno == EPERM }
+        entries[pid] = (tty, id)
+    }
+
+    public func evict(pid: Int32, id: String) {
+        if entries[pid]?.id == id { entries[pid] = nil }
+    }
+}
+
+/// Remembers per Ghostty process whether optional dictionary features exist.
+public actor GhosttyFeatureCache {
+    private var ttyPropertyByPID: [Int32: Bool] = [:]
+    public init() {}
+    /// nil = not yet detected.
+    public func ttyProperty(ghosttyPID: Int32) -> Bool? { ttyPropertyByPID[ghosttyPID] }
+    public func setTTYProperty(_ supported: Bool, ghosttyPID: Int32) { ttyPropertyByPID[ghosttyPID] = supported }
+}
+
+// MARK: - Focuser
+
+/// What to do when no resolver is certain but the title/cwd heuristic produced candidates.
 public enum GhosttyAmbiguityPolicy: Sendable {
-    /// Focus the first (best-ranked) candidate, but report `.appActivatedOnly(reason:)` so the
-    /// UI can tell the user it was a guess. Default: landing on a likely tab in the right
-    /// window/Space beats just raising Ghostty.
-    case focusFirstCandidate
-    /// Only activate Ghostty and report `.appActivatedOnly(reason:)`.
+    /// Only activate Ghostty and report `.appActivatedOnly(reason:)`. Default.
     case activateAppOnly
+    /// Focus the first (best-ranked) candidate, still reporting `.appActivatedOnly(reason:)`
+    /// so the UI can say it was a guess.
+    case focusFirstCandidate
+}
+
+/// Diagnostics from one focus attempt.
+public struct GhosttyFocusReport: Sendable, Equatable {
+    public var result: FocusResult
+    /// Name of the resolver whose terminal was focused, if any.
+    public var resolver: String?
+    public var terminalID: String?
 }
 
 /// Focuses the Ghostty terminal hosting a session. Ghostty's `focus` command raises the window
-/// and switches Spaces (verified with Ghostty 1.3.1). Never launches Ghostty.
+/// and switches Spaces (verified, Ghostty 1.3.1). Never launches Ghostty.
 ///
-/// Results:
-/// - `.focused`: a resolver produced a unique terminal and it was focused.
-/// - `.appActivatedOnly`: ambiguous match (see `ambiguityPolicy`) or no match; Ghostty raised.
-/// - `.failed`: Ghostty not running, Automation permission denied, timeout, script error.
+/// Default resolution chain: tty property → hook id → pid cache → OSC 7 probe → unique
+/// title+cwd → activate Ghostty (`.appActivatedOnly`). A resolver's id that turns out missing
+/// or a zombie ("Terminal is not in a window.", -10000) falls through to the next resolver.
+///
+/// Keep one instance alive (the cache and probe lock live in it).
+///
+/// Results: `.focused` (exact terminal), `.appActivatedOnly` (ambiguous / not found; Ghostty
+/// raised), `.failed` (Ghostty not running, Automation denied, timeout, script error).
 public struct GhosttyFocuser: SessionFocuser {
     public var resolvers: [any GhosttyTerminalResolver]
     public var ambiguityPolicy: GhosttyAmbiguityPolicy
     public var ghostty: GhosttyScripting
+    public let cache: GhosttyTerminalCache
 
     public init(
-        resolvers: [any GhosttyTerminalResolver] = [KnownTerminalIDResolver(), TitleCwdResolver()],
-        ambiguityPolicy: GhosttyAmbiguityPolicy = .focusFirstCandidate,
-        ghostty: GhosttyScripting = GhosttyScripting()
+        resolvers: [any GhosttyTerminalResolver]? = nil,
+        ambiguityPolicy: GhosttyAmbiguityPolicy = .activateAppOnly,
+        ghostty: GhosttyScripting = GhosttyScripting(),
+        cache: GhosttyTerminalCache = GhosttyTerminalCache()
     ) {
-        self.resolvers = resolvers
+        self.cache = cache
+        self.resolvers = resolvers ?? [
+            TTYPropertyResolver(),
+            KnownTerminalIDResolver(),
+            CachedTerminalResolver(cache: cache),
+            OSC7ProbeResolver(),
+            TitleCwdResolver(),
+        ]
         self.ambiguityPolicy = ambiguityPolicy
         self.ghostty = ghostty
     }
 
     public func focus(_ session: ClaudeSession) async -> FocusResult {
+        await focusWithReport(session).result
+    }
+
+    public func focusWithReport(_ session: ClaudeSession) async -> GhosttyFocusReport {
         guard let app = AppActivation.runningApp(bundleID: AppActivation.ghosttyBundleID) else {
-            return .failed(reason: "Ghostty isn't running.")
+            return GhosttyFocusReport(result: .failed(reason: "Ghostty isn't running."))
         }
         await AppActivation.yieldActivation(to: app)
         do throws(AppleScriptError) {
@@ -135,25 +190,33 @@ public struct GhosttyFocuser: SessionFocuser {
             for resolver in resolvers {
                 switch try await resolver.resolve(session, ghostty: ghostty) {
                 case .unique(let id):
-                    if try await ghostty.focus(terminalID: id) { return .focused }
-                    // Stale id (terminal closed): fall through to the next strategy.
+                    switch try await ghostty.focus(terminalID: id) {
+                    case .focused:
+                        if resolver.cachesResult { await cache.store(pid: session.pid, tty: session.tty, id: id) }
+                        return GhosttyFocusReport(result: .focused, resolver: resolver.name, terminalID: id)
+                    case .notFound, .stale:
+                        await cache.evict(pid: session.pid, id: id)  // fall through
+                    }
                 case .ambiguous(let candidates, let reason):
                     if firstAmbiguous == nil, !candidates.isEmpty { firstAmbiguous = (candidates, reason) }
                 case .notFound:
                     break
                 }
             }
-            if let (candidates, reason) = firstAmbiguous {
-                if ambiguityPolicy == .focusFirstCandidate, try await ghostty.focus(terminalID: candidates[0]) {
-                    return .appActivatedOnly(reason: "\(reason); focused the first match.")
-                }
-                await AppActivation.activate(app)
-                return .appActivatedOnly(reason: reason)
+            if let (candidates, reason) = firstAmbiguous, ambiguityPolicy == .focusFirstCandidate,
+               try await ghostty.focus(terminalID: candidates[0]) == .focused {
+                return GhosttyFocusReport(result: .appActivatedOnly(reason: "\(reason); focused the first match."),
+                                          resolver: "ambiguous-first", terminalID: candidates[0])
             }
             await AppActivation.activate(app)
-            return .appActivatedOnly(reason: "Couldn't find this session's Ghostty terminal.")
+            let reason = firstAmbiguous?.reason ?? "Couldn't find this session's Ghostty terminal."
+            return GhosttyFocusReport(result: .appActivatedOnly(reason: reason))
         } catch {
-            return .failed(reason: error.userMessage(app: GhosttyScripting.app))
+            return GhosttyFocusReport(result: .failed(reason: error.userMessage(app: GhosttyScripting.app)))
         }
     }
+}
+
+extension GhosttyFocusReport {
+    init(result: FocusResult) { self.init(result: result, resolver: nil, terminalID: nil) }
 }

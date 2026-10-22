@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import ClaudeWatcherCore
@@ -150,6 +151,8 @@ func stripsTitleGlyph(input: String, expected: String) {
             GhosttyScripting.listScript,
             GhosttyScripting.focusScript(terminalID: "0FD9735C-\"evil\\"),
             AppleTerminalFocuser.focusScript(tty: "ttys001"),
+            GhosttyScripting.ttyLookupScript(tty: "/dev/ttys001"),
+            GhosttyScripting.nonceLookupScript(nonce: "CW-1-a"),
         ]
         for source in scripts {
             let script = try #require(NSAppleScript(source: source))
@@ -194,8 +197,8 @@ private final class FakeRunner: AppleScriptExecuting, @unchecked Sendable {
     }
     let g = GhosttyScripting(runner: fake)
     #expect(try await g.listTerminals() == [term("A", "✳ T", "/p")])
-    #expect(try await g.focus(terminalID: "A") == true)
-    #expect(try await g.focus(terminalID: "B") == false)
+    #expect(try await g.focus(terminalID: "A") == .focused)
+    #expect(try await g.focus(terminalID: "B") == .notFound)
 }
 
 @Test func resolverChainFallsThroughStaleID() async throws {
@@ -217,6 +220,102 @@ private final class FakeRunner: AppleScriptExecuting, @unchecked Sendable {
     } catch {
         #expect(error == .notPermitted(app: "Ghostty"))
     }
+}
+
+@Test func focusMapsStaleZombie() async throws {
+    let g = GhosttyScripting(runner: FakeRunner { _ in .success("stale") })
+    #expect(try await g.focus(terminalID: "Z") == .stale)
+}
+
+@Test func ttyLookupUnsupportedReturnsNil() async throws {
+    let unsupported = GhosttyScripting(runner: FakeRunner { _ in .failure(.scriptError(code: -2753, message: "The variable tty is not defined.")) })
+    #expect(try await unsupported.terminalIDs(forTTY: "/dev/ttys001") == nil)
+    let supported = GhosttyScripting(runner: FakeRunner { _ in .success("X\u{1E}") })
+    #expect(try await supported.terminalIDs(forTTY: "/dev/ttys001") == ["X"])
+    let denied = GhosttyScripting(runner: FakeRunner { _ in .failure(.notPermitted(app: "Ghostty")) })
+    await #expect(throws: AppleScriptError.notPermitted(app: "Ghostty")) {
+        _ = try await denied.terminalIDs(forTTY: "/dev/ttys001")
+    }
+}
+
+private struct FixedResolver: GhosttyTerminalResolver {
+    let name: String
+    let resolution: GhosttyResolution
+    var cachesResult: Bool = false
+    func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
+        resolution
+    }
+}
+
+/// Only runs the `.focused` paths, so it never activates the real Ghostty. Needs Ghostty running
+/// (the focuser checks NSRunningApplication first, and never launches it).
+@Test(.enabled(if: !NSRunningApplication.runningApplications(withBundleIdentifier: "com.mitchellh.ghostty").isEmpty))
+func focuserFallsThroughStaleAndCaches() async {
+    let fake = FakeRunner { src in
+        if src.contains("\"ZOMBIE\"") { return .success("stale") }
+        if src.contains("\"GONE\"") { return .success("notfound") }
+        return .success("ok")
+    }
+    let cache = GhosttyTerminalCache()
+    let focuser = GhosttyFocuser(
+        resolvers: [
+            FixedResolver(name: "hook", resolution: .unique(terminalID: "GONE")),
+            CachedTerminalResolver(cache: cache),
+            FixedResolver(name: "zombie", resolution: .unique(terminalID: "ZOMBIE")),
+            FixedResolver(name: "probe", resolution: .unique(terminalID: "LIVE"), cachesResult: true),
+        ],
+        ghostty: GhosttyScripting(runner: fake), cache: cache)
+    let s = session(title: "T", cwd: "/p", tty: "/dev/ttys999")
+    let first = await focuser.focusWithReport(s)
+    #expect(first == GhosttyFocusReport(result: .focused, resolver: "probe", terminalID: "LIVE"))
+    #expect(await cache.terminalID(pid: s.pid, tty: s.tty) == "LIVE")
+    let second = await focuser.focusWithReport(s)
+    #expect(second.resolver == "cache")
+    #expect(await cache.terminalID(pid: s.pid, tty: "/dev/ttys000") == nil)  // tty changed → evicted
+}
+
+// MARK: - OSC 7 probe (pure parts)
+
+@Test func osc7Nonce() {
+    #expect(OSC7Probe.makeNonce(pid: 42, random: 0xBEEF) == "CW-42-beef")
+    let a = OSC7Probe.makeNonce(pid: 42), b = OSC7Probe.makeNonce(pid: 42)
+    #expect(a != b)
+    #expect(a.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") })
+}
+
+@Test func osc7Sequences() {
+    #expect(OSC7Probe.probeSequence(host: "mac.local", nonce: "CW-1-a")
+            == "\u{1B}]7;file://mac.local/tmp/CW-1-a\u{07}")
+    #expect(OSC7Probe.restoreSequence(host: "mac.local", cwd: "/Users/me/My Project")
+            == "\u{1B}]7;file://mac.local/Users/me/My%20Project\u{07}")
+    #expect(OSC7Probe.percentEncodePath("/a/b%c#d?e;f") == "/a/b%25c%23d%3Fe%3Bf")
+    #expect(OSC7Probe.percentEncodePath("/x\u{07}\u{1B}y") == "/x%07%1By")
+    #expect(OSC7Probe.percentEncodePath("/ünï/✳") == "/%C3%BCn%C3%AF/%E2%9C%B3")
+}
+
+@Test func osc7TTYValidation() {
+    #expect(OSC7Probe.isWritableTTYPath("/dev/ttys001"))
+    #expect(!OSC7Probe.isWritableTTYPath("/dev/ttys"))
+    #expect(!OSC7Probe.isWritableTTYPath("/dev/ttys001/../disk0"))
+    #expect(!OSC7Probe.isWritableTTYPath("/dev/console"))
+    #expect(!OSC7Probe.isWritableTTYPath("ttys001"))
+    #expect(!OSC7Probe.isWritableTTYPath("/tmp/ttys001"))
+}
+
+@Test func osc7HostName() {
+    #expect(!OSC7Probe.hostName().isEmpty)
+}
+
+@Test func parsesIDs() {
+    #expect(GhosttyScripting.parseIDs("A\u{1E}B\u{1E}") == ["A", "B"])
+    #expect(GhosttyScripting.parseIDs("") == [])
+}
+
+@Test func processTreeBasics() {
+    let me = getpid()
+    #expect(ProcessTree.parentPID(of: me) == getppid())
+    #expect(ProcessTree.name(of: me)?.isEmpty == false)
+    #expect(!ProcessTree.ancestors(of: me).isEmpty)
 }
 
 // MARK: - Live (CW_LIVE_FOCUS=1)

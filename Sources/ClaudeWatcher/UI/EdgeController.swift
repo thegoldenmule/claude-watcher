@@ -70,7 +70,7 @@ final class EdgeController {
             onSelect: { session in
                 Task {
                     let result = await focuser.focus(session)
-                    logger.info("focus \(session.id, privacy: .public): \(String(describing: result), privacy: .public)")
+                    logger.notice("focus \(session.id, privacy: .public): \(String(describing: result), privacy: .public)")
                 }
             }
         )

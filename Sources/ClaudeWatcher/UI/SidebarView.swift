@@ -161,14 +161,15 @@ private struct SessionRow: View {
                         Label(session.waitingFor ?? "Waiting for you", systemImage: "exclamationmark.bubble.fill")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(.orange)
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                             .labelStyle(TightLabelStyle())
                     }
 
                     HStack(spacing: 4) {
                         Text(folderName)
                             .lineLimit(1)
-                            .layoutPriority(1)
+                            .truncationMode(.tail)
                         if let branch = session.branch, !branch.isEmpty {
                             Text("·").foregroundStyle(.tertiary)
                             Image(systemName: "arrow.triangle.branch")
@@ -229,7 +230,7 @@ private struct RowButtonStyle: ButtonStyle {
 
 private struct TightLabelStyle: LabelStyle {
     func makeBody(configuration: Configuration) -> some View {
-        HStack(spacing: 4) {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
             configuration.icon.font(.system(size: 10))
             configuration.title
         }

@@ -1,3 +1,4 @@
+import AppKit
 import ClaudeWatcherCore
 import Foundation
 
@@ -7,6 +8,15 @@ enum DemoMode {
     static var isEnabled: Bool {
         ProcessInfo.processInfo.environment["CW_DEMO"] == "1"
             || CommandLine.arguments.contains("--demo")
+    }
+
+    /// `CW_APPEARANCE=dark|light` forces the app appearance (for screenshots of both themes).
+    static var forcedAppearance: NSAppearance? {
+        switch ProcessInfo.processInfo.environment["CW_APPEARANCE"] {
+        case "dark": NSAppearance(named: .darkAqua)
+        case "light": NSAppearance(named: .aqua)
+        default: nil
+        }
     }
 
     static let sessions: [ClaudeSession] = {

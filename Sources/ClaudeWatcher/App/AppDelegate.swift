@@ -15,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store = nil
             edge = EdgeController(
                 sessions: { DemoMode.sessions },
-                onSelect: { logger.info("demo select: \($0.title, privacy: .public)") }
+                onSelect: { logger.notice("demo select: \($0.title, privacy: .public)") }
             )
         } else {
             let store = SessionStore()
@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if let appearance = DemoMode.forcedAppearance { NSApp.appearance = appearance }
         store?.start()
         if isDemo { edge.isPinned = true }
         edge.start()

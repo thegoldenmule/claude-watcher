@@ -1,6 +1,6 @@
 #!/bin/zsh -f
 # claude-watcher-hook.sh: Claude Code hook for ClaudeWatcher.
-# claude-watcher-hook-version: 1
+# claude-watcher-hook-version: 2
 #
 # Records what ~/.claude/sessions/<pid>.json lacks, so ClaudeWatcher can focus the
 # right terminal: the claude PID <-> session_id link (found by walking up our own
@@ -8,29 +8,35 @@
 # terminal id.
 #
 # Input: hook JSON on stdin (session_id, cwd, transcript_path, hook_event_name, ...).
-# Output: $STATE_DIR/<session_id>.json, written atomically (temp file + rename):
-#   {"session_id":"…","claude_pid":123,"tty":"/dev/ttys001","term_program":"ghostty",
-#    "cwd":"…","transcript_path":"…","last_event":"Stop","ghostty_terminal_id":null,
-#    "updated_at":1792680000000}
-# SessionEnd renames it to a short-lived "<session_id>.ended" tombstone so a slow async
-# hook from the same session cannot resurrect it. On Ghostty, SessionStart also starts a
-# detached OSC 7 nonce probe that fills in ghostty_terminal_id (see HOOK POINT below).
+# Output, in $STATE_DIR:
+#   <sid>.json     written atomically (temp file + rename) by every event, never read back:
+#                  {"session_id":"…","claude_pid":123,"tty":"/dev/ttys001","term_program":"ghostty",
+#                   "cwd":"…","transcript_path":"…","last_event":"Stop","updated_at":1792680000000}
+#   <sid>.ghostty  sidecar holding just the Ghostty terminal id (temp file + rename). Written
+#                  only by the detached OSC 7 probe and by SessionStart inheriting a /clear
+#                  predecessor's id, so a hook rewriting <sid>.json can never drop it.
+#   <sid>.ended    SessionEnd renames <sid>.json to this short-lived tombstone so a slow async
+#                  hook from the same session cannot resurrect it. The sidecar stays next to
+#                  it until GC, for a /clear successor (same pid + tty) to inherit.
+#   .probe-<ttyname>.lock/owner   per-tty lock shared with the app's own OSC 7 probe (both
+#                  rewrite that terminal's pwd); see probe_lock_acquire.
 #
 # Contract: never block or fail Claude. Always exit 0, print nothing on stdout,
-# swallow errors.
+# swallow errors. Only the detached probe ever waits.
 #
 # Env overrides (tests/debugging):
 #   CLAUDE_WATCHER_STATE_DIR   state directory
 #   CLAUDE_WATCHER_CLAUDE_PID  skip the process-tree walk and use this pid
 #   CLAUDE_WATCHER_NO_JQ=1     force the pure-zsh fallback even when jq exists
 #   CLAUDE_WATCHER_NO_GHOSTTY_PROBE=1  skip the Ghostty terminal-id probe
-#   CLAUDE_WATCHER_TTY         use this path as claude's tty (tests: a regular file)
+#   CLAUDE_WATCHER_TTY         use this path as claude's tty (tests: a regular file or FIFO)
 #   CLAUDE_WATCHER_OSASCRIPT   osascript command used by the probe (tests: a stub)
 
 exec >/dev/null 2>&1
 setopt no_nomatch extended_glob
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 zmodload zsh/datetime 2>/dev/null
+zmodload zsh/system 2>/dev/null
 zmodload -F zsh/files b:zf_mv b:zf_rm b:zf_mkdir b:zf_rmdir 2>/dev/null
 
 main() {
@@ -65,9 +71,9 @@ main() {
 
   if [[ $event == SessionEnd ]]; then
     # Keep the last state as the tombstone: it blocks late async writers for this id and
-    # lets a /clear successor in the same process adopt the Ghostty terminal id.
+    # lets a /clear successor in the same process adopt the Ghostty id from <sid>.ghostty.
     if [[ -f $state_file ]]; then
-      zf_mv -f "$state_file" "$tombstone" || mv -f "$state_file" "$tombstone"
+      atomic_mv "$state_file" "$tombstone"
     else
       : >| "$tombstone"
     fi
@@ -84,21 +90,13 @@ main() {
   local now_ms=$(( ${EPOCHREALTIME:-$(date +%s)} * 1000 ))
   now_ms=${now_ms%%.*}
 
-  # Serialize this read-modify-write with other hooks of the session and the probe's patch
-  # (best effort: after ~200 ms we go ahead unlocked).
-  local lock="$state_dir/.lock-$sid" locked=0
-  lock_acquire "$lock" && locked=1
-  {
-
-  # Keep a Ghostty id we already resolved for this session.
-  local old="" ghostty_id=""
-  [[ -f $state_file ]] && old=$(<"$state_file")
-  ghostty_id=$(json_string_value "$old" ghostty_terminal_id)
-
+  # No read-modify-write here: the Ghostty id lives in the <sid>.ghostty sidecar, so every
+  # event just replaces <sid>.json wholesale and concurrent hooks need no lock.
+  local ghostty_id=""
   if [[ $event == SessionStart ]]; then
     # /clear and in-process /resume start a new session_id in the same claude process:
     # drop the predecessor's state and adopt its Ghostty id (same pid + tty => same terminal).
-    supersede_same_pid "$state_dir"
+    adopt_ghostty_id "$state_dir"
     # A (re)started session supersedes any earlier end of the same id (e.g. --resume).
     zf_rm -f "$tombstone"
   fi
@@ -110,7 +108,6 @@ main() {
       --arg tty "$tty" \
       --arg term "$term_program" \
       --arg event "$event" \
-      --arg gid "$ghostty_id" \
       --argjson now "$now_ms" \
       '{session_id: .session_id,
         claude_pid: $pid,
@@ -119,14 +116,13 @@ main() {
         cwd: .cwd,
         transcript_path: .transcript_path,
         last_event: $event,
-        ghostty_terminal_id: (if $gid == "" then null else $gid end),
         updated_at: $now}' >| "$tmp" || { zf_rm -f "$tmp"; return 0; }
   else
     local tp_raw
     tp_raw=$(json_raw_string "$input" transcript_path)
     local cwd_json
     cwd_json=$(json_raw_string "$input" cwd)
-    print -r -- "{\"session_id\":\"$sid\",\"claude_pid\":$claude_pid,\"tty\":$(json_str_or_null "$(json_escape "$tty")"),\"term_program\":$(json_str_or_null "$(json_escape "$term_program")"),\"cwd\":$(json_str_or_null "$cwd_json"),\"transcript_path\":$(json_str_or_null "$tp_raw"),\"last_event\":\"$event\",\"ghostty_terminal_id\":$(json_str_or_null "$ghostty_id"),\"updated_at\":$now_ms}" >| "$tmp" || { zf_rm -f "$tmp"; return 0; }
+    print -r -- "{\"session_id\":\"$sid\",\"claude_pid\":$claude_pid,\"tty\":$(json_str_or_null "$(json_escape "$tty")"),\"term_program\":$(json_str_or_null "$(json_escape "$term_program")"),\"cwd\":$(json_str_or_null "$cwd_json"),\"transcript_path\":$(json_str_or_null "$tp_raw"),\"last_event\":\"$event\",\"updated_at\":$now_ms}" >| "$tmp" || { zf_rm -f "$tmp"; return 0; }
     # Raw JSON string -> path for the probe: only "\/" is unescaped; any other escape means
     # we are unsure, so leave it empty and let the probe use $PWD (also encoded there).
     cwd_raw=${cwd_json//\\\//\/}
@@ -138,19 +134,18 @@ main() {
     zf_rm -f "$tmp"
     return 0
   fi
-  zf_mv -f "$tmp" "$state_file" || mv -f "$tmp" "$state_file" || { zf_rm -f "$tmp"; return 0; }
+  atomic_mv "$tmp" "$state_file" || { zf_rm -f "$tmp"; return 0; }
   # ...or between the check above and the rename: then the file we just wrote must go.
   [[ -e $tombstone ]] && { zf_rm -f "$state_file"; return 0; }
 
-  } always {
-    (( locked )) && zf_rmdir "$lock" 2>/dev/null
-  }
+  # Inherited id: written after <sid>.json so GC never sees it as an orphan.
+  [[ -n $ghostty_id ]] && write_sidecar "$state_dir" "$sid" "$ghostty_id"
 
   # ===========================================================================
   # HOOK POINT: resolve Ghostty terminal id
   # SessionStart (any source), Ghostty only, with a tty, outside tmux, id still unknown.
   # The state file above is already written without the id so pid/tty are available
-  # immediately; the probe runs fully detached and patches the id in when it resolves.
+  # immediately; the probe runs fully detached and writes <sid>.ghostty when it resolves.
   # ===========================================================================
   if [[ $event == SessionStart && -z $ghostty_id && $term_program == ghostty && -n $tty \
         && -z ${TMUX:-} && ${CLAUDE_WATCHER_NO_GHOSTTY_PROBE:-0} != 1 ]]; then
@@ -159,49 +154,121 @@ main() {
   return 0
 }
 
-# On SessionStart: for other state files (and SessionEnd tombstones) of the same claude
-# pid, adopt their Ghostty id when the tty matches, and delete the live ones.
-# Uses caller's: sid, claude_pid, tty, ghostty_id.
-supersede_same_pid() {
-  local dir=$1 f content tty_json=null
+# On SessionStart: sets ghostty_id to a still-valid id for this session, if any, and drops
+# superseded state. Uses caller's: sid, claude_pid, tty, ghostty_id.
+# - Our own sidecar is kept only if our last state (live file or tombstone) has the same pid
+#   and tty: SessionStart "compact" keeps it, a --resume in another process/terminal drops it.
+# - Other state files (and tombstones) of the same claude pid: adopt their sidecar id when the
+#   tty matches (/clear successor), and delete the live ones with their sidecars.
+adopt_ghostty_id() {
+  local dir=$1 f content other tty_json=null
   [[ -n $tty ]] && tty_json="\"$tty\""
+  if [[ -f $dir/$sid.ghostty ]]; then
+    content=""
+    if [[ -f $dir/$sid.json ]]; then content=$(<"$dir/$sid.json")
+    elif [[ -f $dir/$sid.ended ]]; then content=$(<"$dir/$sid.ended"); fi
+    if [[ $content == *\"claude_pid\":${claude_pid}[,}]* && $content == *\"tty\":${tty_json}[,}]* ]]; then
+      ghostty_id=$(read_sidecar "$dir/$sid.ghostty")
+    fi
+    [[ -n $ghostty_id ]] || zf_rm -f "$dir/$sid.ghostty"
+  fi
   for f in $dir/[^.]*.(json|ended)(N); do
-    [[ ${f:t:r} == $sid ]] && [[ $f == *.json ]] && continue
+    other=${f:t:r}
+    [[ $other == $sid ]] && continue
     content=$(<"$f")
     [[ $content == *\"claude_pid\":${claude_pid}[,}]* ]] || continue
-    if [[ -z $ghostty_id && $content == *\"tty\":${tty_json}[,}]* ]]; then
-      ghostty_id=$(json_string_value "$content" ghostty_terminal_id)
+    if [[ -z $ghostty_id && $content == *\"tty\":${tty_json}[,}]* && -f $dir/$other.ghostty ]]; then
+      ghostty_id=$(read_sidecar "$dir/$other.ghostty")
     fi
-    [[ $f == *.json ]] && zf_rm -f "$f"
+    [[ $f == *.json ]] && zf_rm -f "$f" "$dir/$other.ghostty"
   done
 }
 
-# Detached: resolve the id (serialized per tty) and patch it into the state file.
+# Prints the id in sidecar $1 if it looks like one.
+read_sidecar() {
+  local v
+  [[ -f $1 ]] && v=$(<"$1")
+  [[ $v == [A-Za-z0-9-]## ]] && print -r -- "$v"
+}
+
+# Atomically replaces <dir>/<sid>.ghostty ($1 $2) with id $3.
+write_sidecar() {
+  local tmp="$1/.$2.ghostty.tmp.${sysparams[pid]:-$$}"
+  { print -rn -- "$3" >| "$tmp" && atomic_mv "$tmp" "$1/$2.ghostty" } || zf_rm -f "$tmp"
+}
+
+atomic_mv() {
+  zf_mv -f "$1" "$2" 2>/dev/null || mv -f "$1" "$2"
+}
+
+# Detached: resolve the id (serialized per tty with the app's probe) and write the sidecar.
 # Args: state dir, session id, claude pid, tty, cwd_url (encoded, may be empty), cwd_raw.
 ghostty_probe() {
   local dir=$1 sid=$2 pid=$3 tty=$4 cwd_url=$5 cwd_raw=$6
   [[ -n $cwd_url ]] || cwd_url=$(osc7_encode "${cwd_raw:-$PWD}" /)
-  local plock="$dir/.probe-${tty:t}.lock"
-  local -a stale=( $plock(N/mm+1) )
-  (( ${#stale} )) && zf_rmdir "$plock" 2>/dev/null
-  zf_mkdir "$plock" 2>/dev/null || return 0
-  local id
-  id=$(resolve_ghostty_terminal_id "$pid" "$tty" "$cwd_url")
-  zf_rmdir "$plock" 2>/dev/null
-  [[ $id == [A-Za-z0-9-]## ]] || return 0
-  local f="$dir/$sid.json" content lock="$dir/.lock-$sid" locked=0
-  lock_acquire "$lock" && locked=1
+  local plock="$dir/.probe-${tty:t}.lock" token id=""
+  probe_lock_acquire "$plock" || return 0
+  token=$REPLY
   {
-    [[ -f $f && ! -e $dir/$sid.ended ]] || return 0
-    content=$(<"$f")
-    [[ $content == *'"ghostty_terminal_id":null'* ]] || return 0
-    local tmp="$dir/.$sid.json.tmp.$$"
-    print -r -- "${content/\"ghostty_terminal_id\":null/\"ghostty_terminal_id\":\"$id\"}" >| "$tmp" \
-      && zf_mv -f "$tmp" "$f" || { zf_rm -f "$tmp"; return 0; }
-    [[ -e $dir/$sid.ended ]] && zf_rm -f "$f"
+    # A /clear predecessor's probe may have handed us the id while we waited.
+    [[ -n $(read_sidecar "$dir/$sid.ghostty") ]] && return 0
+    id=$(resolve_ghostty_terminal_id "$pid" "$tty" "$cwd_url")
   } always {
-    (( locked )) && zf_rmdir "$lock" 2>/dev/null
+    probe_lock_release "$plock" "$token"
   }
+  [[ $id == [A-Za-z0-9-]## ]] || return 0
+  # Written even if the session ended meanwhile: the sidecar next to the tombstone is what a
+  # /clear successor that has not started yet inherits.
+  write_sidecar "$dir" "$sid" "$id"
+  [[ -f $dir/$sid.json && ! -e $dir/$sid.ended ]] && return 0
+  # Ended or superseded (/clear) while we probed: hand the id to a successor that already
+  # started in the same process and terminal, unless it has one.
+  local f content tty_json="\"$tty\""
+  for f in $dir/[^.]*.json(N); do
+    [[ ${f:t:r} == $sid || -f ${f:r}.ghostty ]] && continue
+    content=$(<"$f")
+    [[ $content == *\"claude_pid\":${pid}[,}]* && $content == *\"tty\":${tty_json}[,}]* ]] || continue
+    write_sidecar "$dir" "${f:t:r}" "$id"
+  done
+}
+
+# Per-tty probe lock, shared with the app's Swift OSC 7 probe (same protocol on both sides):
+# - acquire: mkdir <lock> (atomic), then write "<pid> <token>" to <lock>/owner;
+# - held: poll every ~25 ms for at most 1 s, then give up (return 1);
+# - stale (lock dir mtime older than 10 s; a probe's AppleScript times out after 3 s): rename
+#   it to <lock>.stale-<random> (atomic, so one breaker wins), rm -rf that, retry mkdir.
+# On success REPLY is the token for probe_lock_release.
+probe_lock_acquire() {
+  local lock=$1 me=${sysparams[pid]:-$$} grave
+  local -a stale
+  local deadline=$(( EPOCHREALTIME + 1.0 ))
+  zmodload -e zsh/files && zmodload zsh/zselect 2>/dev/null || return 1
+  REPLY="${EPOCHREALTIME/./}$RANDOM$RANDOM"
+  while :; do
+    if zf_mkdir "$lock" 2>/dev/null; then
+      print -r -- "$me $REPLY" >| "$lock/owner" && return 0
+      zf_rmdir "$lock" 2>/dev/null
+      return 1
+    fi
+    (( EPOCHREALTIME < deadline )) || return 1
+    stale=( $lock(N/ms+10) )
+    if (( ${#stale} )); then
+      grave="$lock.stale-$me$RANDOM$RANDOM"
+      zf_mv "$lock" "$grave" 2>/dev/null && zf_rm -rf "$grave" 2>/dev/null
+      continue
+    fi
+    zselect -t 2   # ~20 ms (returns 1 on timeout)
+  done
+}
+
+# Removes the lock only while <lock>/owner still holds our token: if someone broke it as
+# stale, the lock there now is theirs.
+probe_lock_release() {
+  local lock=$1 owner=""
+  [[ -f $lock/owner ]] && owner=$(<"$lock/owner")
+  [[ $owner == "${sysparams[pid]:-$$} $2" ]] || return 0
+  zf_rm -f "$lock/owner"
+  zf_rmdir "$lock" 2>/dev/null
 }
 
 # HOOK POINT (Ghostty terminal id): print the Ghostty AppleScript terminal id hosting
@@ -217,23 +284,27 @@ resolve_ghostty_terminal_id() {
   host=$(osc7_encode "${HOST:-$(hostname)}")
   local nonce="CW-$pid-$RANDOM$RANDOM-x"
   [[ -w $tty ]] || return 0
-  tty_write "$tty" $'\e]7;file://'"$host/tmp/$nonce"$'\a' || return 0
-  local out
-  out=$(${CLAUDE_WATCHER_OSASCRIPT:-osascript} -e 'on run argv
+  local out="" rc
+  osc_send "$tty" $'\e]7;file://'"$host/tmp/$nonce"$'\a'; rc=$?
+  (( rc == 1 )) && return 0   # nothing went out: the terminal is untouched
+  # rc 2: only part of the nonce went out (now BEL-terminated); just restore.
+  (( rc == 0 )) && out=$(${CLAUDE_WATCHER_OSASCRIPT:-osascript} -e 'on run argv
     set n to "/" & (item 1 of argv)
     tell application "Ghostty"
-      repeat 20 times
-        set ids to id of every terminal whose working directory contains n
-        if (count of ids) > 0 then
-          set AppleScript'"'"'s text item delimiters to linefeed
-          return ids as text
-        end if
-        delay 0.03
-      end repeat
+      with timeout of 3 seconds
+        repeat 20 times
+          set ids to id of every terminal whose working directory contains n
+          if (count of ids) > 0 then
+            set AppleScript'"'"'s text item delimiters to linefeed
+            return ids as text
+          end if
+          delay 0.03
+        end repeat
+      end timeout
     end tell
     return ""
   end run' "$nonce" 2>/dev/null)
-  tty_write "$tty" $'\e]7;file://'"$host$cwd"$'\a'
+  osc_send "$tty" $'\e]7;file://'"$host$cwd"$'\a'
   local -a ids=( ${(f)out} )
   (( ${#ids} == 1 )) && print -r -- "$ids[1]"
 }
@@ -260,34 +331,49 @@ osc7_encode() {
   print -rn -- "$out"
 }
 
-# Writes $2 to tty $1 without ever blocking: a flow-controlled (XOFF) tty fails with EAGAIN
-# instead of hanging the detached probe. (macOS never makes a tty the controlling terminal
-# on open, so no O_NOCTTY is needed; zsh's sysopen does not offer it.) Falls back to a
-# plain append only when zsh/system is unavailable.
-tty_write() {
-  local fd rc
-  if zmodload zsh/system 2>/dev/null; then
-    sysopen -w -a -o nonblock,cloexec -u fd "$1" || return 1
-    syswrite -o $fd -- "$2"; rc=$?
-    exec {fd}>&-
-    return $rc
-  fi
-  print -rn -- "$2" >> "$1"
+# Writes one BEL-terminated OSC sequence $2 to tty $1. If only a prefix went out, still
+# sends the terminating BEL so the terminal is never left inside an unterminated string.
+# Returns tty_write's status for the sequence.
+osc_send() {
+  local rc
+  tty_write "$1" "$2"; rc=$?
+  (( rc == 2 )) && tty_write "$1" $'\a'
+  return $rc
 }
 
-# Per-session lock (a directory) around the state file's read-modify-write. Waits at most
-# ~200 ms, breaks a lock older than 2 s, and returns 1 instead of ever blocking Claude.
-lock_acquire() {
-  local lock=$1 i
-  local -a stale
-  zmodload -e zsh/files || return 1
-  for (( i = 0; i < 20; i++ )); do
-    zf_mkdir "$lock" 2>/dev/null && return 0
-    stale=( $lock(N/ms+2) )
-    if (( ${#stale} )); then zf_rmdir "$lock" 2>/dev/null; continue; fi
-    zmodload zsh/zselect 2>/dev/null || return 1
-    zselect -t 1   # 10 ms (returns 1 on timeout)
+# Writes $2 to tty $1 without ever blocking for long: the fd is non-blocking, so a
+# flow-controlled (XOFF) tty fails with EAGAIN instead of hanging the detached probe. On
+# EAGAIN or a short write it waits for writability (zselect) and retries the remainder, for
+# at most ~200 ms in total. Returns 0 if everything was written, 1 if nothing was, 2 if only
+# a prefix was. (macOS never makes a tty the controlling terminal on open, so no O_NOCTTY is
+# needed; zsh's sysopen does not offer it.) Falls back to a plain append only when
+# zsh/system is unavailable.
+tty_write() {
+  emulate -L zsh
+  setopt no_multibyte
+  local data=$2 fd deadline
+  local -i n sent=0 cs ready=0
+  if ! zmodload zsh/system 2>/dev/null; then
+    print -rn -- "$data" >> "$1" && return 0
+    return 1
+  fi
+  zmodload zsh/zselect 2>/dev/null || return 1
+  sysopen -w -a -o nonblock,cloexec -u fd "$1" || return 1
+  deadline=$(( EPOCHREALTIME + 0.2 ))
+  while (( sent < ${#data} )); do
+    n=0
+    syswrite -c n -o $fd -- "${data[sent+1,-1]}" && { sent=${#data}; break; }
+    (( sent += n ))
+    # zsh exposes no errno here: no progress although zselect said writable is a hard
+    # error (EIO, ...), not EAGAIN, so stop instead of spinning.
+    (( n > 0 || ! ready )) || break
+    (( cs = (deadline - EPOCHREALTIME) * 100 + 1 ))
+    (( cs > 1 )) || break
+    zselect -t $cs -w $fd && ready=1 || ready=0   # 1 on timeout: one last try, then stop
   done
+  exec {fd}>&-
+  (( sent == ${#data} )) && return 0
+  (( sent > 0 )) && return 2
   return 1
 }
 
@@ -319,7 +405,7 @@ find_claude() {
 }
 
 # At most every 10 minutes: drop state files whose claude_pid is dead (or reused by a
-# non-claude process) and tombstones older than an hour.
+# non-claude process), tombstones older than an hour, and sidecars left without either.
 maybe_gc() {
   local dir=$1 stamp="$1/.gc-stamp"
   local -a recent=( $stamp(Nmm-10) )
@@ -355,8 +441,12 @@ maybe_gc() {
     done
   fi
   for f in $dir/*.ended(Nmh+1); do zf_rm -f "$f"; done
+  for f in $dir/[^.]*.ghostty(N); do
+    [[ -e ${f:r}.json || -e ${f:r}.ended ]] || zf_rm -f "$f"
+  done
   for f in $dir/.*.tmp.*(Nmh+1); do zf_rm -f "$f"; done
-  for f in $dir/.lock-*(N/mh+1); do zf_rmdir "$f"; done
+  # Broken probe locks whose rm -rf did not finish; per-session locks of hook version 1.
+  for f in $dir/.probe-*.lock.stale-*(N/mh+1) $dir/.lock-*(N/mh+1); do zf_rm -rf "$f"; done
 }
 
 # --- pure-zsh JSON helpers (fallback when jq is unavailable) -------------------

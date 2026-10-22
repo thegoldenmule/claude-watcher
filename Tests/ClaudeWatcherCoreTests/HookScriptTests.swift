@@ -46,17 +46,25 @@ import Testing
             return Run(status: p.terminationStatus, stdout: String(decoding: out, as: UTF8.self))
         }
 
+        /// The state as the app sees it: `<sid>.json` joined with its `<sid>.ghostty` sidecar.
         func state(_ sid: String) throws -> HookState? {
-            let url = dir.appendingPathComponent("\(sid).json")
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            return try JSONDecoder().decode(HookState.self, from: Data(contentsOf: url))
+            HookStateStore.loadAll(directory: dir)[sid]
+        }
+
+        func json(_ sid: String) -> String? {
+            try? String(contentsOf: dir.appendingPathComponent("\(sid).json"), encoding: .utf8)
+        }
+
+        func sidecar(_ sid: String) -> String? {
+            try? String(contentsOf: dir.appendingPathComponent("\(sid).ghostty"), encoding: .utf8)
         }
 
         func setGhosttyID(_ sid: String, _ id: String) throws {
-            let url = dir.appendingPathComponent("\(sid).json")
-            var text = try String(contentsOf: url, encoding: .utf8)
-            text = text.replacingOccurrences(of: "\"ghostty_terminal_id\":null", with: "\"ghostty_terminal_id\":\"\(id)\"")
-            try Data(text.utf8).write(to: url)
+            try Data(id.utf8).write(to: dir.appendingPathComponent("\(sid).ghostty"))
+        }
+
+        func exists(_ name: String) -> Bool {
+            FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path)
         }
     }
 
@@ -86,7 +94,9 @@ import Testing
         #expect(s.lastEvent == "SessionStart")
         #expect(s.ghosttyTerminalID == nil)
         #expect(abs(s.updatedAt.timeIntervalSinceNow) < 60)
-        // Only the state file (plus GC stamp) remains; no temp files.
+        // The id lives only in the sidecar now.
+        #expect(env.json("s-1")?.contains("ghostty_terminal_id") == false)
+        // Only the state file (plus GC stamp) remains; no temp files, no locks.
         let names = try FileManager.default.contentsOfDirectory(atPath: env.dir.path).sorted()
         #expect(names == [".gc-stamp", "s-1.json"])
     }
@@ -100,6 +110,21 @@ import Testing
         let s = try #require(try env.state("s-1"))
         #expect(s.lastEvent == "UserPromptSubmit")
         #expect(s.ghosttyTerminalID == "0FD9735C-6645-44F3-975D-7BC605D03215")
+        #expect(env.sidecar("s-1") == "0FD9735C-6645-44F3-975D-7BC605D03215")
+    }
+
+    @Test func concurrentHooksNeverTouchTheSidecar() throws {
+        let env = try Env(noJQ: false)
+        try env.run(Self.input("s-1", "SessionStart"))
+        try env.setGhosttyID("s-1", "GID-1")
+        let sidecar = env.dir.appendingPathComponent("s-1.ghostty")
+        let inode = try FileManager.default.attributesOfItem(atPath: sidecar.path)[.systemFileNumber] as? Int
+        DispatchQueue.concurrentPerform(iterations: 16) { i in
+            _ = try? env.run(Self.input("s-1", i.isMultiple(of: 2) ? "UserPromptSubmit" : "Stop"))
+        }
+        #expect(try FileManager.default.attributesOfItem(atPath: sidecar.path)[.systemFileNumber] as? Int == inode)
+        #expect(try env.state("s-1")?.ghosttyTerminalID == "GID-1")
+        #expect(env.json("s-1")?.contains("GID-1") == false)
     }
 
     @Test(arguments: [false, true])
@@ -122,13 +147,41 @@ import Testing
         try env.run(Self.input("old", "SessionStart"))
         try env.setGhosttyID("old", "GID-1")
         try env.run(Self.input("old", "SessionEnd"))
+        // The tombstone keeps its sidecar for the successor.
+        #expect(env.exists("old.ended") && env.sidecar("old") == "GID-1")
         try env.run(Self.input("new", "SessionStart"))
         #expect(try env.state("old") == nil)
         #expect(try env.state("new")?.ghosttyTerminalID == "GID-1")
-        // A still-live file for the same pid (no SessionEnd seen) is also dropped.
+        #expect(env.sidecar("new") == "GID-1")
+        // A still-live file for the same pid (no SessionEnd seen) is also dropped, sidecar included.
         try env.run(Self.input("newer", "SessionStart"))
         #expect(try env.state("new") == nil)
+        #expect(env.sidecar("new") == nil)
         #expect(try env.state("newer")?.ghosttyTerminalID == "GID-1")
+    }
+
+    @Test func successorInAnotherTerminalDoesNotInherit() throws {
+        let env = try Env(noJQ: false)
+        try env.run(Self.input("old", "SessionStart"), extraEnv: ["CLAUDE_WATCHER_TTY": "/dev/ttys901"])
+        try env.setGhosttyID("old", "GID-1")
+        try env.run(Self.input("new", "SessionStart"), extraEnv: ["CLAUDE_WATCHER_TTY": "/dev/ttys902"])
+        #expect(try env.state("new")?.ghosttyTerminalID == nil)
+        #expect(env.sidecar("new") == nil)
+    }
+
+    @Test func ownSidecarSurvivesOnlyARestartInTheSameProcess() throws {
+        let env = try Env(noJQ: false)
+        try env.run(Self.input("s-1", "SessionStart"))
+        try env.setGhosttyID("s-1", "GID-1")
+        // SessionStart "compact" (same id, same process): kept.
+        try env.run(Self.input("s-1", "SessionStart"))
+        #expect(try env.state("s-1")?.ghosttyTerminalID == "GID-1")
+        // --resume of the same id in another claude process (our parent here): dropped.
+        try env.run(Self.input("s-1", "SessionEnd"))
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: ["CLAUDE_WATCHER_CLAUDE_PID": String(getppid())])
+        #expect(try env.state("s-1")?.claudePID == getppid())
+        #expect(try env.state("s-1")?.ghosttyTerminalID == nil)
+        #expect(env.sidecar("s-1") == nil)
     }
 
     @Test(arguments: [false, true])
@@ -158,10 +211,22 @@ import Testing
         let notClaude = #"{"session_id":"init","claude_pid":1,"last_event":"Stop","updated_at":1}"#
         try Data(dead.utf8).write(to: env.dir.appendingPathComponent("dead.json"))
         try Data(notClaude.utf8).write(to: env.dir.appendingPathComponent("init.json"))
+        try env.setGhosttyID("dead", "GID-D")
+        try env.setGhosttyID("orphan", "GID-O")
+        try Data().write(to: env.dir.appendingPathComponent("ended.ended"))
+        try env.setGhosttyID("ended", "GID-E")
+        let grave = env.dir.appendingPathComponent(".probe-ttys009.lock.stale-1")
+        try FileManager.default.createDirectory(at: grave, withIntermediateDirectories: true)
+        try Data("1 x".utf8).write(to: grave.appendingPathComponent("owner"))
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-7200)], ofItemAtPath: grave.path)
         try env.run(Self.input("s-1", "Stop"))
         #expect(try env.state("dead") == nil)
         #expect(try env.state("init") == nil)
         #expect(try env.state("s-1") != nil)
+        #expect(env.sidecar("dead") == nil)
+        #expect(env.sidecar("orphan") == nil)
+        #expect(env.sidecar("ended") == "GID-E")   // tombstone still there: kept for a successor
+        #expect(!env.exists(grave.lastPathComponent))
     }
 
     @Test func isFast() throws {
@@ -175,16 +240,23 @@ import Testing
 
     // MARK: Ghostty OSC 7 probe (fake tty file + stub osascript)
 
-    /// Sets up a probe run: a regular file as the tty and an osascript stub that records the
-    /// nonce it was asked about and prints `ids` (one per line).
-    static func probeEnv(_ env: Env, ids: [String]) throws -> [String: String] {
+    /// Sets up a probe run: a regular file as the tty (unless `fifo`) and an osascript stub that
+    /// records the nonce it was asked about (in `nonces`), sleeps `delay` seconds and prints
+    /// `ids` (one per line).
+    static func probeEnv(_ env: Env, ids: [String], delay: Double = 0, fifo: Bool = false) throws -> [String: String] {
         let tty = env.dir.appendingPathComponent("tty")
-        try Data().write(to: tty)
+        if fifo {
+            try? FileManager.default.removeItem(at: tty)
+            #expect(mkfifo(tty.path, 0o600) == 0)
+        } else {
+            try Data().write(to: tty)
+        }
         let stub = env.dir.appendingPathComponent("osascript-stub")
         let script = """
         #!/bin/sh
         for a; do last=$a; done
         printf '%s\\n' "$last" >> "$(dirname "$0")/nonces"
+        sleep \(delay)
         printf '\(ids.joined(separator: "\\n"))'
         """
         try Data(script.utf8).write(to: stub)
@@ -197,15 +269,14 @@ import Testing
         let end = Date().addingTimeInterval(timeout)
         while Date() < end {
             if try cond() { return true }
-            Thread.sleep(forTimeInterval: 0.02)
+            Thread.sleep(forTimeInterval: 0.01)
         }
         return try cond()
     }
 
-    /// The OSC 7 sequences written to the fake tty, as (host, path) still percent-encoded.
+    /// The OSC 7 sequences in `bytes`, as (host, path) still percent-encoded.
     /// Every byte inside a sequence must be printable ASCII without spaces.
-    static func osc7Writes(_ env: Env) throws -> [(host: String, path: String)] {
-        let bytes = try Data(contentsOf: env.dir.appendingPathComponent("tty"))
+    static func osc7Sequences(_ bytes: Data) -> [(host: String, path: String)] {
         var result: [(String, String)] = []
         for chunk in bytes.split(separator: 0x07, omittingEmptySubsequences: true) {
             let prefix = Array("\u{1B}]7;file://".utf8)
@@ -218,6 +289,13 @@ import Testing
         }
         return result
     }
+
+    /// The OSC 7 sequences written to the fake tty file.
+    static func osc7Writes(_ env: Env) throws -> [(host: String, path: String)] {
+        osc7Sequences(try Data(contentsOf: env.dir.appendingPathComponent("tty")))
+    }
+
+    static let probeLock = ".probe-tty.lock"
 
     @Test(arguments: [false, true])
     func probeRestoresAnEncodedSafeCwd(noJQ: Bool) throws {
@@ -234,6 +312,10 @@ import Testing
         #expect(r.status == 0)
         #expect(r.stdout.isEmpty)
         #expect(try Self.waitFor { try env.state("s-1")?.ghosttyTerminalID == "GID-1" })
+        // The probe writes the sidecar and leaves <sid>.json alone; it released its lock first.
+        #expect(env.sidecar("s-1") == "GID-1")
+        #expect(env.json("s-1")?.contains("GID-1") == false)
+        #expect(!env.exists(Self.probeLock))
 
         let writes = try Self.osc7Writes(env)
         try #require(writes.count == 2)
@@ -256,6 +338,7 @@ import Testing
         #expect(try Self.waitFor { try Self.osc7Writes(env).count == 2 })
         Thread.sleep(forTimeInterval: 0.3)
         #expect(try env.state("s-1")?.ghosttyTerminalID == nil)
+        #expect(env.sidecar("s-1") == nil)
 
         // The nonce ends in a delimiter, so an older nonce for the same pid that merely starts
         // with the same digits ("CW-<pid>-12345" vs "CW-<pid>-1234567") can't contain it.
@@ -269,13 +352,18 @@ import Testing
         #expect(try Self.waitFor { try env.state("s-2")?.ghosttyTerminalID == "GID-3" })
     }
 
+    @Test func probeAppleScriptHasATimeout() throws {
+        let text = try String(contentsOf: Self.script, encoding: .utf8)
+        #expect(text.contains("with timeout of 3 seconds"))
+    }
+
     @Test func probeIDSurvivesConcurrentHookWrites() throws {
         let env = try Env(noJQ: false)
-        let extra = try Self.probeEnv(env, ids: ["GID-1"])
+        let extra = try Self.probeEnv(env, ids: ["GID-1"], delay: 0.2)
         try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
-        // Hooks of the same session race the detached probe's patch; none may drop the id.
+        // Hooks of the same session race the detached probe; none may drop the id.
         let start = Date()
-        while Date().timeIntervalSince(start) < 1.5 {
+        while Date().timeIntervalSince(start) < 3 {
             DispatchQueue.concurrentPerform(iterations: 4) { _ in
                 _ = try? env.run(Self.input("s-1", "UserPromptSubmit"))
             }
@@ -290,31 +378,193 @@ import Testing
         #expect(try env.state("s-1")?.lastEvent == "UserPromptSubmit")
     }
 
-    // MARK: Per-session lock
-
-    @Test func heldLockIsWaitedForBrieflyThenIgnored() throws {
+    @Test func probeHandsTheIDToAClearSuccessor() throws {
         let env = try Env(noJQ: false)
-        let lock = env.dir.appendingPathComponent(".lock-s-1")
-        try FileManager.default.createDirectory(at: lock, withIntermediateDirectories: false)
-        let start = Date()
-        let r = try env.run(Self.input("s-1", "Stop"))
-        let elapsed = Date().timeIntervalSince(start)
-        #expect(r.status == 0)
-        #expect(elapsed >= 0.15, "did not wait for the lock (\(elapsed)s)")
-        #expect(elapsed < 2, "waited too long for the lock (\(elapsed)s)")
-        #expect(try env.state("s-1") != nil)
-        // Not ours, so not removed.
-        #expect(FileManager.default.fileExists(atPath: lock.path))
+        let extra = try Self.probeEnv(env, ids: ["GID-1"], delay: 0.6)
+        try env.run(Self.input("old", "SessionStart"), extraEnv: extra)
+        // /clear while the probe is still asking Ghostty: the old session ends and a new one
+        // starts in the same process and terminal, with nothing to inherit yet.
+        #expect(Self.waitFor { env.exists("nonces") })
+        try env.run(Self.input("old", "SessionEnd"))
+        var successor = extra
+        successor["CLAUDE_WATCHER_NO_GHOSTTY_PROBE"] = "1"
+        try env.run(Self.input("new", "SessionStart"), extraEnv: successor)
+        #expect(try env.state("new")?.ghosttyTerminalID == nil)
+        #expect(try Self.waitFor { try env.state("new")?.ghosttyTerminalID == "GID-1" })
+        #expect(env.sidecar("old") == "GID-1")   // next to the tombstone, for a later successor
+        #expect(try env.state("old") == nil)
     }
 
-    @Test func staleLockIsBroken() throws {
-        let env = try Env(noJQ: false)
-        let lock = env.dir.appendingPathComponent(".lock-s-1")
+    // MARK: Probe lock (shared with the app's OSC 7 probe)
+
+    func makeLock(_ env: Env, owner: String, age: TimeInterval = 0) throws -> URL {
+        let lock = env.dir.appendingPathComponent(Self.probeLock)
         try FileManager.default.createDirectory(at: lock, withIntermediateDirectories: false)
-        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-30)], ofItemAtPath: lock.path)
-        let r = try env.run(Self.input("s-1", "Stop"))
-        #expect(r.status == 0)
-        #expect(try env.state("s-1") != nil)
-        #expect(!FileManager.default.fileExists(atPath: lock.path))
+        try Data(owner.utf8).write(to: lock.appendingPathComponent("owner"))
+        if age > 0 {
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: lock.path)
+        }
+        return lock
+    }
+
+    @Test func probeWaitsForAHeldLock() throws {
+        let env = try Env(noJQ: false)
+        let extra = try Self.probeEnv(env, ids: ["GID-1"])
+        let lock = try makeLock(env, owner: "1 app-token")
+        let start = Date()
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        #expect(Date().timeIntervalSince(start) < 0.5, "the main hook must not wait for the probe lock")
+        Thread.sleep(forTimeInterval: 0.4)
+        #expect(!env.exists("nonces"))
+        try FileManager.default.removeItem(at: lock)   // the other probe releases its lock
+        #expect(try Self.waitFor(2) { try env.state("s-1")?.ghosttyTerminalID == "GID-1" })
+        #expect(!env.exists(Self.probeLock))
+    }
+
+    @Test func probeGivesUpOnALockHeldOverOneSecond() throws {
+        let env = try Env(noJQ: false)
+        let extra = try Self.probeEnv(env, ids: ["GID-1"])
+        let lock = try makeLock(env, owner: "1 app-token")
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        Thread.sleep(forTimeInterval: 1.5)
+        try FileManager.default.removeItem(at: lock)
+        Thread.sleep(forTimeInterval: 0.5)
+        // It gave up after ~1 s instead of probing once the lock went away.
+        #expect(!env.exists("nonces"))
+        #expect(env.sidecar("s-1") == nil)
+        #expect(!env.exists(Self.probeLock))
+    }
+
+    @Test func staleProbeLockIsBrokenByRename() throws {
+        let env = try Env(noJQ: false)
+        let extra = try Self.probeEnv(env, ids: ["GID-1"])
+        // Not empty (owner file inside), so a plain rmdir could not have removed it.
+        _ = try makeLock(env, owner: "1 dead-token", age: 30)
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        #expect(try Self.waitFor { try env.state("s-1")?.ghosttyTerminalID == "GID-1" })
+        let names = try FileManager.default.contentsOfDirectory(atPath: env.dir.path)
+        #expect(!names.contains { $0.hasPrefix(".probe-") }, "\(names)")
+    }
+
+    @Test func probeReleasesOnlyALockItStillOwns() throws {
+        let env = try Env(noJQ: false)
+        let extra = try Self.probeEnv(env, ids: ["GID-1"], delay: 0.5)
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        let lock = env.dir.appendingPathComponent(Self.probeLock)
+        let ownerFile = lock.appendingPathComponent("owner")
+        #expect(Self.waitFor { env.exists("nonces") })
+        let owner = try String(contentsOf: ownerFile, encoding: .utf8).trimmingCharacters(in: .newlines)
+        #expect(owner.wholeMatch(of: /\d+ \S+/) != nil, "owner \(owner)")
+        // Someone breaks the probe's lock (as if stale) and takes it while the probe runs.
+        try FileManager.default.moveItem(at: lock, to: env.dir.appendingPathComponent("\(Self.probeLock).stale-test"))
+        try FileManager.default.removeItem(at: env.dir.appendingPathComponent("\(Self.probeLock).stale-test"))
+        _ = try makeLock(env, owner: "1 theirs")
+        #expect(try Self.waitFor { try env.state("s-1")?.ghosttyTerminalID == "GID-1" })
+        #expect(try String(contentsOf: ownerFile, encoding: .utf8) == "1 theirs")
+    }
+
+    // MARK: Non-blocking tty writes (FIFO standing in for a flow-controlled tty)
+
+    /// A FIFO "tty" whose pipe buffer is completely full (NUL filler), plus its read end.
+    static func fullFIFO(_ env: Env) -> (read: Int32, write: Int32) {
+        let path = env.dir.appendingPathComponent("tty").path
+        let r = open(path, O_RDONLY | O_NONBLOCK)
+        let w = open(path, O_WRONLY | O_NONBLOCK)
+        #expect(r >= 0 && w >= 0)
+        let zeros = [UInt8](repeating: 0, count: 4096)
+        while write(w, zeros, zeros.count) > 0 {}
+        while write(w, zeros, 1) > 0 {}
+        return (r, w)
+    }
+
+    /// Reads up to `count` bytes (all available when nil) from a non-blocking fd.
+    static func drain(_ fd: Int32, _ count: Int? = nil) -> Data {
+        var out = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while count.map({ out.count < $0 }) ?? true {
+            let want = min(buf.count, count.map { $0 - out.count } ?? buf.count)
+            let n = read(fd, &buf, want)
+            if n <= 0 { break }
+            out.append(contentsOf: buf[0..<n])
+        }
+        return out
+    }
+
+    /// Drains `fd` in `chunk`-byte steps every `interval` until `done`, then completely.
+    /// Returns everything read except the NUL filler.
+    static func drainSlowly(_ fd: Int32, chunk: Int, every interval: TimeInterval, until done: () -> Bool) -> Data {
+        var out = Data()
+        let end = Date().addingTimeInterval(10)
+        while !done() && Date() < end {
+            out.append(drain(fd, chunk))
+            Thread.sleep(forTimeInterval: interval)
+        }
+        out.append(drain(fd))
+        return out.filter { $0 != 0 }
+    }
+
+    @Test func probeRetriesShortWritesAndEAGAIN() throws {
+        let env = try Env(noJQ: false)
+        var extra = try Self.probeEnv(env, ids: ["GID-1"], fifo: true)
+        let host = String(repeating: "h", count: 1500)   // > PIPE_BUF: writes can be partial
+        extra["HOST"] = host
+        let fifo = Self.fullFIFO(env)
+        defer { close(fifo.read); close(fifo.write) }
+        try env.run(Self.input("s-1", "SessionStart", cwd: "/tmp"), extraEnv: extra)
+        // Free 1000 bytes every 30 ms: each ~1.5 KB sequence starts on a full pipe (EAGAIN)
+        // and needs two partial writes, well within the 200 ms retry budget.
+        let bytes = Self.drainSlowly(fifo.read, chunk: 1000, every: 0.03) { env.sidecar("s-1") != nil }
+        #expect(env.sidecar("s-1") == "GID-1")
+        let writes = Self.osc7Sequences(bytes)
+        try #require(writes.count == 2, "\(writes.map(\.path))")
+        #expect(writes.allSatisfy { $0.host == host })
+        #expect(writes[0].path.hasPrefix("/tmp/CW-"))
+        #expect(writes[1].path == "/tmp")
+    }
+
+    static func available(_ fd: Int32) -> Int32 {
+        var n: Int32 = 0
+        return ioctl(fd, 0x4004_667F /* FIONREAD */, &n) == 0 ? n : -1
+    }
+
+    @Test func probeTerminatesAPartialNonceAndStillRestores() throws {
+        let env = try Env(noJQ: false)
+        var extra = try Self.probeEnv(env, ids: ["GID-1"], fifo: true)
+        let host = String(repeating: "h", count: 1500)
+        extra["HOST"] = host
+        let fifo = Self.fullFIFO(env)
+        defer { close(fifo.read); close(fifo.write) }
+        let capacity = Self.available(fifo.read)
+        // 700 bytes free: the ~1.5 KB nonce sequence goes out only partly (macOS pipes take a
+        // partial write once >= PIPE_BUF is free), then nothing more fits for its 200 ms budget.
+        #expect(Self.drain(fifo.read, 700).count == 700)
+        try env.run(Self.input("s-1", "SessionStart", cwd: "/tmp"), extraEnv: extra)
+        #expect(Self.waitFor(2) { Self.available(fifo.read) == capacity }, "no partial write")
+        // Room again after the nonce gave up (+200 ms) but within the BEL's retry budget (+400 ms).
+        Thread.sleep(forTimeInterval: 0.3)
+        let bytes = Self.drainSlowly(fifo.read, chunk: 4096, every: 0.01) { !env.exists(Self.probeLock) }
+        // Partial nonce, BEL, then the full restore: never an unterminated OSC string.
+        let chunks = bytes.split(separator: 0x07, omittingEmptySubsequences: false)
+        try #require(chunks.count == 3, "\(chunks.map(\.count))")
+        let prefix = Data("\u{1B}]7;file://".utf8)
+        #expect(Data(chunks[0]) == (prefix + Data(host.utf8)).prefix(700))
+        #expect(Data(chunks[1]) == prefix + Data(host.utf8) + Data("/tmp".utf8))
+        #expect(chunks[2].isEmpty)
+        #expect(!env.exists("nonces"), "a partial nonce must not be looked up")
+        #expect(env.sidecar("s-1") == nil)
+    }
+
+    @Test func probeGivesUpOnATTYThatNeverDrains() throws {
+        let env = try Env(noJQ: false)
+        let extra = try Self.probeEnv(env, ids: ["GID-1"], fifo: true)
+        let fifo = Self.fullFIFO(env)
+        defer { close(fifo.read); close(fifo.write) }
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        // Nothing fits: the probe gives up within its ~200 ms write budget, touching nothing.
+        Thread.sleep(forTimeInterval: 1)
+        #expect(!env.exists(Self.probeLock))
+        #expect(!env.exists("nonces"))
+        #expect(Self.drain(fifo.read).allSatisfy { $0 == 0 })
+        #expect(env.sidecar("s-1") == nil)
     }
 }

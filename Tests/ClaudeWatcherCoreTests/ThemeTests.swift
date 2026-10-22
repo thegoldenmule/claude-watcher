@@ -25,31 +25,31 @@ private let latte = """
     foreground = #4c4f69
     """
 
-@Suite struct RGBColorTests {
+@Suite struct GhosttyColorTests {
     @Test func parsesHexForms() {
-        #expect(RGBColor(ghostty: "#282c34") == RGBColor(0x282c34))
-        #expect(RGBColor(ghostty: "282C34") == RGBColor(0x282c34))
-        #expect(RGBColor(ghostty: "#fff") == RGBColor(0xffffff))
-        #expect(RGBColor(ghostty: " #000000 ") == RGBColor(0x000000))
-        #expect(RGBColor(ghostty: "Red") == RGBColor(0xff0000))
+        #expect(GhosttyColor(ghostty: "#282c34") == GhosttyColor(0x282c34))
+        #expect(GhosttyColor(ghostty: "282C34") == GhosttyColor(0x282c34))
+        #expect(GhosttyColor(ghostty: "#fff") == GhosttyColor(0xffffff))
+        #expect(GhosttyColor(ghostty: " #000000 ") == GhosttyColor(0x000000))
+        #expect(GhosttyColor(ghostty: "Red") == GhosttyColor(0xff0000))
     }
 
     @Test func rejectsGarbageAndKeywords() {
-        #expect(RGBColor(ghostty: "") == nil)
-        #expect(RGBColor(ghostty: "#12345") == nil)
-        #expect(RGBColor(ghostty: "#gg0000") == nil)
-        #expect(RGBColor(ghostty: "cell-foreground") == nil)
+        #expect(GhosttyColor(ghostty: "") == nil)
+        #expect(GhosttyColor(ghostty: "#12345") == nil)
+        #expect(GhosttyColor(ghostty: "#gg0000") == nil)
+        #expect(GhosttyColor(ghostty: "cell-foreground") == nil)
     }
 
     @Test func hexRoundTripAndLightness() {
-        #expect(RGBColor(0x1e1e2e).hexString == "#1e1e2e")
-        #expect(RGBColor(0xeff1f5).isLight)
-        #expect(!RGBColor(0x282c34).isLight)
-        #expect(RGBColor(0x000000).contrast(with: RGBColor(0xffffff)) > 20.9)
+        #expect(GhosttyColor(0x1e1e2e).hexString == "#1e1e2e")
+        #expect(GhosttyColor(0xeff1f5).isLight)
+        #expect(!GhosttyColor(0x282c34).isLight)
+        #expect(GhosttyColor(0x000000).contrast(with: GhosttyColor(0xffffff)) > 20.9)
     }
 
     @Test func darkenScalesChannels() {
-        #expect(RGBColor(0x804020).darkened(by: 0.5) == RGBColor(red: 0x40 / 255.0, green: 0x20 / 255.0, blue: 0x10 / 255.0))
+        #expect(GhosttyColor(0x804020).darkened(by: 0.5) == GhosttyColor(red: 0x40 / 255.0, green: 0x20 / 255.0, blue: 0x10 / 255.0))
     }
 }
 
@@ -99,11 +99,11 @@ private let latte = """
 @Suite struct GhosttyThemeApplyTests {
     @Test func defaultsMatchStockGhostty() {
         let t = GhosttyTheme.ghosttyDefault
-        #expect(t.background == RGBColor(0x282c34))
-        #expect(t.foreground == RGBColor(0xffffff))
+        #expect(t.background == GhosttyColor(0x282c34))
+        #expect(t.foreground == GhosttyColor(0xffffff))
         #expect(t.palette.count == 16)
-        #expect(t.ansi(3) == RGBColor(0xf0c674))
-        #expect(t.ansi(8) == RGBColor(0x666666))
+        #expect(t.ansi(3) == GhosttyColor(0xf0c674))
+        #expect(t.ansi(8) == GhosttyColor(0x666666))
         #expect(t.fontSize == 13)
         #expect(t.backgroundOpacity == 1)
         #expect(t.backgroundBlur == .off)
@@ -134,8 +134,8 @@ private let latte = """
             selection-background = cell-foreground
             faint-opacity = 0.6
             """))
-        #expect(t.ansi(4) == RGBColor(0x0000ff))
-        #expect(t.ansi(12) == RGBColor(0x0000aa))
+        #expect(t.ansi(4) == GhosttyColor(0x0000ff))
+        #expect(t.ansi(12) == GhosttyColor(0x0000aa))
         #expect(t.palette.count == 16)
         #expect(t.fontFamilies == ["JetBrains Mono", "Menlo"])
         #expect(t.fontSize == 15.5)
@@ -145,7 +145,7 @@ private let latte = """
         #expect(t.paddingX == (4, 8))
         #expect(t.paddingY == (6, 6))
         #expect(t.unfocusedSplitOpacity == 0.15)
-        #expect(t.effectiveSplitDividerColor == RGBColor(0x333333))
+        #expect(t.effectiveSplitDividerColor == GhosttyColor(0x333333))
         #expect(t.selectionBackground == nil)
         #expect(t.faintOpacity == 0.6)
     }
@@ -163,7 +163,7 @@ private let latte = """
             """))
         #expect(t.fontFamilies.isEmpty)
         #expect(t.fontSize == 13)
-        #expect(t.background == RGBColor(0x282c34))
+        #expect(t.background == GhosttyColor(0x282c34))
         #expect(t.backgroundBlur == .radius(30))
     }
 
@@ -179,9 +179,9 @@ private let latte = """
 
     @Test func splitDividerDefaultDarkensBackground() {
         var t = GhosttyTheme.ghosttyDefault
-        #expect(t.effectiveSplitDividerColor == RGBColor(0x282c34).darkened(by: 0.4))
+        #expect(t.effectiveSplitDividerColor == GhosttyColor(0x282c34).darkened(by: 0.4))
         t.apply(GhosttyConfigEntry("background", "#eff1f5"))
-        #expect(t.effectiveSplitDividerColor == RGBColor(0xeff1f5).darkened(by: 0.08))
+        #expect(t.effectiveSplitDividerColor == GhosttyColor(0xeff1f5).darkened(by: 0.08))
     }
 }
 
@@ -215,11 +215,11 @@ private let latte = """
         let t = load.theme
         #expect(t.themeName == "Catppuccin Mocha")
         // Config keys win over the theme regardless of their position in the file.
-        #expect(t.background == RGBColor(0x000000))
-        #expect(t.ansi(1) == RGBColor(0xff0000))
-        #expect(t.foreground == RGBColor(0xcdd6f4))
-        #expect(t.ansi(3) == RGBColor(0xf9e2af))
-        #expect(t.selectionBackground == RGBColor(0x585b70))
+        #expect(t.background == GhosttyColor(0x000000))
+        #expect(t.ansi(1) == GhosttyColor(0xff0000))
+        #expect(t.foreground == GhosttyColor(0xcdd6f4))
+        #expect(t.ansi(3) == GhosttyColor(0xf9e2af))
+        #expect(t.selectionBackground == GhosttyColor(0x585b70))
         #expect(t.fontSize == 14)
         #expect(load.watchedPaths.contains("/res/themes/Catppuccin Mocha"))
     }
@@ -233,9 +233,9 @@ private let latte = """
         let dark = loader(map).load(prefersDark: true)
         let light = loader(map).load(prefersDark: false)
         #expect(dark.followsAppearance && light.followsAppearance)
-        #expect(dark.theme.background == RGBColor(0x1e1e2e))
-        #expect(light.theme.background == RGBColor(0xeff1f5))
-        #expect(light.theme.ansi(3) == RGBColor(0xdf8e1d))
+        #expect(dark.theme.background == GhosttyColor(0x1e1e2e))
+        #expect(light.theme.background == GhosttyColor(0xeff1f5))
+        #expect(light.theme.ansi(3) == GhosttyColor(0xdf8e1d))
         #expect(!light.theme.isDark)
     }
 
@@ -245,9 +245,9 @@ private let latte = """
             "/cfg/xdg/themes/Mine": "background = #111111",
             "/res/themes/Mine": "background = #222222",
         ]
-        #expect(loader(map).load(prefersDark: true).theme.background == RGBColor(0x111111))
+        #expect(loader(map).load(prefersDark: true).theme.background == GhosttyColor(0x111111))
         let abs = ["/cfg/xdg/config": "theme = ~/t/x", "/home/t/x": "background = #333333"]
-        #expect(loader(abs).load(prefersDark: true).theme.background == RGBColor(0x333333))
+        #expect(loader(abs).load(prefersDark: true).theme.background == GhosttyColor(0x333333))
     }
 
     @Test func missingThemeKeepsDefaults() {
@@ -281,7 +281,7 @@ private let latte = """
         // The include comes after the including file, so its background wins.
         var t = GhosttyTheme.ghosttyDefault
         t.apply(config.entries)
-        #expect(t.background == RGBColor(0x020202))
+        #expect(t.background == GhosttyColor(0x020202))
         #expect(t.fontSize == 18)
         #expect(config.files.contains("/cfg/xdg/colors.conf"))
         #expect(config.files.contains("/cfg/xdg/missing.conf"))
@@ -293,7 +293,7 @@ private let latte = """
             "/cfg/xdg/config": "theme = Catppuccin Mocha\nbackground = #000000\nfont-size = 15",
             "/res/themes/Catppuccin Latte": latte,
         ], override: "Catppuccin Latte").load(prefersDark: true)
-        #expect(load.theme.background == RGBColor(0xeff1f5))
+        #expect(load.theme.background == GhosttyColor(0xeff1f5))
         #expect(load.theme.fontSize == 15, "non-color keys still apply")
     }
 

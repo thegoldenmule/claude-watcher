@@ -12,13 +12,13 @@ public struct GhosttyTheme: Sendable, Equatable {
         case glass(clear: Bool)
     }
 
-    public var background: RGBColor
-    public var foreground: RGBColor
+    public var background: GhosttyColor
+    public var foreground: GhosttyColor
     /// The 16 ANSI colors (0-7 normal, 8-15 bright).
-    public var palette: [RGBColor]
-    public var cursorColor: RGBColor?
-    public var selectionBackground: RGBColor?
-    public var selectionForeground: RGBColor?
+    public var palette: [GhosttyColor]
+    public var cursorColor: GhosttyColor?
+    public var selectionBackground: GhosttyColor?
+    public var selectionForeground: GhosttyColor?
     /// `font-family` values in order (fallbacks follow the first). Empty means Ghostty's
     /// built-in JetBrains Mono.
     public var fontFamilies: [String]
@@ -31,22 +31,22 @@ public struct GhosttyTheme: Sendable, Equatable {
     /// `window-padding-y`: top, bottom.
     public var paddingY: (Double, Double)
     public var unfocusedSplitOpacity: Double
-    public var unfocusedSplitFill: RGBColor?
-    public var splitDividerColor: RGBColor?
+    public var unfocusedSplitFill: GhosttyColor?
+    public var splitDividerColor: GhosttyColor?
     /// Opacity of SGR 2 ("faint") text.
     public var faintOpacity: Double
     /// Theme name that was applied, if any (for logs).
     public var themeName: String?
 
-    public static let defaultPalette: [RGBColor] = [
+    public static let defaultPalette: [GhosttyColor] = [
         0x1d1f21, 0xcc6666, 0xb5bd68, 0xf0c674, 0x81a2be, 0xb294bb, 0x8abeb7, 0xc5c8c6,
         0x666666, 0xd54e53, 0xb9ca4a, 0xe7c547, 0x7aa6da, 0xc397d8, 0x70c0b1, 0xeaeaea,
-    ].map(RGBColor.init)
+    ].map(GhosttyColor.init)
 
     /// Stock Ghostty 1.3.
     public static let ghosttyDefault = GhosttyTheme(
-        background: RGBColor(0x282c34),
-        foreground: RGBColor(0xffffff),
+        background: GhosttyColor(0x282c34),
+        foreground: GhosttyColor(0xffffff),
         palette: defaultPalette,
         cursorColor: nil,
         selectionBackground: nil,
@@ -80,21 +80,21 @@ public struct GhosttyTheme: Sendable, Equatable {
     // MARK: - Derived colors
 
     /// ANSI color `index` (0...15); out-of-range indices fall back to the foreground.
-    public func ansi(_ index: Int) -> RGBColor {
+    public func ansi(_ index: Int) -> GhosttyColor {
         palette.indices.contains(index) ? palette[index] : foreground
     }
 
     public var isDark: Bool { !background.isLight }
 
     /// Ghostty inverts the cell when no selection colors are set.
-    public var effectiveSelectionBackground: RGBColor { selectionBackground ?? foreground }
-    public var effectiveSelectionForeground: RGBColor { selectionForeground ?? background }
+    public var effectiveSelectionBackground: GhosttyColor { selectionBackground ?? foreground }
+    public var effectiveSelectionForeground: GhosttyColor { selectionForeground ?? background }
     /// Ghostty's block cursor defaults to the foreground color.
-    public var effectiveCursorColor: RGBColor { cursorColor ?? foreground }
+    public var effectiveCursorColor: GhosttyColor { cursorColor ?? foreground }
 
     /// Ghostty macOS's split divider: the configured color, else the background darkened by 8%
     /// (light backgrounds) or 40% (dark ones).
-    public var effectiveSplitDividerColor: RGBColor {
+    public var effectiveSplitDividerColor: GhosttyColor {
         splitDividerColor ?? background.darkened(by: background.isLight ? 0.08 : 0.4)
     }
 
@@ -107,17 +107,17 @@ public struct GhosttyTheme: Sendable, Equatable {
         let d = Self.ghosttyDefault
         switch entry.key {
         case "background":
-            background = value.isEmpty ? d.background : (RGBColor(ghostty: value) ?? background)
+            background = value.isEmpty ? d.background : (GhosttyColor(ghostty: value) ?? background)
         case "foreground":
-            foreground = value.isEmpty ? d.foreground : (RGBColor(ghostty: value) ?? foreground)
+            foreground = value.isEmpty ? d.foreground : (GhosttyColor(ghostty: value) ?? foreground)
         case "palette":
             applyPalette(value)
         case "cursor-color":
-            cursorColor = RGBColor(ghostty: value)
+            cursorColor = GhosttyColor(ghostty: value)
         case "selection-background":
-            selectionBackground = RGBColor(ghostty: value)
+            selectionBackground = GhosttyColor(ghostty: value)
         case "selection-foreground":
-            selectionForeground = RGBColor(ghostty: value)
+            selectionForeground = GhosttyColor(ghostty: value)
         case "font-family":
             if value.isEmpty { fontFamilies = [] } else { fontFamilies.append(value) }
         case "font-size":
@@ -143,9 +143,9 @@ public struct GhosttyTheme: Sendable, Equatable {
                 unfocusedSplitOpacity = min(max(v, 0.15), 1)  // Ghostty's clamp
             }
         case "unfocused-split-fill":
-            unfocusedSplitFill = RGBColor(ghostty: value)
+            unfocusedSplitFill = GhosttyColor(ghostty: value)
         case "split-divider-color":
-            splitDividerColor = RGBColor(ghostty: value)
+            splitDividerColor = GhosttyColor(ghostty: value)
         case "faint-opacity":
             if value.isEmpty {
                 faintOpacity = d.faintOpacity
@@ -168,7 +168,7 @@ public struct GhosttyTheme: Sendable, Equatable {
         let index: Int? = indexText.lowercased().hasPrefix("0x")
             ? Int(indexText.dropFirst(2), radix: 16) : Int(indexText)
         guard let index, palette.indices.contains(index),
-              let color = RGBColor(ghostty: String(value[value.index(after: eq)...]))
+              let color = GhosttyColor(ghostty: String(value[value.index(after: eq)...]))
         else { return }
         palette[index] = color
     }

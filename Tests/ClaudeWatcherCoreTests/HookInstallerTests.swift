@@ -95,6 +95,14 @@ import Testing
         return groups.flatMap { $0["hooks"] as? [[String: Any]] ?? [] }
     }
 
+    static func mode(_ url: URL) throws -> Int {
+        try #require(try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int)
+    }
+
+    static func leftoverTempFiles(_ dir: URL) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.contains("claudewatcher-tmp-") }
+    }
+
     static func ours(_ json: [String: Any], _ event: String) -> [[String: Any]] {
         handlers(json, event).filter { ($0["command"] as? String)?.contains("/claude-watcher-hook.sh") == true }
     }
@@ -165,7 +173,12 @@ import Testing
         #expect(try box.uninstall() != nil)
         #expect(try box.read() == Self.fixture)
         #expect(box.status() == .notInstalled)
-        #expect(!FileManager.default.fileExists(atPath: HookInstaller.installedScriptURL(installDirectory: box.installDir).path))
+        #expect(box.status(source: box.source) == .notInstalled)
+        // Script replaced by an executable no-op stub, not deleted (running sessions still call it).
+        let script = HookInstaller.installedScriptURL(installDirectory: box.installDir)
+        #expect(try Data(contentsOf: script) == HookInstaller.noOpScript)
+        #expect(try Self.mode(script) == 0o755)
+        #expect(try Self.leftoverTempFiles(box.installDir).isEmpty)
         // Second uninstall: no-op.
         #expect(try box.uninstall() == nil)
         #expect(try box.read() == Self.fixture)
@@ -279,6 +292,210 @@ import Testing
         let attrs = try FileManager.default.attributesOfItem(atPath: box.settings.path)
         #expect(attrs[.type] as? FileAttributeType == .typeSymbolicLink)
         #expect(Self.ours(try box.json(), "Stop").count == 1)
+    }
+
+    // MARK: Atomic script publishing
+
+    @Test func writeAtomicallySetsModeBeforeRename() throws {
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        let target = box.root.appendingPathComponent("script.sh")
+        try Data("old\n".utf8).write(to: target)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: target.path)
+        let payload = Data("#!/bin/sh\necho new\n".utf8)
+        var sawTemp = false
+        try HookInstaller.writeAtomically(payload, to: target, mode: 0o755) { temp throws in
+            sawTemp = true
+            // The file that is about to be renamed into place is already complete and 0755,
+            // and the destination still holds the old file.
+            #expect(temp.deletingLastPathComponent().path == target.deletingLastPathComponent().path)
+            #expect(try Self.mode(temp) == 0o755)
+            #expect(try Data(contentsOf: temp) == payload)
+            #expect(try Data(contentsOf: target) == Data("old\n".utf8))
+        }
+        #expect(sawTemp)
+        #expect(try Self.mode(target) == 0o755)
+        #expect(try Data(contentsOf: target) == payload)
+        #expect(try Self.leftoverTempFiles(box.root).isEmpty)
+    }
+
+    @Test func writeAtomicallyAbortLeavesTargetAndNoTemp() throws {
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        let target = box.root.appendingPathComponent("script.sh")
+        try Data("old\n".utf8).write(to: target)
+        struct Abort: Error {}
+        #expect(throws: Abort.self) {
+            try HookInstaller.writeAtomically(Data("new".utf8), to: target, mode: 0o755) { _ in throw Abort() }
+        }
+        #expect(try Data(contentsOf: target) == Data("old\n".utf8))
+        #expect(try Self.leftoverTempFiles(box.root).isEmpty)
+    }
+
+    @Test func installPublishesExecutableScriptAndReplacesStub() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        let script = HookInstaller.installedScriptURL(installDirectory: box.installDir)
+        // A previous non-executable copy is replaced by a new 0755 file, not chmodded in place.
+        try FileManager.default.createDirectory(at: box.installDir, withIntermediateDirectories: true)
+        try Data("stale\n".utf8).write(to: script)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: script.path)
+        _ = try box.install()
+        #expect(try Self.mode(script) == 0o755)
+        #expect(try Data(contentsOf: script) == Data(contentsOf: box.source))
+        #expect(try Self.leftoverTempFiles(box.installDir).isEmpty)
+        // Uninstall -> stub; reinstall replaces the stub with the real script.
+        _ = try box.uninstall()
+        #expect(try Data(contentsOf: script) == HookInstaller.noOpScript)
+        _ = try box.install()
+        #expect(try Data(contentsOf: script) == Data(contentsOf: box.source))
+        #expect(box.status(source: box.source) == .installed)
+    }
+
+    @Test func noOpStubRunsAndExitsZero() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        _ = try box.install()
+        _ = try box.uninstall()
+        let process = Process()
+        process.executableURL = HookInstaller.installedScriptURL(installDirectory: box.installDir)
+        process.standardInput = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+    }
+
+    // MARK: Lost-update protection
+
+    @Test func concurrentSaveBetweenReadAndWriteIsRetried() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        let concurrent = Self.fixture.replacingOccurrences(of: "\"model\": \"opus\"", with: "\"model\": \"sonnet\"")
+        var commits = 0
+        var transforms = 0
+        let command = HookInstaller.hookCommand(scriptPath: "/x/claude-watcher-hook.sh")
+        let backup = try HookInstaller.editSettings(at: box.settings, beforeCommit: {
+            commits += 1
+            if commits == 1 { try Data(concurrent.utf8).write(to: box.settings, options: .atomic) }
+        }) { root in
+            transforms += 1
+            try HookInstaller.mergeEntries(into: &root, command: command)
+        }
+        #expect(commits == 2)
+        #expect(transforms == 2)
+        // The concurrent change survives and our entries were applied on top of it.
+        let json = try box.json()
+        #expect(json["model"] as? String == "sonnet")
+        #expect(Self.ours(json, "Stop").count == 1)
+        // One backup, of the content we actually transformed.
+        #expect(try box.backups().count == 1)
+        #expect(try String(contentsOf: try #require(backup), encoding: .utf8) == concurrent)
+        #expect(try Self.leftoverTempFiles(box.settings.deletingLastPathComponent()).isEmpty)
+    }
+
+    @Test func inPlaceRewriteIsDetected() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        var commits = 0
+        _ = try HookInstaller.editSettings(at: box.settings, beforeCommit: {
+            commits += 1
+            guard commits == 1 else { return }
+            // Same inode, different size (like Claude Code's in-place rewrites).
+            let h = try FileHandle(forWritingTo: box.settings)
+            try h.seekToEnd()
+            try h.write(contentsOf: Data("\n".utf8))
+            try h.close()
+        }) { root in root.set("added", .bool(true)) }
+        #expect(commits == 2)
+        #expect(try box.json()["added"] as? Bool == true)
+    }
+
+    @Test func persistentConflictGivesUpWithoutWriting() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        var commits = 0
+        var last = ""
+        #expect {
+            try HookInstaller.editSettings(at: box.settings, beforeCommit: {
+                commits += 1
+                last = Self.fixture.replacingOccurrences(of: "\"opus\"", with: "\"opus-\(commits)\"")
+                try Data(last.utf8).write(to: box.settings, options: .atomic)
+            }) { root in root.set("added", .bool(true)) }
+        } throws: { error in
+            guard case .settingsChangedConcurrently(let n)? = error as? HookInstaller.InstallError else { return false }
+            return n == HookInstaller.maxEditAttempts
+        }
+        #expect(commits == HookInstaller.maxEditAttempts)
+        #expect(try box.read() == last) // the other writer's content, untouched
+        #expect(try box.backups().isEmpty)
+        #expect(try Self.leftoverTempFiles(box.settings.deletingLastPathComponent()).isEmpty)
+    }
+
+    @Test func createdSettingsConflictWhenFileAppears() throws {
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        var commits = 0
+        _ = try HookInstaller.editSettings(at: box.settings, beforeCommit: {
+            commits += 1
+            if commits == 1 { try Data("{\n  \"model\": \"opus\"\n}\n".utf8).write(to: box.settings) }
+        }) { root in root.set("added", .bool(true)) }
+        #expect(commits == 2)
+        let json = try box.json()
+        #expect(json["model"] as? String == "opus")
+        #expect(json["added"] as? Bool == true)
+    }
+
+    @Test func editKeepsSettingsPermissions() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: box.settings.path)
+        let backup = try #require(try box.install())
+        #expect(try Self.mode(box.settings) == 0o600)
+        #expect(try Self.mode(backup) == 0o600)
+    }
+
+    // MARK: Lossless parsing
+
+    @Test func refusesUnpairedSurrogatesWithoutWriting() throws {
+        for literal in [#""\uD83D""#, #""\uDE00""#, #""\uD83Dx""#, #""\uD83D\u0041""#] {
+            let original = "{\n  \"s\": \(literal)\n}\n"
+            let box = try Sandbox(settings: original)
+            defer { box.cleanup() }
+            #expect(throws: HookInstaller.InstallError.self, "\(literal)") { try box.install() }
+            #expect(try box.read() == original)
+            #expect(try box.backups().isEmpty)
+        }
+        // A proper pair still parses (and is printed as the character itself).
+        let pair = try OrderedJSON.parse(Data(#"{"s": "\uD83D\uDE00"}"#.utf8))
+        #expect(pair["s"]?.stringValue == "\u{1F600}")
+    }
+
+    @Test func refusesInvalidUTF8WithoutWriting() throws {
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        let original = Data("{\n  \"s\": \"a".utf8) + Data([0xFF, 0xFE]) + Data("\"\n}\n".utf8)
+        try original.write(to: box.settings)
+        #expect(throws: HookInstaller.InstallError.self) { try box.install() }
+        #expect(try Data(contentsOf: box.settings) == original)
+        #expect(try box.backups().isEmpty)
+        #expect(box.status() == .notInstalled)
+    }
+
+    @Test func preservesBOM() throws {
+        let bom = Data([0xEF, 0xBB, 0xBF])
+        let original = bom + Data(Self.fixture.utf8)
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        try original.write(to: box.settings)
+        _ = try box.install()
+        let installed = try Data(contentsOf: box.settings)
+        #expect(installed.starts(with: bom))
+        #expect(box.status() == .installed)
+        _ = try box.uninstall()
+        #expect(try Data(contentsOf: box.settings) == original)
+        // BOM-only / whitespace-only files count as empty and keep the BOM.
+        let empty = try #require(try HookInstaller.transformedSettings(bom + Data("\n".utf8)) { $0.set("a", .bool(true)) })
+        #expect(empty == bom + Data("{\n  \"a\": true\n}\n".utf8))
     }
 }
 

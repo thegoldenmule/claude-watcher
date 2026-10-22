@@ -24,6 +24,8 @@ public enum HookInstaller {
         case hooksNotAnObject
         case eventNotAnArray(String)
         case unreadableSettings(String)
+        /// settings.json changed between our read and our write on every attempt.
+        case settingsChangedConcurrently(attempts: Int)
 
         public var description: String {
             switch self {
@@ -31,11 +33,19 @@ public enum HookInstaller {
             case .hooksNotAnObject: "settings.json \"hooks\" is not an object"
             case let .eventNotAnArray(e): "settings.json hooks.\(e) is not an array"
             case let .unreadableSettings(m): "settings.json could not be parsed: \(m)"
+            case let .settingsChangedConcurrently(n):
+                "settings.json kept changing while it was being edited (gave up after \(n) attempts); try again"
             }
         }
     }
 
     public static let scriptFileName = "claude-watcher-hook.sh"
+
+    /// What `uninstall` leaves at the script path (see there).
+    static let noOpScript = Data("#!/bin/sh\nexit 0\n".utf8)
+
+    /// Read-transform-write attempts before giving up on a settings.json that keeps changing.
+    static let maxEditAttempts = 3
 
     /// Events we register for. All are async (never block Claude) except SessionEnd, which
     /// runs synchronously so it completes before `claude -p` teardown kills async hooks.
@@ -81,7 +91,8 @@ public enum HookInstaller {
         return state
     }
 
-    /// Idempotent. Copies the script (chmod 755) and merges our hook entries into settings,
+    /// Idempotent. Copies the script (mode 755, published atomically so a hook firing mid-install
+    /// never finds a non-executable file) and merges our hook entries into settings,
     /// replacing any previous entries of ours. Backs up settings.json to
     /// `settings.json.claudewatcher-backup-<yyyyMMdd-HHmmss>` before changing it; does not
     /// touch the file at all when it already has exactly our entries.
@@ -97,9 +108,10 @@ public enum HookInstaller {
         let script = installedScriptURL(installDirectory: installDirectory)
         let scriptData = try Data(contentsOf: hookScriptSource)
         if (try? Data(contentsOf: script)) != scriptData {
-            try scriptData.write(to: script, options: .atomic)
+            try writeAtomically(scriptData, to: script, mode: 0o755)
+        } else {
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         }
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
         let command = hookCommand(scriptPath: script.path)
         return try editSettings(at: settingsURL) { root in
@@ -108,7 +120,13 @@ public enum HookInstaller {
     }
 
     /// Removes only our entries (and event arrays / the `hooks` object if that leaves them
-    /// empty) and deletes the installed script. Leaves the hook-state directory alone.
+    /// empty). Leaves the hook-state directory alone.
+    ///
+    /// The installed script is not deleted but atomically replaced with a no-op stub
+    /// (`#!/bin/sh` / `exit 0`): running Claude Code sessions snapshot their hooks at startup
+    /// and keep invoking the old path until they exit, and a missing script would make every
+    /// event of theirs report an exit-127 hook error. `status` is based on the settings.json
+    /// entries, so it still reports `.notInstalled` with the stub in place.
     /// - Returns: the backup URL if settings.json was changed.
     @discardableResult
     public static func uninstall(
@@ -119,8 +137,9 @@ public enum HookInstaller {
             try removeEntries(from: &root)
         }
         let script = installedScriptURL(installDirectory: installDirectory)
-        if FileManager.default.fileExists(atPath: script.path) {
-            try FileManager.default.removeItem(at: script)
+        if FileManager.default.fileExists(atPath: script.path),
+           (try? Data(contentsOf: script)) != noOpScript {
+            try writeAtomically(noOpScript, to: script, mode: 0o755)
         }
         return backup
     }
@@ -229,7 +248,9 @@ public enum HookInstaller {
         let original: OrderedJSON
         var indent = "  "
         var trailingNewline = true
-        if let data, !data.allSatisfy({ [0x20, 0x09, 0x0A, 0x0D].contains($0) }) {
+        let bom: [UInt8] = [0xEF, 0xBB, 0xBF]
+        let hasBOM = data?.starts(with: bom) ?? false
+        if let data, !data.dropFirst(hasBOM ? bom.count : 0).allSatisfy({ [0x20, 0x09, 0x0A, 0x0D].contains($0) }) {
             do { original = try OrderedJSON.parse(data) } catch {
                 throw InstallError.unreadableSettings(String(describing: error))
             }
@@ -243,7 +264,7 @@ public enum HookInstaller {
         if root == original, data != nil { return nil }
         var text = root.serialized(indent: indent)
         if trailingNewline { text += "\n" }
-        return Data(text.utf8)
+        return Data((hasBOM ? bom : []) + Array(text.utf8))
     }
 
     static func detectIndent(_ data: Data) -> String? {
@@ -257,41 +278,118 @@ public enum HookInstaller {
 
     /// Reads, transforms, backs up, and atomically writes settings. Follows a symlinked
     /// settings.json (dotfile setups) and keeps the file's permissions.
+    ///
+    /// Guards against lost updates: the file's (device, inode, size, mtime) is captured before
+    /// reading and re-checked right before the new file is renamed into place. If Claude Code
+    /// or the user saved it in between, the attempt is discarded (backup included) and the
+    /// read-transform-write is redone, up to `maxEditAttempts` times.
+    /// - Parameter beforeCommit: test hook, called after the transform and right before the
+    ///   conflict check of each attempt.
     static func editSettings(
         at settingsURL: URL,
         createIfMissing: Bool = true,
+        beforeCommit: () throws -> Void = {},
         _ transform: (inout OrderedJSON) throws -> Void
     ) throws -> URL? {
         let fm = FileManager.default
         let target = settingsURL.resolvingSymlinksInPath()
-        let exists = fm.fileExists(atPath: target.path)
-        if !exists && !createIfMissing { return nil }
-        let data = exists ? try Data(contentsOf: target) : nil
-        guard let newData = try transformedSettings(data, transform) else { return nil }
+        for _ in 0..<maxEditAttempts {
+            let before = try FileSnapshot(path: target.path)
+            if before == nil && !createIfMissing { return nil }
+            let data = before != nil ? try Data(contentsOf: target) : nil
+            guard let newData = try transformedSettings(data, transform) else { return nil }
 
-        var backup: URL?
-        var permissions: Any?
-        if exists {
-            permissions = try? fm.attributesOfItem(atPath: target.path)[.posixPermissions]
-            let stamp = backupTimestamp()
-            var candidate = target.deletingLastPathComponent()
-                .appendingPathComponent("\(target.lastPathComponent).claudewatcher-backup-\(stamp)")
-            var n = 1
-            while fm.fileExists(atPath: candidate.path) {
-                candidate = target.deletingLastPathComponent()
-                    .appendingPathComponent("\(target.lastPathComponent).claudewatcher-backup-\(stamp)-\(n)")
-                n += 1
+            var backup: URL?
+            if let data, let before {
+                let stamp = backupTimestamp()
+                var candidate = target.deletingLastPathComponent()
+                    .appendingPathComponent("\(target.lastPathComponent).claudewatcher-backup-\(stamp)")
+                var n = 1
+                while fm.fileExists(atPath: candidate.path) {
+                    candidate = target.deletingLastPathComponent()
+                        .appendingPathComponent("\(target.lastPathComponent).claudewatcher-backup-\(stamp)-\(n)")
+                    n += 1
+                }
+                // The bytes we read, not a fresh copy, so the backup matches what we transformed.
+                try writeAtomically(data, to: candidate, mode: before.permissions)
+                backup = candidate
+            } else {
+                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             }
-            try fm.copyItem(at: target, to: candidate)
-            backup = candidate
-        } else {
-            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            do {
+                try writeAtomically(newData, to: target, mode: before?.permissions ?? 0o644) { _ in
+                    try beforeCommit()
+                    guard try FileSnapshot(path: target.path) == before else { throw EditConflict() }
+                }
+                return backup
+            } catch is EditConflict {
+                if let backup { try? fm.removeItem(at: backup) }
+            }
         }
-        try newData.write(to: target, options: .atomic)
-        if let permissions {
-            try? fm.setAttributes([.posixPermissions: permissions], ofItemAtPath: target.path)
+        throw InstallError.settingsChangedConcurrently(attempts: maxEditAttempts)
+    }
+
+    private struct EditConflict: Error {}
+
+    /// Identity of a file's current contents: equal snapshots mean nobody replaced or rewrote it.
+    struct FileSnapshot: Equatable {
+        var device: Int64
+        var inode: UInt64
+        var size: Int64
+        var mtimeSeconds: Int
+        var mtimeNanoseconds: Int
+        /// Carried along for rewriting the file; not part of equality.
+        var permissions: mode_t
+
+        /// nil when the file does not exist.
+        init?(path: String) throws {
+            var st = stat()
+            guard stat(path, &st) == 0 else {
+                if errno == ENOENT { return nil }
+                throw posixError(errno, path: path)
+            }
+            device = Int64(st.st_dev)
+            inode = UInt64(st.st_ino)
+            size = Int64(st.st_size)
+            mtimeSeconds = st.st_mtimespec.tv_sec
+            mtimeNanoseconds = st.st_mtimespec.tv_nsec
+            permissions = st.st_mode & 0o7777
         }
-        return backup
+
+        static func == (a: FileSnapshot, b: FileSnapshot) -> Bool {
+            a.device == b.device && a.inode == b.inode && a.size == b.size
+                && a.mtimeSeconds == b.mtimeSeconds && a.mtimeNanoseconds == b.mtimeNanoseconds
+        }
+    }
+
+    /// Writes `data` to a temp file next to `url`, sets `mode` on it, then `rename()`s it into
+    /// place, so readers only ever see the old file or the complete new one with its final
+    /// permissions. `beforeRename` gets the temp file's URL; throwing from it aborts the write
+    /// (the temp file is removed and `url` is left untouched).
+    static func writeAtomically(
+        _ data: Data,
+        to url: URL,
+        mode: mode_t,
+        beforeRename: (URL) throws -> Void = { _ in }
+    ) throws {
+        let temp = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).claudewatcher-tmp-\(UUID().uuidString)")
+        let fd = open(temp.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw posixError(errno, path: temp.path) }
+        var renamed = false
+        defer { if !renamed { unlink(temp.path) } }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        guard fchmod(fd, mode) == 0 else { throw posixError(errno, path: temp.path) }
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
+        try handle.close()
+        try beforeRename(temp)
+        guard rename(temp.path, url.path) == 0 else { throw posixError(errno, path: url.path) }
+        renamed = true
+    }
+
+    static func posixError(_ code: Int32, path: String) -> Error {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: path])
     }
 
     static func backupTimestamp() -> String {

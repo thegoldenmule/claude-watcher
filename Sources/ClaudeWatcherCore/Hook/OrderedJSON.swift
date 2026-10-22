@@ -4,8 +4,12 @@ import Foundation
 /// minimal diff. `JSONSerialization` would reorder keys (or sort them) and reformat
 /// (`"key" : value`); this keeps key order and number literals as written and prints in
 /// the `JSON.stringify(value, null, 2)` style Claude Code itself uses.
-/// Tradeoff: string escapes are normalized (e.g. `\/` or `é` in the source come back
+/// Tradeoff: string escapes are normalized (e.g. `\/` or `\u00e9` in the source come back
 /// as `/` and `é`), and whitespace is normalized to 2-space indentation.
+/// Content that cannot be represented faithfully is refused instead of being altered:
+/// invalid UTF-8 inside a string and unpaired surrogate escapes (a lone `\uD83D`) are parse
+/// errors, so the installer never rewrites such a file. A leading UTF-8 BOM is skipped here;
+/// `HookInstaller.transformedSettings` re-adds it when printing the file back.
 indirect enum OrderedJSON: Equatable, Sendable {
     case object([(String, OrderedJSON)])
     case array([OrderedJSON])
@@ -194,7 +198,11 @@ indirect enum OrderedJSON: Equatable, Sendable {
                 index += 1
                 switch b {
                 case UInt8(ascii: "\""):
-                    return String(decoding: units, as: UTF8.self)
+                    // Refuse rather than substitute U+FFFD for invalid UTF-8.
+                    guard let string = String(bytes: units, encoding: .utf8) else {
+                        throw fail("invalid UTF-8 in string")
+                    }
+                    return string
                 case UInt8(ascii: "\\"):
                     guard index < bytes.count else { throw fail("unterminated escape") }
                     let e = bytes[index]
@@ -209,16 +217,23 @@ indirect enum OrderedJSON: Equatable, Sendable {
                     case UInt8(ascii: "r"): units.append(0x0D)
                     case UInt8(ascii: "t"): units.append(0x09)
                     case UInt8(ascii: "u"):
-                        var codeUnits = [try parseHex4()]
-                        if (0xD800..<0xDC00).contains(codeUnits[0]),
-                           index + 6 <= bytes.count, bytes[index] == UInt8(ascii: "\\"), bytes[index + 1] == UInt8(ascii: "u") {
-                            let save = index
+                        // An unpaired surrogate has no UTF-8 form: refuse rather than
+                        // substitute U+FFFD.
+                        let first = try parseHex4()
+                        var value = UInt32(first)
+                        if (0xD800..<0xDC00).contains(first) {
+                            guard index + 2 <= bytes.count, bytes[index] == UInt8(ascii: "\\"),
+                                  bytes[index + 1] == UInt8(ascii: "u") else {
+                                throw fail("unpaired surrogate escape")
+                            }
                             index += 2
                             let low = try parseHex4()
-                            if (0xDC00..<0xE000).contains(low) { codeUnits.append(low) } else { index = save }
+                            guard (0xDC00..<0xE000).contains(low) else { throw fail("unpaired surrogate escape") }
+                            value = 0x10000 + ((value - 0xD800) << 10) + (UInt32(low) - 0xDC00)
                         }
-                        let s = String(decoding: codeUnits, as: UTF16.self)
-                        units.append(contentsOf: Array(s.utf8))
+                        // nil for a lone low surrogate.
+                        guard let scalar = Unicode.Scalar(value) else { throw fail("unpaired surrogate escape") }
+                        units.append(contentsOf: Array(String(scalar).utf8))
                     default:
                         throw fail("invalid escape")
                     }

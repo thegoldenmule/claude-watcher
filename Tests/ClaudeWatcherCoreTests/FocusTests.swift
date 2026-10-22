@@ -642,6 +642,39 @@ private func onlyLockLeft(_ dir: URL) throws -> Bool {
     #expect(try onlyLockLeft(dir))
 }
 
+@Test func probeLockRestoresFreshOwnerlessLockSwappedInBeforeRename() throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir)
+    let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
+    func inode(_ p: String) -> ino_t? { var st = stat(); return lstat(p, &st) == 0 ? st.st_ino : nil }
+    try plantLock(path, owner: nil, age: 20)  // crashed holder: ownerless and old, so stale
+
+    // Between judging it stale and renaming it, the hook broke it and mkdir'd a fresh lock but
+    // hasn't written its owner yet: the aside dir is ownerless too, but young.
+    var fresh: ino_t?
+    #expect(!lock.breakIfStale(path, beforeRename: {
+        try? FileManager.default.removeItem(atPath: path)
+        try? plantLock(path, owner: nil, age: 0)
+        fresh = inode(path)
+    }))
+    #expect(fresh != nil && inode(path) == fresh)  // renamed back, not deleted
+    #expect(OSC7ProbeLock.readOwner(path) == nil)
+    #expect(try onlyLockLeft(dir))
+    guard case .busy = lock.tryAcquire(tty: "/dev/ttys001") else { Issue.record("expected busy"); return }
+
+    // Same, but a third locker took the path while it was aside: the aside copy is dropped.
+    let newest = "1 fedcba9876543210\n"
+    try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -20)], ofItemAtPath: path)
+    #expect(!lock.breakIfStale(path, beforeRename: {
+        try? FileManager.default.removeItem(atPath: path)
+        try? plantLock(path, owner: nil, age: 0)
+    }, afterRename: {
+        try? plantLock(path, owner: newest, age: 0)
+    }))
+    #expect(OSC7ProbeLock.readOwner(path) == newest)
+    #expect(try onlyLockLeft(dir))
+}
+
 @Test func probeLockHeartbeatRefreshesMtimeWhileHeld() async throws {
     let dir = tempDir()
     let lock = OSC7ProbeLock(directory: dir, heartbeatInterval: .milliseconds(20))

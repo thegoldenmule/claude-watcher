@@ -14,9 +14,11 @@ import Foundation
 ///   owner missing/unreadable and dir mtime older than 10 s; or owner pid alive but dir mtime
 ///   older than 120 s (hard cap against pid reuse).
 /// - Break: remember the owner content S judged stale, rename the lock to
-///   `<lock>.stale-<random>`, re-read the aside owner. Equal to S: remove the aside dir and retry
-///   the `mkdir`. Different (we moved a fresh lock away): rename it back (if a lock already
-///   exists again, remove the aside dir instead) and treat the lock as busy.
+///   `<lock>.stale-<random>`, re-read the aside owner. Equal to S (and, when S is "no owner",
+///   the aside dir's mtime still older than 10 s, since a lock just taken in between has no
+///   owner yet either but is young): remove the aside dir and retry the `mkdir`. Otherwise (we
+///   moved a fresh lock away): rename it back (if a lock already exists again, remove the aside
+///   dir instead) and treat the lock as busy.
 /// - Release: only if `owner` still holds our token: remove `owner`, then `rmdir`.
 public struct OSC7ProbeLock: Sendable {
     public var directory: URL
@@ -126,17 +128,17 @@ public struct OSC7ProbeLock: Sendable {
     /// true if the lock is gone (by us or anyone) and `mkdir` should be retried; false if busy.
     /// `beforeRename`/`afterRename` are test seams for simulating concurrent lockers.
     func breakIfStale(_ path: String, beforeRename: () -> Void = {}, afterRename: () -> Void = {}) -> Bool {
-        var st = stat()
-        guard lstat(path, &st) == 0 else { return errno == ENOENT }
-        let mtime = Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+        guard let age = Self.age(path) else { return errno == ENOENT }
         let owner = Self.readOwner(path)
-        guard isStale(owner: owner, age: Date().timeIntervalSince1970 - mtime) else { return false }
+        guard isStale(owner: owner, age: age) else { return false }
 
         beforeRename()
         let aside = "\(path).stale-\(Self.makeToken())"
         guard rename(path, aside) == 0 else { return errno == ENOENT }  // ENOENT: another breaker won
         afterRename()
-        if Self.readOwner(aside) == owner {
+        // Same owner, or (no owner) still the old dir: the lock we judged. Without an owner, a
+        // lock taken in between (mkdir done, owner not yet written) would be young.
+        if Self.readOwner(aside) == owner, owner != nil || (Self.age(aside) ?? 0) > staleAfter {
             try? FileManager.default.removeItem(atPath: aside)
             return true
         }
@@ -153,6 +155,14 @@ public struct OSC7ProbeLock: Sendable {
     func isStale(owner: String?, age: TimeInterval) -> Bool {
         guard let owner, let pid = Self.ownerPID(owner) else { return age > staleAfter }
         return !Self.isAlive(pid) || age > aliveOwnerStaleAfter
+    }
+
+    /// Seconds since the mtime of `path` (not following symlinks), or nil (errno set) if absent.
+    static func age(_ path: String) -> TimeInterval? {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return nil }
+        let mtime = Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+        return Date().timeIntervalSince1970 - mtime
     }
 
     /// Contents of `<lock>/owner`, or nil if missing/unreadable.

@@ -266,26 +266,102 @@ private let latte = """
         #expect(t.themeName == nil, "an empty theme value clears the earlier one")
     }
 
-    @Test func includesLoadAfterTheirFileAndResolveRelativePaths() {
+    @Test func includesLoadBreadthFirstAfterAllTopLevelFiles() {
         let config = loader([
             "/cfg/xdg/config": """
-                config-file = colors.conf
+                config-file = sub/colors
                 config-file = ?missing.conf
                 config-file = ~/abs.conf
                 background = #010101
                 font-size = 10
                 """,
-            "/cfg/xdg/colors.conf": "background = #020202\nconfig-file = /cfg/xdg/config",
+            "/cfg/app/config.ghostty": "background = #0a0a0a\nconfig-file = app-inc",
+            "/cfg/xdg/sub/colors": "background = #020202\nconfig-file = nested",
             "/home/abs.conf": "font-size = 18",
+            "/cfg/app/app-inc": "background = #030303",
+            "/cfg/xdg/sub/nested": "background = #040404",
         ]).loadConfig()
-        // The include comes after the including file, so its background wins.
+        // Ghostty: every top-level file, then their includes in order, then nested includes
+        // (relative to the including file) appended to the end of the queue.
+        #expect(config.files == [
+            "/cfg/xdg/config", "/cfg/app/config.ghostty",
+            "/cfg/xdg/sub/colors", "/cfg/xdg/missing.conf", "/home/abs.conf", "/cfg/app/app-inc",
+            "/cfg/xdg/sub/nested",
+        ])
+        #expect(config.entries.filter { $0.key == "background" }.map(\.value) == [
+            "#010101", "#0a0a0a", "#020202", "#030303", "#040404",
+        ])
         var t = GhosttyTheme.ghosttyDefault
         t.apply(config.entries)
-        #expect(t.background == GhosttyColor(0x020202))
+        // The XDG file's include beats the later App Support file.
+        #expect(t.background == GhosttyColor(0x040404))
         #expect(t.fontSize == 18)
-        #expect(config.files.contains("/cfg/xdg/colors.conf"))
-        #expect(config.files.contains("/cfg/xdg/missing.conf"))
-        #expect(config.files.filter { $0 == "/cfg/xdg/config" }.count == 1, "include cycle is cut")
+    }
+
+    @Test func includeCyclesAreCut() {
+        let config = loader([
+            "/cfg/xdg/config": "font-size = 1\nconfig-file = b\nconfig-file = config",
+            "/cfg/xdg/b": "font-size = 2\nconfig-file = config\nconfig-file = b",
+        ]).loadConfig()
+        // As in Ghostty, each include path loads once; a top-level file isn't in that set, so
+        // including it re-applies it once, and its own includes are then cut.
+        #expect(config.entries.map(\.value) == ["1", "2", "1"])
+        #expect(config.files == ["/cfg/xdg/config", "/cfg/app/config.ghostty", "/cfg/xdg/b"])
+    }
+
+    @Test func emptyConfigFileClearsPendingIncludes() {
+        let config = loader([
+            "/cfg/xdg/config": "config-file = x\nconfig-file = ?\"\"",
+            "/cfg/app/config.ghostty": "config-file =\nconfig-file = \"?y\"",
+            "/cfg/xdg/x": "font-size = 1",
+            "/cfg/app/y": "font-size = 2",
+        ]).loadConfig()
+        #expect(config.entries.map(\.value) == ["2"])
+        #expect(config.files == ["/cfg/xdg/config", "/cfg/app/config.ghostty", "/cfg/app/y"])
+    }
+
+    @Test func watchesEveryThemeCandidateEvenIfMissing() {
+        let load = loader([
+            "/cfg/xdg/config": "theme = light:L,dark:D",
+            "/res/themes/D": "background = #111111",
+        ]).load(prefersDark: false)
+        #expect(load.watchedPaths == [
+            "/cfg/xdg/config", "/cfg/app/config.ghostty",
+            "/cfg/xdg/themes/L", "/res/themes/L", "/cfg/xdg/themes/D", "/res/themes/D",
+        ])
+        #expect(load.theme.themeName == nil, "L isn't installed yet")
+    }
+
+    @Test func themeAppearingOrShadowingIsPickedUpOnReload() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cw-theme-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: "\(root)/user", withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: "\(root)/res", withIntermediateDirectories: true)
+        try "theme = Mine".write(toFile: "\(root)/config", atomically: true, encoding: .utf8)
+        let loader = GhosttyThemeLoader(
+            configPaths: ["\(root)/config"], themeDirectories: ["\(root)/user", "\(root)/res"])
+        let mtime = { (path: String) in
+            (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        }
+
+        // Not installed: both candidates are watched while missing.
+        let first = loader.load(prefersDark: true)
+        #expect(first.theme.themeName == nil)
+        #expect(first.watchedPaths.allSatisfy { $0 == "\(root)/config" || mtime($0) == nil })
+
+        // Installed into the bundled directory: a watched path appears.
+        try "background = #222222".write(toFile: "\(root)/res/Mine", atomically: true, encoding: .utf8)
+        #expect(first.watchedPaths.contains { $0 != "\(root)/config" && mtime($0) != nil })
+        let second = loader.load(prefersDark: true)
+        #expect(second.theme.background == GhosttyColor(0x222222))
+
+        // A user theme now shadows it: its (previously missing) path was already watched.
+        #expect(second.watchedPaths.contains("\(root)/user/Mine"))
+        try "background = #111111".write(toFile: "\(root)/user/Mine", atomically: true, encoding: .utf8)
+        #expect(mtime("\(root)/user/Mine") != nil)
+        #expect(loader.load(prefersDark: true).theme.background == GhosttyColor(0x111111))
     }
 
     @Test func themeOverrideIgnoresConfigColors() {

@@ -113,59 +113,104 @@ public struct GhosttyThemeLoader: Sendable {
             home: home)
     }
 
-    /// Reads every config file and its `config-file` includes. Ghostty loads an include after
-    /// the rest of the file that names it; `?path` marks an optional include, and relative
-    /// paths are relative to the including file's directory.
+    /// Reads every config file and its `config-file` includes, as Ghostty does
+    /// (`Config.loadRecursiveFiles`): all top-level files first, each appending its includes to
+    /// one list; then that list is loaded in order, every included file appending its own
+    /// includes to the end (breadth-first). So an include overrides every top-level file, not
+    /// just the one naming it. `?path` marks an optional include; relative paths resolve
+    /// against the including file's directory; an empty `config-file =` clears the list; each
+    /// include path loads at most once (cycles), though a top-level file may be re-included.
     public func loadConfig() -> GhosttyConfig {
         var entries: [GhosttyConfigEntry] = []
         var files: [String] = []
-        var visited: Set<String> = []
+        var includes: [String] = []
 
-        func load(_ path: String) {
-            let standardized = (path as NSString).standardizingPath
-            guard visited.insert(standardized).inserted else { return }  // include cycles
-            files.append(standardized)
-            guard let text = readFile(standardized) else { return }
-            var includes: [String] = []
+        func read(_ path: String) {
+            if !files.contains(path) { files.append(path) }
+            guard let text = readFile(path) else { return }
+            let dir = (path as NSString).deletingLastPathComponent
             for entry in GhosttyConfigParser.parse(text) {
-                if entry.key == "config-file" {
-                    var target = entry.value
-                    if target.hasPrefix("?") { target.removeFirst() }
-                    guard !target.isEmpty else { continue }
-                    let dir = (standardized as NSString).deletingLastPathComponent
-                    includes.append(Self.expand(target, home: home, relativeTo: dir))
-                } else {
+                guard entry.key == "config-file" else {
                     entries.append(entry)
+                    continue
                 }
+                guard let target = Self.includeTarget(entry.value) else {
+                    includes.removeAll()
+                    continue
+                }
+                guard !target.isEmpty else { continue }
+                includes.append(Self.standardize(Self.expand(target, home: home, relativeTo: dir)))
             }
-            includes.forEach(load)
         }
 
-        configPaths.forEach(load)
+        configPaths.forEach { read(Self.standardize($0)) }
+        var loaded: Set<String> = []
+        var next = 0
+        while next < includes.count {
+            let path = includes[next]
+            next += 1
+            guard loaded.insert(path).inserted else { continue }  // include cycles
+            read(path)
+        }
         return GhosttyConfig(entries: entries, files: files)
+    }
+
+    /// A `config-file` value's path: nil for an empty value (which clears the include list),
+    /// "" for one that is empty only after dropping `?` and quotes (ignored).
+    static func includeTarget(_ value: String) -> String? {
+        guard !value.isEmpty else { return nil }
+        var target = Substring(value)
+        if target.hasPrefix("?") { target = target.dropFirst() }
+        if target.count >= 2, target.hasPrefix("\""), target.hasSuffix("\"") {
+            target = target.dropFirst().dropLast()
+        }
+        return String(target)
+    }
+
+    private static func standardize(_ path: String) -> String {
+        (path as NSString).standardizingPath
+    }
+
+    /// Every path the theme `name` could be read from, in lookup order: an absolute path as-is,
+    /// else that name in each of `themeDirectories`.
+    public func themeCandidates(named name: String) -> [String] {
+        let expanded = Self.expand(name, home: home, relativeTo: nil)
+        if expanded.hasPrefix("/") { return [expanded] }
+        return themeDirectories.map { "\($0)/\(name)" }
     }
 
     /// Path of the theme file for `name`: absolute paths as-is, else the first match in
     /// `themeDirectories`.
     public func themePath(named name: String) -> String? {
-        let expanded = Self.expand(name, home: home, relativeTo: nil)
-        if expanded.hasPrefix("/") { return expanded }
-        for dir in themeDirectories {
-            let path = "\(dir)/\(name)"
-            if readFile(path) != nil { return path }
+        findTheme(named: name)?.path
+    }
+
+    /// The first readable candidate for `name`, with its contents (read once).
+    private func findTheme(named name: String) -> (path: String, text: String)? {
+        for path in themeCandidates(named: name) {
+            if let text = readFile(path) { return (path, text) }
         }
         return nil
     }
 
     public func load(prefersDark: Bool) -> GhosttyThemeLoad {
         let config = loadConfig()
-        var watched = config.files
         let theme = config.resolve(prefersDark: prefersDark, themeOverride: themeOverride) { name in
-            guard let path = themePath(named: name), let text = readFile(path) else { return nil }
-            watched.append(path)
-            return GhosttyConfigParser.parse(text)
+            findTheme(named: name).map { GhosttyConfigParser.parse($0.text) }
         }
         let spec = themeOverride ?? config.themeSpec
+        // Watch every candidate for every name the spec can select (both variants of
+        // light:/dark:), found or not: installing the theme, or a user theme shadowing a
+        // bundled one, must trigger a reload. A missing path costs one failed stat per poll.
+        var watched = config.files
+        let names: [String] = switch spec {
+        case .fixed(let name): [name]
+        case .adaptive(let light, let dark): [light, dark]
+        case nil: []
+        }
+        for path in names.flatMap(themeCandidates(named:)) where !watched.contains(path) {
+            watched.append(path)
+        }
         return GhosttyThemeLoad(
             theme: theme, followsAppearance: spec?.followsAppearance ?? false, watchedPaths: watched)
     }

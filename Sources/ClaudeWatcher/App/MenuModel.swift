@@ -5,15 +5,20 @@ import ServiceManagement
 
 /// State behind the menu bar extra: Claude Code hook install status and Launch at Login.
 /// Refreshed whenever a menu starts tracking, so it reflects edits made outside the app.
+/// Statuses are computed off the main thread (the first `HookInstaller.status` may wait on
+/// resolving Claude Code's config dir) and published on main.
 @MainActor
 @Observable
 final class MenuModel {
-    private(set) var hookStatus: HookInstaller.InstallStatus = .notInstalled
+    /// nil until the first status check completes.
+    private(set) var hookStatus: HookInstaller.InstallStatus?
     private(set) var launchAtLoginStatus: SMAppService.Status = .notRegistered
     /// Last hook / login-item error, shown in the menu until the next successful action.
     private(set) var lastError: String?
 
     @ObservationIgnored private var menuObserver: (any NSObjectProtocol)?
+    /// Bumped by every `refresh()`; only the newest refresh publishes its result.
+    @ObservationIgnored private var refreshGeneration = 0
     @ObservationIgnored private let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Menu")
 
     /// The hook script shipped in the app bundle (`scripts/build-app.sh` copies it there).
@@ -32,14 +37,24 @@ final class MenuModel {
     }
 
     func refresh() {
-        hookStatus = HookInstaller.status(hookScriptSource: bundledHookScript)
-        launchAtLoginStatus = SMAppService.mainApp.status
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let script = bundledHookScript
+        Task {
+            let (hook, login) = await Task.detached(priority: .userInitiated) {
+                (HookInstaller.status(hookScriptSource: script), SMAppService.mainApp.status)
+            }.value
+            guard generation == refreshGeneration else { return }
+            hookStatus = hook
+            launchAtLoginStatus = login
+        }
     }
 
     // MARK: Hook
 
     var hookStatusText: String {
         switch hookStatus {
+        case nil: "Claude Code Hook: Checking…"
         case .installed: "Claude Code Hook: Installed"
         case .notInstalled: "Claude Code Hook: Not Installed"
         case .outdated: "Claude Code Hook: Needs Update"
@@ -48,10 +63,14 @@ final class MenuModel {
 
     var hookInstallTitle: String? {
         switch hookStatus {
-        case .installed: nil
+        case nil, .installed: nil
         case .notInstalled: "Install Hook"
         case .outdated: "Update Hook"
         }
+    }
+
+    var canUninstallHook: Bool {
+        hookStatus == .installed || hookStatus == .outdated
     }
 
     func installHook() {

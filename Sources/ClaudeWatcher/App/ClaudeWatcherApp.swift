@@ -20,7 +20,7 @@ struct ClaudeWatcherApp: App {
             if let title = menu.hookInstallTitle {
                 Button(title) { menu.installHook() }
             }
-            if menu.hookStatus != .notInstalled {
+            if menu.canUninstallHook {
                 Button("Uninstall Hook") { menu.uninstallHook() }
             }
 

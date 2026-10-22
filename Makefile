@@ -1,6 +1,6 @@
 APP := build/ClaudeWatcher.app
 
-.PHONY: build app run test clean release
+.PHONY: build app run test clean release icon
 
 build:
 	swift build
@@ -14,6 +14,13 @@ run: app
 
 test:
 	swift test
+
+# Regenerates Resources/AppIcon.icns from scripts/make-icon.swift (the .icns is committed).
+icon:
+	@set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	swift scripts/make-icon.swift "$$tmp"; \
+	iconutil -c icns "$$tmp/AppIcon.iconset" -o Resources/AppIcon.icns; \
+	echo "wrote Resources/AppIcon.icns"
 
 clean:
 	swift package clean

@@ -30,13 +30,19 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `Tests/ClaudeWatcherCoreTests/`: Swift Testing (`import Testing`). Keep logic in Core so it is testable.
-- `Resources/Info.plist`, `scripts/build-app.sh`, `Makefile`: build tooling.
+- `Resources/Info.plist`, `scripts/build-app.sh`, `Makefile`: build tooling. `build-app.sh` also
+  takes `HARDENED_RUNTIME=1`, `APP_DIR`, `INFO_PLIST`, `ARCHS` (used by the release script).
+- `scripts/release.sh` (`make release`): notarized universal zip -> GitHub release (process in
+  README "Releasing"). `Resources/ClaudeWatcher.entitlements`: Apple Events, release builds only.
 
 ## Commands
 - `make build` (`swift build`), `make test` (`swift test`)
 - `make app`: release build, assembles and signs `build/ClaudeWatcher.app`
 - `make run`: kills any running instance, builds the app, opens it
 - `make clean`
+- `make release VERSION=X.Y.Z [DRY_RUN=1 [NOTARIZE=1]]`: bumps Info.plist, commits, tags, notarizes,
+  pushes, publishes. `DRY_RUN=1` only builds a Developer ID zip (`NOTARIZE=1` also notarizes);
+  needs a clean, pushed main, an Apple account in Xcode and `gh` auth.
 - Demo data, panel pinned: `open build/ClaudeWatcher.app --args --demo` (or `CW_DEMO=1`;
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
   show the info banner. Screenshot helpers (demo only): `CW_DEMO_NOTICE=error|info`,
@@ -47,7 +53,9 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - Logs: `/usr/bin/log stream --predicate 'subsystem == "com.thegoldenmule.ClaudeWatcher"'`
   (in zsh, bare `log` is a builtin). Focus lines show the resolver and the hook id.
 - Signing: `$CODESIGN_IDENTITY`, else first "Apple Development" identity, else ad-hoc
-  (ad-hoc resets TCC Accessibility/Automation grants on every rebuild). No hardened runtime.
+  (ad-hoc resets TCC Accessibility/Automation grants on every rebuild). Dev builds stay Apple
+  Development and non-hardened; releases are Developer ID (Xcode cloud-managed signing via
+  `xcodebuild -exportArchive`), hardened runtime + entitlements, notarized and stapled.
 
 ## Conventions
 - Commit with one-line messages only (no body/trailers). Don't push.

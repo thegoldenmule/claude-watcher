@@ -19,11 +19,14 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - `Sources/ClaudeWatcherCore/Focus/`: `RoutingFocuser` -> `GhosttyFocuser` (resolver chain) /
   `AppleTerminalFocuser` / activate-hosting-app fallback. `AppleScriptRunner` runs scripts.
   `OSC7Probe` (`GhosttyOSC7Probe.swift`) + `OSC7ProbeLock` (cross-process lock shared with the hook).
+  `TerminalHighlighter` (`.shared`): tints a Ghostty session's split pane on sidebar hover and
+  pulses it after a successful focus (see "Pane highlight" below).
 - `Sources/ClaudeWatcherCore/Theme/`: `GhosttyColor`, `GhosttyConfigParser` (+ `GhosttyThemeSpec`,
   incl. `light:A,dark:B`), `GhosttyTheme`, `GhosttyThemeLoader` (Ghostty's config search paths;
   `config-file` includes load breadth-first after all top-level files, like Ghostty's
   `loadRecursiveFiles`; user then bundled themes; config colors override the theme's; every
   theme candidate path is watched, even missing ones, so a newly created theme file is seen).
+  `GhosttyTheme.highlightTint(strength:)` (`GhosttyTheme+Highlight.swift`): the pane tint color.
 - `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
   `EdgeController`, `MenuModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`. Nothing may
@@ -36,6 +39,10 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `Tests/ClaudeWatcherCoreTests/`: Swift Testing (`import Testing`). Keep logic in Core so it is testable.
+  Tests run in parallel on the shared cooperative pool and must never block it (`waitUntilExit`,
+  `Thread.sleep`, blocking reads/`queue.sync` starve other tests): use `TestSupport.swift`'s
+  `runProcess` (async subprocess) and `onDedicatedThread` (blocking work on its own thread), and
+  `Task.sleep` for waits.
 - `Resources/Info.plist`, `scripts/build-app.sh`, `Makefile`: build tooling. `build-app.sh` also
   takes `HARDENED_RUNTIME=1`, `APP_DIR`, `INFO_PLIST`, `ARCHS` (used by the release script).
 - `scripts/release.sh` (`make release`): notarized universal zip -> GitHub release (process in
@@ -77,8 +84,13 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   2 s poll as safety net.
 - Claude home (`ClaudeHome`, `SessionDiscovery.defaultClaudeHome`): `CLAUDE_CONFIG_DIR` from our
   env, else `launchctl getenv`, else `$SHELL -lic` (value read after a marker, since rc files may
-  print anything); 2 s timeout per probe, `~` expanded, `~/.claude` if unset or not a directory.
-  Resolved once and cached (up to ~4 s cold); `prewarmDefaultClaudeHome()` starts it off-main.
+  print anything); 2 s timeout per probe, `~` expanded. Falls back to `~/.claude` only if no
+  source gives a value or the value is relative; a configured directory that doesn't exist yet is
+  honored (watchers cope). The shell probe runs in its own session with no tty and stops reading
+  once the shell exits, even if a background job still holds stdout; a complete marker line is
+  accepted at timeout. Resolved once and cached (up to ~4 s cold); `prewarmDefaultClaudeHome()`
+  starts it off-main. Async code awaits `SessionDiscovery.resolvedClaudeHome()` (suspends on the
+  resolver queue) instead of touching `defaultClaudeHome`, which blocks until resolved.
 - A registry pid is live only if it runs Claude Code:
   `ProcessRules.isClaudeExecutable` accepts a binary named `claude`, the native installer's
   `…/claude/versions/<ver>`, Homebrew's `Caskroom/claude-code/`, or `node` running the npm
@@ -113,6 +125,25 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   SessionStart; `GhosttyFocuser` runs it on demand (cached per pid) when no hook id exists.
   Swift polls for the nonce with short delay-free scripts (exact last-path-component match);
   tty writes are non-blocking, bounded and retried, and the cwd is always restored.
+- Pane highlight (`TerminalHighlighter`, Ghostty 1.3.1 verified): `ESC ] 11 ; #rrggbb ESC \`
+  written to a session's tty tints only that split pane's default background (cells with an
+  explicit background keep theirs, but most of Claude's TUI uses the default); `ESC ] 111 ESC \`
+  restores the theme background. ST-terminated. Claude Code never sends OSC 11/111 itself but
+  queries OSC 11 to pick its light/dark theme by luminance, so `highlightTint` blends the
+  background ~25% toward palette blue (4; another accent if that's too close) and backs the
+  strength off until the result stays in the background's luminance class (relative luminance
+  and perceived brightness on the same side of 0.5): never a light flash on a dark theme.
+  Hover tints until `endHover`/another `beginHover`, capped at 3 s; `pulse` is tint, reset, tint,
+  then reset (or the hover tint) over ~450 ms. Only for `.ghostty` sessions whose tty is a
+  `/dev/ttysN` that's the pid's controlling tty and not under tmux; writes reuse the OSC 7
+  probe's non-blocking `O_NOCTTY` open and bounded `writeAll`. All tty I/O is on a private
+  serial queue; hover requests are coalesced (only the latest is applied, old pane reset first).
+  A tint is skipped (never waits) while `.probe-<tty>.lock` exists with an mtime under 10 s, so it
+  can't race a probe's restore. Stuck-tint recovery: a tty is added to
+  `~/Library/Application Support/ClaudeWatcher/tinted-ttys` (atomic write) before a tint and
+  removed once its reset fully went out; `resetAll()` (launch, panel hide; `resetAllSync` at
+  terminate) sends OSC 111 to every recorded path that's still a `/dev/ttysN` char device and
+  deletes the file.
 - Ghostty AppleScript `focus <terminal>` switches Spaces to the target window (verified).
 - Terminal.app: `activate` first, then `set index of w to 1` and `set frontmost of w to true`.
   Raising before `activate` never switches Spaces.

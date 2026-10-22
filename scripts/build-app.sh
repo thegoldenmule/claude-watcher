@@ -22,6 +22,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+# Hook script, installed by HookInstaller.install(hookScriptSource:) from the bundle.
+cp hooks/claude-watcher-hook.sh "$APP/Contents/Resources/claude-watcher-hook.sh"
+chmod 755 "$APP/Contents/Resources/claude-watcher-hook.sh"
 
 IDENTITY="${CODESIGN_IDENTITY:-}"
 if [[ -z "$IDENTITY" ]]; then

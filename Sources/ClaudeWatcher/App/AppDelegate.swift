@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The one focuser for the app's lifetime: it holds the Ghostty pid cache and probe locks.
     let focuser = RoutingFocuser()
     let edge: EdgeController
+    let menu = MenuModel()
 
     override init() {
         if DemoMode.isEnabled {

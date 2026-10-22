@@ -27,10 +27,13 @@
 # Env overrides (tests/debugging):
 #   CLAUDE_WATCHER_STATE_DIR   state directory
 #   CLAUDE_WATCHER_CLAUDE_PID  skip the process-tree walk and use this pid
+#   CLAUDE_WATCHER_WALK_FROM   start the process-tree walk at this pid instead of $PPID
 #   CLAUDE_WATCHER_NO_JQ=1     force the pure-zsh fallback even when jq exists
 #   CLAUDE_WATCHER_NO_GHOSTTY_PROBE=1  skip the Ghostty terminal-id probe
 #   CLAUDE_WATCHER_TTY         use this path as claude's tty (tests: a regular file or FIFO)
 #   CLAUDE_WATCHER_OSASCRIPT   osascript command used by the probe (tests: a stub)
+#   CLAUDE_WATCHER_TEST_BEFORE_LOCK_BREAK  command the probe runs after judging a probe lock
+#                              stale and before renaming it aside (tests: simulate a race)
 
 exec >/dev/null 2>&1
 setopt no_nomatch extended_glob
@@ -69,18 +72,22 @@ main() {
   local state_file="$state_dir/$sid.json"
   local tombstone="$state_dir/$sid.ended"
 
+  # Hook version 1 kept the Ghostty id inside <sid>.json: move it to the sidecar before this
+  # event replaces (or tombstones) that file.
+  migrate_v1_id "$state_dir" "$sid"
+
   if [[ $event == SessionEnd ]]; then
     # Keep the last state as the tombstone: it blocks late async writers for this id and
     # lets a /clear successor in the same process adopt the Ghostty id from <sid>.ghostty.
     if [[ -f $state_file ]]; then
-      atomic_mv "$state_file" "$tombstone"
+      # rename keeps the JSON's old mtime: touch it, or GC could take a fresh tombstone (and
+      # its sidecar) for an hour old before the successor adopts the id.
+      atomic_mv "$state_file" "$tombstone" && touch -c "$tombstone"
     else
       : >| "$tombstone"
     fi
     return 0
   fi
-
-  maybe_gc "$state_dir"
 
   local claude_pid tty
   find_claude || return 0   # not under a claude process: nothing useful to record
@@ -97,9 +104,12 @@ main() {
     # /clear and in-process /resume start a new session_id in the same claude process:
     # drop the predecessor's state and adopt its Ghostty id (same pid + tty => same terminal).
     adopt_ghostty_id "$state_dir"
-    # A (re)started session supersedes any earlier end of the same id (e.g. --resume).
-    zf_rm -f "$tombstone"
   fi
+  # After adoption, so GC can't drop a predecessor's tombstone and sidecar first.
+  maybe_gc "$state_dir"
+  # A (re)started session supersedes any earlier end of the same id (e.g. --resume). After GC,
+  # which would otherwise take our kept sidecar for an orphan (neither .json nor .ended).
+  [[ $event == SessionStart ]] && zf_rm -f "$tombstone"
 
   local tmp="$state_dir/.$sid.json.tmp.$$"
   if (( use_jq )); then
@@ -177,8 +187,9 @@ adopt_ghostty_id() {
     [[ $other == $sid ]] && continue
     content=$(<"$f")
     [[ $content == *\"claude_pid\":${claude_pid}[,}]* ]] || continue
-    if [[ -z $ghostty_id && $content == *\"tty\":${tty_json}[,}]* && -f $dir/$other.ghostty ]]; then
-      ghostty_id=$(read_sidecar "$dir/$other.ghostty")
+    if [[ -z $ghostty_id && $content == *\"tty\":${tty_json}[,}]* ]]; then
+      if [[ -f $dir/$other.ghostty ]]; then ghostty_id=$(read_sidecar "$dir/$other.ghostty")
+      else ghostty_id=$(v1_ghostty_id "$content"); fi   # predecessor written by hook version 1
     fi
     [[ $f == *.json ]] && zf_rm -f "$f" "$dir/$other.ghostty"
   done
@@ -189,6 +200,24 @@ read_sidecar() {
   local v
   [[ -f $1 ]] && v=$(<"$1")
   [[ $v == [A-Za-z0-9-]## ]] && print -r -- "$v"
+}
+
+# Prints the Ghostty id a hook-version-1 state JSON ($1) carried inline, if valid.
+v1_ghostty_id() {
+  [[ $1 == *'"ghostty_terminal_id"'* ]] || return 0
+  [[ $1 =~ '"ghostty_terminal_id"[[:space:]]*:[[:space:]]*"([A-Za-z0-9-]{1,128})"' ]] \
+    && print -r -- "$match[1]"
+}
+
+# Writes <dir>/<sid>.ghostty ($1 $2) from an id that <sid>.json still carries inline (hook
+# version 1), unless the sidecar exists. Cheap: reads the JSON only while there is no sidecar.
+migrate_v1_id() {
+  local f="$1/$2.json" content id
+  [[ -f $f && ! -e $1/$2.ghostty ]] || return 0
+  content=$(<"$f")
+  [[ $content == *'"ghostty_terminal_id"'* ]] || return 0
+  id=$(v1_ghostty_id "$content")
+  [[ -n $id ]] && write_sidecar "$1" "$2" "$id"
 }
 
 # Atomically replaces <dir>/<sid>.ghostty ($1 $2) with id $3.
@@ -232,17 +261,22 @@ ghostty_probe() {
   done
 }
 
-# Per-tty probe lock, shared with the app's Swift OSC 7 probe (same protocol on both sides):
+# Per-tty probe lock, shared with the app's Swift OSC7ProbeLock. Protocol v2, same on both
+# sides:
 # - acquire: mkdir <lock> (atomic), then write "<pid> <token>" to <lock>/owner;
 # - held: poll every ~25 ms for at most 1 s, then give up (return 1);
-# - stale (lock dir mtime older than 10 s; a probe's AppleScript times out after 3 s): rename
-#   it to <lock>.stale-<random> (atomic, so one breaker wins), rm -rf that, retry mkdir.
+# - stale (probe_lock_stale): owner pid dead; or owner missing/unparseable and the dir older
+#   than 10 s; or owner pid alive but the dir older than 120 s (pid reuse cap). The Swift
+#   holder touches the dir every ~2 s; we hold it for a few seconds at most (AppleScript times
+#   out after 3 s), so our live pid alone keeps it fresh;
+# - break (probe_lock_break): rename it to <lock>.stale-<random>, and only if the aside owner
+#   is still the one judged stale remove it and retry mkdir; else put it back (it was fresh).
 # On success REPLY is the token for probe_lock_release.
 probe_lock_acquire() {
-  local lock=$1 me=${sysparams[pid]:-$$} grave
-  local -a stale
+  local lock=$1 me=${sysparams[pid]} seen
   local deadline=$(( EPOCHREALTIME + 1.0 ))
-  zmodload -e zsh/files && zmodload zsh/zselect 2>/dev/null || return 1
+  # Our pid must be the detached probe's own (alive while we hold the lock), never $$.
+  [[ $me == <1-> ]] && zmodload -e zsh/files && zmodload zsh/zselect 2>/dev/null || return 1
   REPLY="${EPOCHREALTIME/./}$RANDOM$RANDOM"
   while :; do
     if zf_mkdir "$lock" 2>/dev/null; then
@@ -251,14 +285,65 @@ probe_lock_acquire() {
       return 1
     fi
     (( EPOCHREALTIME < deadline )) || return 1
-    stale=( $lock(N/ms+10) )
-    if (( ${#stale} )); then
-      grave="$lock.stale-$me$RANDOM$RANDOM"
-      zf_mv "$lock" "$grave" 2>/dev/null && zf_rm -rf "$grave" 2>/dev/null
-      continue
+    if probe_lock_stale "$lock"; then
+      [[ -n ${CLAUDE_WATCHER_TEST_BEFORE_LOCK_BREAK:-} ]] && "$CLAUDE_WATCHER_TEST_BEFORE_LOCK_BREAK"
+      probe_lock_break "$lock" "$seen" && continue
     fi
     zselect -t 2   # ~20 ms (returns 1 on timeout)
   done
+}
+
+# True if lock $1 is stale (see probe_lock_acquire). Sets the caller's `seen` to the owner
+# content it judged ("" when missing or unreadable).
+probe_lock_stale() {
+  local lock=$1
+  local -a f old
+  seen=""
+  [[ -d $lock ]] || return 1
+  [[ -r $lock/owner ]] && seen=$(<"$lock/owner")
+  f=( ${=seen} )
+  if (( ${#f} == 2 )) && [[ $f[1] == <1-> ]]; then
+    pid_alive "$f[1]" || return 0
+    old=( $lock(N/ms+120) )
+  else
+    old=( $lock(N/ms+10) )
+  fi
+  (( ${#old} ))
+}
+
+# kill -0 fails for a dead pid and (EPERM) for another user's live one; zsh hides errno, so
+# ask ps in that rare case.
+pid_alive() {
+  kill -0 "$1" 2>/dev/null && return 0
+  [[ -n $(ps -o pid= -p "$1" 2>/dev/null) ]]
+}
+
+# Renames stale lock $1 (owner content $2 when judged) aside. Returns 0 if the lock is gone
+# and mkdir should be retried, 1 if it is busy.
+probe_lock_break() {
+  local lock=$1 seen=$2 grave="$1.stale-${sysparams[pid]}$RANDOM$RANDOM" aside=""
+  local -a old
+  if ! zf_mv "$lock" "$grave" 2>/dev/null; then
+    [[ -e $lock ]] && return 1
+    return 0   # already gone: another breaker won, or the holder released it
+  fi
+  [[ -r $grave/owner ]] && aside=$(<"$grave/owner")
+  if [[ $aside == "$seen" ]]; then
+    old=( $grave(N/ms+10) )
+    # Same owner, or (no owner) still the old dir: the lock we judged. Without an owner, a
+    # lock taken in between (mkdir done, owner not yet written) would be young.
+    if [[ -n $seen ]] || (( ${#old} )); then
+      zf_rm -rf "$grave"
+      return 0
+    fi
+  fi
+  # We moved a fresh lock away: put it back. zf_mv moves *into* an existing directory, so
+  # never restore over a lock taken meanwhile (and undo it if one appeared in between):
+  # then drop the aside dir, as the Swift side's RENAME_EXCL does.
+  [[ -e $lock ]] || zf_mv "$grave" "$lock" 2>/dev/null
+  [[ -e $grave ]] && zf_rm -rf "$grave"
+  [[ -e $lock/${grave:t} ]] && zf_rm -rf "$lock/${grave:t}"
+  return 1
 }
 
 # Removes the lock only while <lock>/owner still holds our token: if someone broke it as
@@ -381,25 +466,39 @@ tty_write() {
 # Hooks are direct children of claude, so this normally stops at $PPID; the walk covers
 # an intermediate shell. ($CLAUDE_PID is not trusted on its own: a claude started from
 # inside another session's Bash tool could inherit the outer session's value.)
-# Native installs exec ~/.local/share/claude/versions/<ver> (ucomm is the version
-# string, argv0 is "claude"); npm installs run node on @anthropic-ai/claude-code.
 find_claude() {
   claude_pid="" tty=""
-  local p=${CLAUDE_WATCHER_CLAUDE_PID:-$PPID} depth=0 line ppid t ucomm args
+  local p=${CLAUDE_WATCHER_CLAUDE_PID:-${CLAUDE_WATCHER_WALK_FROM:-$PPID}} depth=0 line ppid t ucomm args
   while (( depth < 12 )) && [[ $p == <2-> ]]; do
     line=$(ps -o ppid= -o tty= -o ucomm= -o args= -p "$p" 2>/dev/null) || return 1
     [[ -n $line ]] || return 1
     read -r ppid t ucomm args <<< "$line"
-    if [[ -n ${CLAUDE_WATCHER_CLAUDE_PID:-} \
-       || $ucomm == claude || $ucomm == <->.<->.<->* \
-       || ${${args%% *}:t} == claude \
-       || $args == */claude/versions/* || $args == *@anthropic-ai/claude-code* ]]; then
+    if [[ -n ${CLAUDE_WATCHER_CLAUDE_PID:-} ]] || is_claude_process "$ucomm" "$args"; then
       claude_pid=$p
       [[ -n $t && $t != '??' && $t != - ]] && tty="/dev/${t#/dev/}"
       return 0
     fi
     p=$ppid
     (( depth++ ))
+  done
+  return 1
+}
+
+# True if a process with ucomm $1 and command line $2 (ps args) runs Claude Code (mirrors
+# Swift's ProcessRules.isClaudeExecutable). Native installs exec
+# ~/.local/share/claude/versions/<ver> (ucomm is the version string, argv0 is "claude"),
+# Homebrew's cask runs Caskroom/claude-code/…/claude. npm installs run node on the package:
+# argv is "node /opt/homebrew/bin/claude …", where bin/claude is a symlink to
+# …/@anthropic-ai/claude-code/cli.js, so for node look at the script (first non-option arg).
+is_claude_process() {
+  local ucomm=$1 args=$2 a
+  [[ $ucomm == claude || $ucomm == <->.<->.<->* || ${${args%% *}:t} == claude \
+     || $args == */claude/versions/* || $args == *@anthropic-ai/claude-code* ]] && return 0
+  [[ $ucomm == node || ${${args%% *}:t} == node ]] || return 1
+  for a in ${${(z)args}[2,-1]}; do
+    [[ $a == -* ]] && continue
+    [[ ${a:t} == claude || ${a:A} == *@anthropic-ai/claude-code* ]]
+    return
   done
   return 1
 }
@@ -430,10 +529,7 @@ maybe_gc() {
     local -A ok
     for l in ${(f)alive}; do
       read -r lpid lucomm largs <<< "$l"
-      if [[ $lucomm == claude || $lucomm == <->.<->.<->* || ${${largs%% *}:t} == claude \
-         || $largs == */claude/versions/* || $largs == *@anthropic-ai/claude-code* ]]; then
-        ok[$lpid]=1
-      fi
+      is_claude_process "$lucomm" "$largs" && ok[$lpid]=1
     done
     for pid in ${(k)file_for_pid}; do
       [[ -n ${ok[$pid]} ]] && continue

@@ -229,6 +229,163 @@ import Testing
         #expect(!env.exists(grave.lastPathComponent))
     }
 
+    // MARK: npm installs (node running @anthropic-ai/claude-code)
+
+    /// A fake npm layout without spaces in its path (ps args are split on spaces): `node` is a
+    /// symlink to tail (argv0 basename "node"), `bin/claude` and `bin/cc` link to the package's
+    /// cli.js, `other.js` is some other script.
+    final class FakeNode {
+        let root: URL
+        var procs: [Process] = []
+        init() throws {
+            root = FileManager.default.temporaryDirectory.appendingPathComponent("cwnpm-\(UUID().uuidString)")
+            let fm = FileManager.default
+            let pkg = root.appendingPathComponent("lib/node_modules/@anthropic-ai/claude-code")
+            try fm.createDirectory(at: pkg, withIntermediateDirectories: true)
+            try fm.createDirectory(at: root.appendingPathComponent("bin"), withIntermediateDirectories: true)
+            try Data().write(to: pkg.appendingPathComponent("cli.js"))
+            try Data().write(to: root.appendingPathComponent("other.js"))
+            try fm.createSymbolicLink(atPath: root.appendingPathComponent("node").path, withDestinationPath: "/usr/bin/tail")
+            for name in ["claude", "cc"] {
+                try fm.createSymbolicLink(atPath: root.appendingPathComponent("bin/\(name)").path,
+                                          withDestinationPath: "../lib/node_modules/@anthropic-ai/claude-code/cli.js")
+            }
+        }
+        deinit {
+            for p in procs where p.isRunning { p.terminate() }
+            try? FileManager.default.removeItem(at: root)
+        }
+        /// Runs `node <args…>` (tail -f, so it stays up); returns its pid.
+        func spawn(_ args: [String]) throws -> Int32 {
+            let p = Process()
+            p.executableURL = root.appendingPathComponent("node")
+            p.arguments = args.map { $0.replacingOccurrences(of: "$ROOT", with: root.path) }
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try p.run()
+            procs.append(p)
+            return p.processIdentifier
+        }
+    }
+
+    @Test func detectsNPMInstallsInTheWalkAndGC() throws {
+        let env = try Env(noJQ: false)
+        let node = try FakeNode()
+        let viaBin = try node.spawn(["-f", "$ROOT/bin/claude"])   // argv[1] basename "claude"
+        let viaLink = try node.spawn(["-f", "$ROOT/bin/cc"])      // resolves into the package
+        let other = try node.spawn(["-f", "$ROOT/other.js"])
+        Thread.sleep(forTimeInterval: 0.2)
+        for (sid, pid) in [("npm-bin", viaBin), ("npm-link", viaLink), ("other", other)] {
+            try env.run(Self.input(sid, "SessionStart"),
+                        extraEnv: ["CLAUDE_WATCHER_CLAUDE_PID": "", "CLAUDE_WATCHER_WALK_FROM": String(pid)])
+        }
+        #expect(try env.state("npm-bin")?.claudePID == viaBin)
+        #expect(try env.state("npm-link")?.claudePID == viaLink)
+        // Not claude: the walk goes on past it (to whatever claude runs these tests, if any).
+        #expect(try env.state("other")?.claudePID != other)
+
+        // GC keeps state of live npm claudes and drops that of a live node running something else.
+        for (sid, pid) in [("gc-bin", viaBin), ("gc-link", viaLink), ("gc-other", other)] {
+            let json = #"{"session_id":"\#(sid)","claude_pid":\#(pid),"last_event":"Stop","updated_at":1}"#
+            try Data(json.utf8).write(to: env.dir.appendingPathComponent("\(sid).json"))
+        }
+        try FileManager.default.removeItem(at: env.dir.appendingPathComponent(".gc-stamp"))
+        try env.run(Self.input("s-1", "Stop"))
+        #expect(env.exists("gc-bin.json"))
+        #expect(env.exists("gc-link.json"))
+        #expect(!env.exists("gc-other.json"))
+    }
+
+    // MARK: Hook version 1 migration (Ghostty id inline in <sid>.json)
+
+    /// Rewrites `<sid>.json` as hook version 1 wrote it: with the id inline.
+    func makeV1(_ env: Env, _ sid: String, id: String) throws {
+        let json = try #require(env.json(sid))
+        let v1 = json.replacingOccurrences(of: #""updated_at""#, with: #""ghostty_terminal_id":\#(id),"updated_at""#)
+        try Data(v1.utf8).write(to: env.dir.appendingPathComponent("\(sid).json"))
+    }
+
+    @Test(arguments: [false, true])
+    func migratesAV1InlineIDToTheSidecar(noJQ: Bool) throws {
+        // A fresh dir per case: sessions of one pid and tty would adopt each other's ids.
+        for event in ["Stop", "SessionStart", "SessionEnd"] {
+            let env = try Env(noJQ: noJQ)
+            let sid = "s-\(event)"
+            try env.run(Self.input(sid, "Stop"))
+            try makeV1(env, sid, id: #""0FD9735C-6645-44F3-975D-7BC605D03215""#)
+            try env.run(Self.input(sid, event))
+            #expect(env.sidecar(sid) == "0FD9735C-6645-44F3-975D-7BC605D03215", "\(event)")
+            if event != "SessionEnd" {
+                #expect(env.json(sid)?.contains("ghostty_terminal_id") == false)
+                #expect(try env.state(sid)?.ghosttyTerminalID == "0FD9735C-6645-44F3-975D-7BC605D03215")
+            }
+        }
+        // null, an invalid id, or an existing sidecar: nothing (else) written.
+        for (sid, id) in [("n", "null"), ("bad", #""bad id;rm""#), ("long", "\"\(String(repeating: "A", count: 129))\"")] {
+            let env = try Env(noJQ: noJQ)
+            try env.run(Self.input(sid, "Stop"))
+            try makeV1(env, sid, id: id)
+            try env.run(Self.input(sid, "Stop"))
+            #expect(env.sidecar(sid) == nil, "\(sid)")
+        }
+        let env = try Env(noJQ: noJQ)
+        try env.run(Self.input("kept", "Stop"))
+        try env.setGhosttyID("kept", "GID-NEW")
+        try makeV1(env, "kept", id: #""GID-OLD""#)
+        try env.run(Self.input("kept", "Stop"))
+        #expect(env.sidecar("kept") == "GID-NEW")
+    }
+
+    /// A /clear successor of a version-1 session (id only inline in the predecessor's JSON).
+    @Test func clearSuccessorAdoptsAV1InlineID() throws {
+        let env = try Env(noJQ: false)
+        try env.run(Self.input("old", "SessionStart"))
+        try makeV1(env, "old", id: #""GID-V1""#)
+        try FileManager.default.moveItem(at: env.dir.appendingPathComponent("old.json"),
+                                         to: env.dir.appendingPathComponent("old.ended"))   // v1 SessionEnd
+        try env.run(Self.input("new", "SessionStart"))
+        #expect(try env.state("new")?.ghosttyTerminalID == "GID-V1")
+    }
+
+    // MARK: Tombstone age (R2-11)
+
+    func mtime(_ env: Env, _ name: String) throws -> Date {
+        try #require(try FileManager.default.attributesOfItem(atPath: env.dir.appendingPathComponent(name).path)[.modificationDate] as? Date)
+    }
+
+    func age(_ env: Env, _ name: String, by seconds: TimeInterval) throws {
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-seconds)],
+                                              ofItemAtPath: env.dir.appendingPathComponent(name).path)
+    }
+
+    @Test func tombstoneIsFreshAndSurvivesGCForTheSuccessor() throws {
+        let env = try Env(noJQ: false)
+        try env.run(Self.input("old", "SessionStart"))
+        try env.setGhosttyID("old", "GID-1")
+        // The last write was long ago (idle session), then SessionEnd: the tombstone is new.
+        try age(env, "old.json", by: 7200)
+        try env.run(Self.input("old", "SessionEnd"))
+        #expect(abs(try mtime(env, "old.ended").timeIntervalSinceNow) < 60)
+        // GC due now: it must neither take the fresh tombstone nor run before adoption.
+        try FileManager.default.removeItem(at: env.dir.appendingPathComponent(".gc-stamp"))
+        try env.run(Self.input("other", "Stop"))
+        #expect(env.exists("old.ended") && env.sidecar("old") == "GID-1")
+        try env.run(Self.input("new", "SessionStart"))
+        #expect(try env.state("new")?.ghosttyTerminalID == "GID-1")
+    }
+
+    @Test func successorAdoptsBeforeGCDropsAnOldTombstone() throws {
+        let env = try Env(noJQ: false)
+        try env.run(Self.input("old", "SessionStart"))
+        try env.setGhosttyID("old", "GID-1")
+        try env.run(Self.input("old", "SessionEnd"))
+        try age(env, "old.ended", by: 7200)
+        try FileManager.default.removeItem(at: env.dir.appendingPathComponent(".gc-stamp"))
+        try env.run(Self.input("new", "SessionStart"))
+        #expect(try env.state("new")?.ghosttyTerminalID == "GID-1")
+        #expect(!env.exists("old.ended") && env.sidecar("old") == nil)   // GC'd, after adoption
+    }
+
     @Test func isFast() throws {
         let env = try Env(noJQ: false)
         try env.run(Self.input("s-1", "SessionStart"))
@@ -435,15 +592,82 @@ import Testing
         #expect(!env.exists(Self.probeLock))
     }
 
-    @Test func staleProbeLockIsBrokenByRename() throws {
+    static let deadPID = "999999"
+    static var myPID: String { String(ProcessInfo.processInfo.processIdentifier) }
+
+    /// Protocol v2: a lock whose owner pid is dead is stale at once, whatever its age; one
+    /// without a (parseable) owner only after 10 s; one whose owner is alive only after 120 s.
+    static let staleLocks: [(String, Double)] = [
+        ("\(deadPID) dead-token", 0), ("\(deadPID) dead-token", 30), ("", 30), ("garbage", 30), ("0 tok", 30),
+        ("\(myPID) alive-token", 200), ("1 launchd-token", 200)]
+    static let liveLocks: [(String, Double)] = [("\(myPID) alive-token", 60), ("1 launchd-token", 60), ("", 0)]
+
+    @Test(arguments: staleLocks)
+    func staleProbeLockIsBrokenByRename(owner: String, age: Double) throws {
         let env = try Env(noJQ: false)
         let extra = try Self.probeEnv(env, ids: ["GID-1"])
         // Not empty (owner file inside), so a plain rmdir could not have removed it.
-        _ = try makeLock(env, owner: "1 dead-token", age: 30)
+        let lock = try makeLock(env, owner: owner, age: age)
+        if owner.isEmpty {
+            try FileManager.default.removeItem(at: lock.appendingPathComponent("owner"))
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: lock.path)
+        }
         try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
         #expect(try Self.waitFor { try env.state("s-1")?.ghosttyTerminalID == "GID-1" })
         let names = try FileManager.default.contentsOfDirectory(atPath: env.dir.path)
         #expect(!names.contains { $0.hasPrefix(".probe-") }, "\(names)")
+    }
+
+    /// A live owner (ours; pid 1 answers EPERM) is never broken before the 120 s cap, and a
+    /// young lock without an owner (mkdir done, owner not yet written) is not either.
+    @Test(arguments: liveLocks)
+    func liveOrYoungProbeLockIsNotBroken(owner: String, age: Double) throws {
+        let env = try Env(noJQ: false)
+        let extra = try Self.probeEnv(env, ids: ["GID-1"])
+        let lock = try makeLock(env, owner: owner, age: age)
+        if owner.isEmpty { try FileManager.default.removeItem(at: lock.appendingPathComponent("owner")) }
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        Thread.sleep(forTimeInterval: 1.5)
+        #expect(!env.exists("nonces"))
+        #expect(env.sidecar("s-1") == nil)
+        if !owner.isEmpty {
+            #expect(try String(contentsOf: lock.appendingPathComponent("owner"), encoding: .utf8) == owner)
+        }
+        let names = try FileManager.default.contentsOfDirectory(atPath: env.dir.path)
+        #expect(names.filter { $0.hasPrefix(".probe-") } == [Self.probeLock], "\(names)")
+    }
+
+    /// R2-7: the lock judged stale is replaced by a fresh one before the rename. The breaker
+    /// sees a different owner in the aside dir, puts the fresh lock back and keeps waiting.
+    @Test func freshLockRenamedByMistakeIsRestored() throws {
+        let env = try Env(noJQ: false)
+        var extra = try Self.probeEnv(env, ids: ["GID-1"])
+        _ = try makeLock(env, owner: "\(Self.deadPID) dead-token")
+        let swap = env.dir.appendingPathComponent("swap-lock")
+        let script = """
+        #!/bin/sh
+        d=$(dirname "$0")
+        [ -e "$d/swapped" ] && exit 0
+        : > "$d/swapped"
+        rm -rf "$d/\(Self.probeLock)"
+        mkdir "$d/\(Self.probeLock)"
+        printf '%s' '\(Self.myPID) fresh-token' > "$d/\(Self.probeLock)/owner"
+        """
+        try Data(script.utf8).write(to: swap)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: swap.path)
+        extra["CLAUDE_WATCHER_TEST_BEFORE_LOCK_BREAK"] = swap.path
+        try env.run(Self.input("s-1", "SessionStart"), extraEnv: extra)
+        #expect(Self.waitFor { env.exists("swapped") })
+        Thread.sleep(forTimeInterval: 1.5)
+        // Restored (not broken, not nested), and the probe gave up instead of probing.
+        let owner = env.dir.appendingPathComponent(Self.probeLock).appendingPathComponent("owner")
+        #expect(try String(contentsOf: owner, encoding: .utf8) == "\(Self.myPID) fresh-token")
+        let inside = try FileManager.default.contentsOfDirectory(atPath: owner.deletingLastPathComponent().path)
+        #expect(inside == ["owner"])
+        let names = try FileManager.default.contentsOfDirectory(atPath: env.dir.path)
+        #expect(names.filter { $0.hasPrefix(".probe-") } == [Self.probeLock], "\(names)")
+        #expect(!env.exists("nonces"))
+        #expect(env.sidecar("s-1") == nil)
     }
 
     @Test func probeReleasesOnlyALockItStillOwns() throws {

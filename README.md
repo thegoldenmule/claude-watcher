@@ -43,3 +43,7 @@ tabs are still found on first click by a quick probe.
 
 Sessions come from `~/.claude/sessions/` and their transcripts; Ghostty tabs are matched by an
 OSC 7 probe (a nonce cwd written to the session's tty) via Ghostty's AppleScript.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

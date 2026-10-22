@@ -23,9 +23,14 @@ public struct ProcessSnapshot: Sendable, Equatable {
 /// Abstraction over libproc so discovery can be tested with fake process tables.
 public protocol ProcessInspecting: Sendable {
     func snapshot(pid: Int32) -> ProcessSnapshot?
+    /// The process's argv (argv[0] first), if readable. Comparatively expensive: callers
+    /// should only ask when the executable alone is not conclusive (e.g. `node`).
+    func arguments(pid: Int32) -> [String]?
 }
 
 extension ProcessInspecting {
+    public func arguments(pid: Int32) -> [String]? { nil }
+
     /// Ancestors of `pid` (parent first), stopping before launchd (pid 1).
     public func ancestors(of pid: Int32, maxDepth: Int = 24) -> [ProcessSnapshot] {
         var result: [ProcessSnapshot] = []
@@ -89,6 +94,41 @@ public struct SystemProcessInspector: ProcessInspecting {
         return String(decoding: bytes, as: UTF8.self)
     }
 
+    public func arguments(pid: Int32) -> [String]? {
+        guard pid > 0 else { return nil }
+        var argmax: Int32 = 0
+        var argmaxLen = MemoryLayout<Int32>.size
+        var argmaxMib: [Int32] = [CTL_KERN, KERN_ARGMAX]
+        guard sysctl(&argmaxMib, 2, &argmax, &argmaxLen, nil, 0) == 0, argmax > 0 else { return nil }
+
+        var buffer = [UInt8](repeating: 0, count: Int(argmax))
+        var len = buffer.count
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        guard sysctl(&mib, 3, &buffer, &len, nil, 0) == 0 else { return nil }
+        return Self.parseProcArgs2(buffer.prefix(len))
+    }
+
+    /// Parses a `KERN_PROCARGS2` buffer: `int argc`, the exec path, NUL padding, then
+    /// `argc` NUL-terminated argument strings (followed by the environment, ignored).
+    static func parseProcArgs2(_ bytes: ArraySlice<UInt8>) -> [String]? {
+        let intSize = MemoryLayout<Int32>.size
+        guard bytes.count >= intSize else { return nil }
+        let argc = bytes.prefix(intSize).withUnsafeBytes { Int($0.loadUnaligned(as: Int32.self)) }
+        guard argc >= 0 else { return nil }
+        var i = bytes.startIndex + intSize
+        // Skip the exec path, then the NUL padding after it.
+        while i < bytes.endIndex, bytes[i] != 0 { i += 1 }
+        while i < bytes.endIndex, bytes[i] == 0 { i += 1 }
+        var args: [String] = []
+        while args.count < argc, i < bytes.endIndex {
+            let start = i
+            while i < bytes.endIndex, bytes[i] != 0 { i += 1 }
+            args.append(String(decoding: bytes[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
+    }
+
     static func kinfo(pid: Int32) -> kinfo_proc? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var kp = kinfo_proc()
@@ -105,11 +145,27 @@ public enum ProcessRules {
     /// Allowed difference between `procStart` (second resolution) and the real start time.
     public static let startTolerance: TimeInterval = 2
 
+    /// Whether `executablePath` runs Claude Code. Mirrors the hook's `find_claude`: a binary
+    /// named `claude` (Homebrew cask, symlinked installs), the native installer's
+    /// `…/claude/versions/<ver>`, the cask's `Caskroom/claude-code/`, or `node` running the npm
+    /// package. `arguments` is only consulted for `node`, so the argv read stays rare.
+    public static func isClaudeExecutable(_ executablePath: String?, arguments: () -> [String]?) -> Bool {
+        guard let path = executablePath, !path.isEmpty else { return false }
+        if path.contains("/claude/versions/") || path.contains("Caskroom/claude-code/") { return true }
+        let name = (path as NSString).lastPathComponent
+        if name == "claude" { return true }
+        guard name == "node" else { return false }
+        return arguments()?.contains { $0.contains("@anthropic-ai/claude-code") } ?? false
+    }
+
     /// A registry record is live when its pid exists, runs a Claude Code binary, and
     /// started when the record says (guards against pid reuse by stale files).
-    public static func isLive(_ record: SessionRecord, process: ProcessSnapshot?) -> Bool {
+    /// `arguments` supplies the process's argv; it is only called for `node` processes.
+    public static func isLive(
+        _ record: SessionRecord, process: ProcessSnapshot?, arguments: () -> [String]? = { nil }
+    ) -> Bool {
         guard let process, process.pid == record.pid else { return false }
-        guard let path = process.executablePath, path.contains("/claude/versions/") else { return false }
+        guard isClaudeExecutable(process.executablePath, arguments: arguments) else { return false }
         if let procStart = record.procStartDate {
             return abs(process.startTime.timeIntervalSince(procStart)) <= startTolerance
         }

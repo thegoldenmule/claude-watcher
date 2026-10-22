@@ -87,7 +87,9 @@ public actor SessionDiscovery {
         var liveTerminalKeys: Set<String> = []
         for record in records where record.isInteractive {
             let process = inspector.snapshot(pid: record.pid)
-            guard ProcessRules.isLive(record, process: process), let process else { continue }
+            guard ProcessRules.isLive(record, process: process, arguments: { inspector.arguments(pid: record.pid) }),
+                  let process
+            else { continue }
 
             let terminalKey = "\(process.pid)@\(process.startTime.timeIntervalSince1970)"
             liveTerminalKeys.insert(terminalKey)

@@ -37,7 +37,9 @@ private func procStartString(_ date: Date) -> String {
 /// Fake process table.
 private struct FakeInspector: ProcessInspecting {
     var table: [Int32: ProcessSnapshot]
+    var argv: [Int32: [String]] = [:]
     func snapshot(pid: Int32) -> ProcessSnapshot? { table[pid] }
+    func arguments(pid: Int32) -> [String]? { argv[pid] }
 }
 
 private final class TempHome {
@@ -265,6 +267,59 @@ private let transcriptSample = """
     #expect(!ProcessRules.isLive(record, process: other))
 }
 
+@Test func livenessAcceptsClaudeInstallKinds() {
+    let start = Date(timeIntervalSince1970: 1792681136)
+    let record = SessionRecord(pid: 42, sessionId: "s", cwd: "/", startedAt: 1792681139260,
+                               procStart: procStartString(start))
+    func live(_ path: String, argv: [String]? = nil) -> Bool {
+        let snap = ProcessSnapshot(pid: 42, ppid: 1, startTime: start, executablePath: path)
+        return ProcessRules.isLive(record, process: snap, arguments: { argv })
+    }
+    let npmArgv = ["node", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js", "--resume"]
+
+    // Native installer.
+    #expect(live(claudeBinary))
+    // Homebrew cask.
+    #expect(live("/opt/homebrew/Caskroom/claude-code/2.1.306/claude"))
+    // Any binary named claude (e.g. a symlinked or self-built install).
+    #expect(live("/usr/local/bin/claude"))
+    // npm: node running the claude-code package.
+    #expect(live("/opt/homebrew/Cellar/node/24.1.0/bin/node", argv: npmArgv))
+    #expect(live("/Users/me/.nvm/versions/node/v22.0.0/bin/node", argv: npmArgv))
+    // Plain node, or node whose argv is unreadable: rejected.
+    #expect(!live("/opt/homebrew/bin/node", argv: ["node", "server.js"]))
+    #expect(!live("/opt/homebrew/bin/node", argv: nil))
+    // Unrelated binaries: rejected, and argv is never read for them.
+    var argvRead = false
+    let vim = ProcessSnapshot(pid: 42, ppid: 1, startTime: start, executablePath: "/usr/bin/vim")
+    #expect(!ProcessRules.isLive(record, process: vim, arguments: { argvRead = true; return npmArgv }))
+    #expect(!argvRead)
+    #expect(!live("/Users/me/bin/claude-wrapper"))
+    // Start-time guard still applies to non-native installs.
+    let reused = ProcessSnapshot(pid: 42, ppid: 1, startTime: start.addingTimeInterval(3600),
+                                 executablePath: "/opt/homebrew/bin/node")
+    #expect(!ProcessRules.isLive(record, process: reused, arguments: { npmArgv }))
+}
+
+@Test func parsesProcArgs2() {
+    var bytes: [UInt8] = []
+    withUnsafeBytes(of: Int32(3)) { bytes.append(contentsOf: $0) }
+    bytes += Array("/opt/homebrew/bin/node".utf8) + [0, 0, 0, 0]
+    for arg in ["node", "/x/node_modules/@anthropic-ai/claude-code/cli.js", "-c"] {
+        bytes += Array(arg.utf8) + [0]
+    }
+    bytes += Array("HOME=/Users/me".utf8) + [0]
+    #expect(SystemProcessInspector.parseProcArgs2(bytes[...])
+            == ["node", "/x/node_modules/@anthropic-ai/claude-code/cli.js", "-c"])
+    #expect(SystemProcessInspector.parseProcArgs2([1, 0][...]) == nil)
+}
+
+@Test func readsOwnArguments() {
+    let args = SystemProcessInspector().arguments(pid: getpid())
+    #expect(args?.isEmpty == false)
+    #expect(SystemProcessInspector().arguments(pid: -1) == nil)
+}
+
 @Test func classifiesTerminals() {
     #expect(ProcessRules.terminalKind(ancestorPaths: ["/bin/zsh", "/usr/bin/login", ghosttyBinary]) == .ghostty)
     #expect(ProcessRules.terminalKind(ancestorPaths: ["/bin/zsh", "/usr/bin/login", terminalBinary]) == .appleTerminal)
@@ -352,6 +407,30 @@ private let transcriptSample = """
     gone.table[100] = nil
     let discovery2 = SessionDiscovery(claudeHome: home.url, inspector: gone)
     #expect(await discovery2.scan().map(\.id) == ["s-200"])
+}
+
+@Test func discoversCaskAndNpmInstalls() async throws {
+    let home = try TempHome()
+    let t0 = Date(timeIntervalSince1970: 1792681136)
+    for pid: Int32 in [700, 800, 900] {
+        try home.write("sessions/\(pid).json", recordJSON(
+            pid: pid, sessionId: "s-\(pid)", cwd: "/p\(pid)",
+            startedAt: t0.timeIntervalSince1970 * 1000 + Double(pid), procStart: procStartString(t0)))
+    }
+    let node = "/opt/homebrew/Cellar/node/24.1.0/bin/node"
+    let inspector = FakeInspector(
+        table: [
+            700: ProcessSnapshot(pid: 700, ppid: 1, startTime: t0,
+                                 executablePath: "/opt/homebrew/Caskroom/claude-code/2.1.306/claude"),
+            800: ProcessSnapshot(pid: 800, ppid: 1, startTime: t0, executablePath: node),
+            900: ProcessSnapshot(pid: 900, ppid: 1, startTime: t0, executablePath: node),
+        ],
+        argv: [
+            800: ["node", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
+            900: ["node", "/srv/app/server.js"],
+        ])
+    let sessions = await SessionDiscovery(claudeHome: home.url, inspector: inspector).scan()
+    #expect(sessions.map(\.id) == ["s-700", "s-800"])
 }
 
 @Test func missingClaudeHomeYieldsNoSessions() async {

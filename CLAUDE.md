@@ -94,10 +94,11 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - A registry pid is live only if it runs Claude Code:
   `ProcessRules.isClaudeExecutable` accepts a binary named `claude`, the native installer's
   `…/claude/versions/<ver>`, Homebrew's `Caskroom/claude-code/`, or `node` running the npm
-  package (argv read via `KERN_PROCARGS2`, only for `node`): argv[1] basename `claude` (npm's
-  `bin/claude` symlink), argv[0] `claude` (`process.title`), an absolute argv[1] whose realpath
-  is in `@anthropic-ai/claude-code`, or any argument naming that package. Mirrors the hook's
-  `find_claude`.
+  package (argv read via `KERN_PROCARGS2`, only for `node`): argv[0] `claude` (`process.title`),
+  any argument literally naming `@anthropic-ai/claude-code` (`node …/cli.js`), or the script
+  (`ProcessRules.nodeScript`: skip leading `-` options; at `--`, the next argument) with basename
+  `claude` (npm's `bin/claude` symlink) or, if absolute, a realpath into that package. The hook's
+  `is_claude_process` (used by `find_claude` and GC) applies the same rule; keep both in sync.
 - Hook state dir `~/Library/Application Support/ClaudeWatcher/hook-state/` (layout documented at
   the top of `hooks/claude-watcher-hook.sh`; keep both sides in sync):
   - `<sid>.json`: replaced wholesale (temp + rename) by every event, no lock, no Ghostty id.

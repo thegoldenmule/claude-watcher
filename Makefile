@@ -1,6 +1,6 @@
 APP := build/ClaudeWatcher.app
 
-.PHONY: build app run test clean release icon
+.PHONY: build app run test clean release icon dmg
 
 build:
 	swift build
@@ -28,7 +28,12 @@ clean:
 	swift package clean
 	rm -rf build .build
 
-# Notarized universal app (zip) -> GitHub release. See "Releasing" in README.md.
+# Preview the release disk image with the dev app (Apple Development-signed, so not for
+# distribution). Releases build theirs from the notarized app in scripts/release.sh.
+dmg: app
+	./scripts/build-dmg.sh $(APP) build/ClaudeWatcher.dmg
+
+# Notarized universal app (DMG + zip) -> GitHub release. See "Releasing" in README.md.
 #   make release VERSION=1.2.3 [DRY_RUN=1 [NOTARIZE=1]] [TEAM_ID=...]
 release:
 	@VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" NOTARIZE="$(NOTARIZE)" TEAM_ID="$(TEAM_ID)" scripts/release.sh

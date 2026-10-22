@@ -36,24 +36,31 @@ public actor SessionDiscovery {
 
     /// Claude Code's config directory, resolved once and cached (see `ClaudeHome`).
     /// The first call may spawn `launchctl` and a login shell (bounded at ~2 s each, ~0.1 s
-    /// typically); call `prewarmDefaultClaudeHome()` early to do that off the main thread.
+    /// typically) and blocks until done: never touch it on main at launch, nor from a
+    /// Swift-concurrency task before it's resolved (await `resolvedClaudeHome()` instead).
     public static var defaultClaudeHome: URL { ClaudeHome.resolved }
 
     /// Starts resolving `defaultClaudeHome` on a background queue. Idempotent.
     public static func prewarmDefaultClaudeHome() {
-        DispatchQueue.global(qos: .userInitiated).async { _ = ClaudeHome.resolved }
+        ClaudeHome.prewarm()
+    }
+
+    /// `defaultClaudeHome`, resolved on the prewarm queue: the caller suspends instead of
+    /// blocking a cooperative thread while the one-time resolution runs.
+    public static func resolvedClaudeHome() async -> URL {
+        await ClaudeHome.resolvedAsync()
     }
 
     /// Pure resolution of Claude Code's config directory: the first non-empty of `env`'s
     /// `CLAUDE_CONFIG_DIR`, `launchctlValue`, `shellValue`, with a leading `~` expanded against
-    /// `home`; `home/.claude` if none is set or the chosen directory doesn't exist. The later
-    /// sources are autoclosures so they're only evaluated when the earlier ones are empty.
+    /// `home`. The value is used as-is even if the directory doesn't exist yet (watchers cope
+    /// with a missing directory); `home/.claude` only if none is set or the value is relative.
+    /// The later sources are autoclosures so they're only evaluated when the earlier ones are empty.
     public static func resolveClaudeHome(
         env: [String: String],
         launchctlValue: @autoclosure () -> String?,
         shellValue: @autoclosure () -> String?,
-        home: String,
-        fileExists: (String) -> Bool
+        home: String
     ) -> URL {
         let fallback = URL(fileURLWithPath: home, isDirectory: true)
             .appendingPathComponent(".claude", isDirectory: true)
@@ -69,7 +76,7 @@ public actor SessionDiscovery {
         } else if path.hasPrefix("~/") {
             path = (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
         }
-        guard path.hasPrefix("/"), fileExists(path) else { return fallback }
+        guard path.hasPrefix("/") else { return fallback }
         return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
     }
 

@@ -9,15 +9,26 @@ enum ClaudeHome {
     static let probeTimeout: TimeInterval = 2
 
     /// Resolved once, lazily (Swift globals/statics initialize exactly once, thread-safely).
+    /// Touching it may block for seconds; async code awaits `resolvedAsync()` instead.
     static let resolved: URL = SessionDiscovery.resolveClaudeHome(
         env: ProcessInfo.processInfo.environment,
         launchctlValue: launchctlValue(),
         shellValue: shellValue(),
-        home: FileManager.default.homeDirectoryForCurrentUser.path,
-        fileExists: { path in
-            var isDir: ObjCBool = false
-            return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
-        })
+        home: FileManager.default.homeDirectoryForCurrentUser.path)
+
+    /// Serial queue that resolves `resolved` (prewarm) and hands it to async waiters, so a
+    /// waiter never blocks a Swift-concurrency thread inside the one-time initializer.
+    static let queue = DispatchQueue(label: "com.thegoldenmule.ClaudeWatcher.ClaudeHome", qos: .userInitiated)
+
+    static func prewarm() {
+        queue.async { _ = resolved }
+    }
+
+    static func resolvedAsync() async -> URL {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: resolved) }
+        }
+    }
 
     static func launchctlValue() -> String? {
         run("/bin/launchctl", ["getenv", variable])?.trimmingCharacters(in: .newlines)
@@ -32,7 +43,14 @@ enum ClaudeHome {
         var shell = ProcessInfo.processInfo.environment["SHELL"] ?? ""
         if !shell.hasPrefix("/") || !FileManager.default.isExecutableFile(atPath: shell) { shell = "/bin/zsh" }
         let command = "printf '\\n%s%s\\n' '\(marker)' \"$\(variable)\""
-        return run(shell, ["-lic", command]).flatMap(markedValue)
+        return run(shell, ["-lic", command], acceptOnTimeout: hasMarkedLine).flatMap(markedValue)
+    }
+
+    /// Whether `output` already holds a complete (newline-terminated) marker line, so it can be
+    /// used even if the shell (say, a logout file) is still running when the probe times out.
+    static func hasMarkedLine(_ output: String) -> Bool {
+        guard let range = output.range(of: marker, options: .backwards) else { return false }
+        return output[range.upperBound...].contains { $0 == "\n" || $0 == "\r" }
     }
 
     /// The rest of the line after the last `marker` in `output`, or nil if there is none.
@@ -43,8 +61,14 @@ enum ClaudeHome {
 
     /// Runs `path args…` in a new session (no controlling terminal, so an interactive shell
     /// can't grab or stop on the user's tty), stdin and stderr on /dev/null, and returns its
-    /// stdout. Kills the whole process group and returns nil after `timeout`.
-    static func run(_ path: String, _ args: [String], timeout: TimeInterval = probeTimeout) -> String? {
+    /// stdout. Reading stops at EOF, or once `path` has exited and the pipe is drained (a job it
+    /// backgrounded may hold stdout open indefinitely). The process group is killed if anything
+    /// is left running. After `timeout` returns nil, unless `acceptOnTimeout` accepts the output
+    /// read so far.
+    static func run(
+        _ path: String, _ args: [String], timeout: TimeInterval = probeTimeout,
+        acceptOnTimeout: (String) -> Bool = { _ in false }
+    ) -> String? {
         var pipe: [Int32] = [-1, -1]
         guard Darwin.pipe(&pipe) == 0 else { return nil }
         let (readFD, writeFD) = (pipe[0], pipe[1])
@@ -73,37 +97,63 @@ enum ClaudeHome {
         guard spawned == 0 else { return nil }
 
         var output = Data()
-        var timedOut = false
+        var status: Int32 = 0
         let deadline = Date().addingTimeInterval(timeout)
         var buffer = [UInt8](repeating: 0, count: 4096)
+
+        enum ReadResult { case data, idle, eof, failed }
+        /// One poll (up to `waitMs`) and, if readable, one read into `output`.
+        func readAvailable(waitMs: Int32) -> ReadResult {
+            var pfd = pollfd(fd: readFD, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pfd, 1, waitMs)
+            if ready < 0 { return errno == EINTR ? .idle : .failed }
+            if ready == 0 { return .idle }
+            let n = read(readFD, &buffer, buffer.count)
+            if n < 0 { return errno == EINTR || errno == EAGAIN ? .idle : .failed }
+            if n == 0 { return .eof }  // every writer (the shell and its jobs) is done
+            output.append(contentsOf: buffer[0..<n])
+            return output.count > 1 << 20 ? .failed : .data  // runaway rc output
+        }
+        func reap() -> Bool {
+            let r = waitpid(pid, &status, WNOHANG)
+            return r == pid || (r < 0 && errno != EINTR)
+        }
+
+        var last = ReadResult.idle
+        var exited = false, timedOut = false
         while true {
+            if reap() {
+                // The shell is gone, but a job it backgrounded may keep stdout open: take what
+                // is already in the pipe and stop rather than wait for EOF.
+                exited = true
+                let drainUntil = Date().addingTimeInterval(0.05)
+                repeat { last = readAvailable(waitMs: 0) } while last == .data && Date() < drainUntil
+                break
+            }
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { timedOut = true; break }
-            var pfd = pollfd(fd: readFD, events: Int16(POLLIN), revents: 0)
-            let ready = poll(&pfd, 1, Int32(min(remaining * 1000, 1000).rounded(.up)))
-            if ready < 0 { if errno == EINTR { continue }; timedOut = true; break }
-            if ready == 0 { continue }
-            let n = read(readFD, &buffer, buffer.count)
-            if n < 0 { if errno == EINTR { continue }; break }
-            if n == 0 { break }  // EOF: every writer (the shell and anything it forked) is done
-            output.append(contentsOf: buffer[0..<n])
-            if output.count > 1 << 20 { timedOut = true; break }  // runaway rc output
+            // Short waits, so the shell's exit is noticed promptly while a job holds stdout.
+            last = readAvailable(waitMs: Int32(min(remaining * 1000, 20).rounded(.up)))
+            if last == .eof || last == .failed { break }
         }
-        // Stdout closed; give the shell until the deadline to exit (e.g. running a logout file).
-        var status: Int32 = 0
-        var reaped = false
-        while !timedOut {
-            let r = waitpid(pid, &status, WNOHANG)
-            if r == pid || (r < 0 && errno != EINTR) { reaped = true; break }
-            if deadline.timeIntervalSinceNow <= 0 { break }
+        let eof = last == .eof, failed = last == .failed
+        // EOF: give the shell until the deadline to exit (e.g. running a logout file).
+        while eof, !exited {
+            if reap() { exited = true; break }
+            if deadline.timeIntervalSinceNow <= 0 { timedOut = true; break }
             usleep(5_000)
         }
-        if !reaped {
+        if !exited {
             kill(-pid, SIGKILL)
             kill(pid, SIGKILL)
             while waitpid(pid, &status, 0) < 0, errno == EINTR {}
+        } else if !eof {
+            // Background jobs still hold stdout; don't leave them running.
+            kill(-pid, SIGKILL)
         }
-        guard !timedOut else { return nil }
-        return String(decoding: output, as: UTF8.self)
+        guard !failed else { return nil }
+        let text = String(decoding: output, as: UTF8.self)
+        if timedOut, !acceptOnTimeout(text) { return nil }
+        return text
     }
 }

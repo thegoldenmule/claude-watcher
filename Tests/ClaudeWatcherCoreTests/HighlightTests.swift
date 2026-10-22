@@ -135,26 +135,32 @@ private struct Fixture {
     let dir: URL
     let recorder = Recorder()
     let highlighter: TerminalHighlighter
-    var recoveryFile: URL { dir.appendingPathComponent("tinted-ttys") }
+    let recoveryFile: URL
     var lockDir: URL { dir.appendingPathComponent("hook-state", isDirectory: true) }
 
-    /// `ghosttyTTYs`: ttys with a live Ghostty-hosted process (nil: all of them).
+    /// `ghosttyTTYs`: ttys with a live Ghostty-hosted process (nil: all of them);
+    /// `unknownTTYs`: ttys whose processes can't be listed.
     init(hoverCap: Duration = .seconds(30), pulseDuration: Duration = .milliseconds(60),
          tmuxPIDs: Set<Int32> = [], controlling: Bool = true, ttyDevices: Bool = true,
-         ghosttyTTYs: Set<String>? = nil)
+         ghosttyTTYs: Set<String>? = nil, unknownTTYs: Set<String> = [],
+         recoveryFileName: String = "tinted-ttys")
     {
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("cw-hl-\(UUID().uuidString)")
         try! FileManager.default.createDirectory(at: dir.appendingPathComponent("hook-state"),
                                                  withIntermediateDirectories: true)
+        recoveryFile = dir.appendingPathComponent(recoveryFileName)
         let recorder = self.recorder
         let io = TerminalHighlighterIO(
             write: { recorder.write($0, $1) },
             isControllingTTY: { _, _ in controlling },
             isInsideTmux: { tmuxPIDs.contains($0) },
-            isTTYDevice: { _ in ttyDevices },
-            hasGhosttyProcess: { ghosttyTTYs?.contains($0) ?? true })
+            recoveryState: { tty in
+                if !ttyDevices { return .notGhostty }
+                if unknownTTYs.contains(tty) { return .unknown }
+                return ghosttyTTYs?.contains(tty) ?? true ? .ghostty : .notGhostty
+            })
         highlighter = TerminalHighlighter(
-            recoveryFile: dir.appendingPathComponent("tinted-ttys"),
+            recoveryFile: recoveryFile,
             lockDirectory: dir.appendingPathComponent("hook-state", isDirectory: true),
             io: io, timing: TerminalHighlighterTiming(hoverCap: hoverCap, pulseDuration: pulseDuration))
     }
@@ -549,6 +555,57 @@ private let blue = GhosttyColor(0x202040)
     #expect(!f.recoveryFileExists)
 }
 
+@Test func resetAllKeepsTTYsWhoseProcessesAreUnknown() async throws {
+    let f = Fixture(ghosttyTTYs: ["/dev/ttys902"], unknownTTYs: ["/dev/ttys901"])
+    defer { f.cleanup() }
+    try "/dev/ttys901\n/dev/ttys902\n/dev/ttys903\n".write(to: f.recoveryFile, atomically: true, encoding: .utf8)
+    f.highlighter.resetAll()
+    try await f.idle()
+    #expect(f.recorder.ops == [.reset("/dev/ttys902")])
+    #expect(f.recorded == ["/dev/ttys901"])
+}
+
+@Test func undecodableRecoveryFileIsRewritten() async throws {
+    // Invalid UTF-8 around a valid line: the line is still reset, and the file cleaned up.
+    let f = Fixture()
+    defer { f.cleanup() }
+    try Data([0xFF, 0xFE, 0x0A] + Array("/dev/ttys901\n".utf8) + [0xC3]).write(to: f.recoveryFile)
+    f.highlighter.resetAll()
+    try await f.idle()
+    #expect(f.recorder.ops == [.reset("/dev/ttys901")])
+    #expect(!f.recoveryFileExists)
+
+    // Only invalid bytes: nothing to reset, the file is still removed.
+    let g = Fixture()
+    defer { g.cleanup() }
+    try Data([0xFF, 0xFE, 0xFD]).write(to: g.recoveryFile)
+    g.highlighter.resetAll()
+    try await g.idle()
+    #expect(g.recorder.ops.isEmpty)
+    #expect(!g.recoveryFileExists)
+}
+
+@Test func deletedRecoveryDirectoryIsRecreated() async throws {
+    let f = Fixture(recoveryFileName: "support/tinted-ttys")
+    defer { f.cleanup() }
+    let support = f.recoveryFile.deletingLastPathComponent()
+    f.highlighter.beginHover(session(1), tint: red)
+    try await f.idle()
+    #expect(f.recorded == ["/dev/ttys91"])
+    f.highlighter.endHover()
+    try await f.idle()
+    try FileManager.default.removeItem(at: support)
+    // This save fails (the directory is gone); the next one recreates it.
+    f.highlighter.beginHover(session(2), tint: red)
+    try await f.idle()
+    f.highlighter.beginHover(session(3), tint: red)
+    try await f.idle()
+    #expect(f.recorded == ["/dev/ttys93"])
+    f.highlighter.endHover()
+    try await f.idle()
+    #expect(!f.recoveryFileExists)
+}
+
 @Test func resetAllWithNothingRecordedTouchesNoFiles() async throws {
     let f = Fixture()
     defer { f.cleanup() }
@@ -585,21 +642,16 @@ private let blue = GhosttyColor(0x202040)
 }
 
 @Test func ttyDeviceCheck() {
-    #expect(!TerminalHighlighter.isTTYDevice("/dev/null"))
-    #expect(!TerminalHighlighter.isTTYDevice("/dev/ttys99999999"))
-    #expect(!TerminalHighlighter.isTTYDevice("/tmp/ttys1"))
-    #expect(!TerminalHighlighter.hasGhosttyProcess(onTTY: "/dev/null"))
-    #expect(!TerminalHighlighter.hasGhosttyProcess(onTTY: "/dev/ttys99999999"))
-    #expect(TerminalHighlighter.isGhosttyExecutable("/Applications/Ghostty.app/Contents/MacOS/ghostty"))
-    #expect(!TerminalHighlighter.isGhosttyExecutable("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"))
-    #expect(!TerminalHighlighter.isGhosttyExecutable(nil))
+    #expect(TerminalHighlighter.recoveryState(ofTTY: "/dev/null") == .notGhostty)
+    #expect(TerminalHighlighter.recoveryState(ofTTY: "/dev/ttys99999999") == .notGhostty)
+    #expect(TerminalHighlighter.recoveryState(ofTTY: "/tmp/ttys1") == .notGhostty)
 }
 
 @Test func controllingTTYScanFindsTheTTYsProcesses() throws {
     // Our own tty, when the test run has one (not in CI): this process or an ancestor is on it.
     var st = stat()
     guard fstat(STDIN_FILENO, &st) == 0, isatty(STDIN_FILENO) == 1 else { return }
-    let pids = TerminalHighlighter.pids(withControllingTTY: st.st_rdev)
+    let pids = try #require(TerminalHighlighter.pids(withControllingTTY: st.st_rdev))
     let mine = Set([getpid()] + ProcessTree.ancestors(of: getpid()))
     #expect(!Set(pids).isDisjoint(with: mine))
 }

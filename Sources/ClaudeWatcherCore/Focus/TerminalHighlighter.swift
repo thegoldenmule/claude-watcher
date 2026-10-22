@@ -27,8 +27,9 @@ import os
 /// so `resetAll()` (at launch, panel hide, terminate) can clear a tint left behind by a crash.
 /// A recovery reset only goes to a recorded tty that is still a `/dev/ttysN` char device with a
 /// live process on it (controlling tty) descended from Ghostty: after a crash the tty number may
-/// have been reused by an unrelated terminal. Other entries are dropped without a write; a
-/// reset that didn't fully go out keeps its entry for the next `resetAll()`.
+/// have been reused by an unrelated terminal. Other entries are dropped without a write; one
+/// whose processes couldn't be listed, or whose reset didn't fully go out, keeps its entry for
+/// the next `resetAll()`.
 public final class TerminalHighlighter: @unchecked Sendable {
     public static let shared = TerminalHighlighter()
 
@@ -256,9 +257,14 @@ public final class TerminalHighlighter: @unchecked Sendable {
         let before = loadRecorded()
         var keep = Set<String>()
         for tty in before.sorted() {
-            // Gone, or no live Ghostty-hosted process on it (maybe a reused tty number): drop.
-            guard io.isTTYDevice(tty), io.hasGhosttyProcess(tty) else { continue }
-            if !sendReset(tty) { keep.insert(tty) }  // retried by the next resetAll
+            switch io.recoveryState(tty) {
+            case .ghostty:
+                if !sendReset(tty) { keep.insert(tty) }  // retried by the next resetAll
+            case .unknown:
+                keep.insert(tty)  // couldn't list its processes: try again next time
+            case .notGhostty:
+                break  // gone, or no live Ghostty-hosted process (maybe a reused tty number): drop
+            }
         }
         setRecorded(keep)
         // The request was cleared when resetAll was called, so a hover wanted now came later
@@ -325,36 +331,30 @@ public final class TerminalHighlighter: @unchecked Sendable {
         return age < timing.probeLockFreshFor
     }
 
-    /// A `/dev/ttysN` path that exists and is a character device.
-    static func isTTYDevice(_ path: String) -> Bool {
-        guard OSC7Probe.isWritableTTYPath(path) else { return false }
-        var st = stat()
-        return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFCHR
-    }
-
-    /// Gate for a recovery reset: some live process has `path` as its controlling tty and a
-    /// Ghostty ancestor (the tint-time checks, minus the session we no longer know). A tty whose
-    /// number was reused by another terminal, or a pane whose processes all exited, fails.
-    static func hasGhosttyProcess(onTTY path: String) -> Bool {
+    /// Gate for a recovery reset, with a single `stat`: `path` is a `/dev/ttysN` char device and
+    /// some live process has it as its controlling tty with a Ghostty ancestor (the tint-time
+    /// checks, minus the session we no longer know). A tty whose number was reused by another
+    /// terminal, or a pane whose processes all exited, is `.notGhostty`; `.unknown` if the
+    /// processes on it couldn't be listed.
+    static func recoveryState(ofTTY path: String) -> RecoveryTTYState {
         var st = stat()
         guard OSC7Probe.isWritableTTYPath(path), stat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFCHR
-        else { return false }
-        return pids(withControllingTTY: st.st_rdev).contains { pid in
-            ProcessTree.ancestors(of: pid).contains { isGhosttyExecutable(SystemProcessInspector.path(pid: $0)) }
+        else { return .notGhostty }
+        guard let pids = pids(withControllingTTY: st.st_rdev) else { return .unknown }
+        let ghostty = pids.contains { pid in
+            let paths = ProcessTree.ancestors(of: pid).compactMap { SystemProcessInspector.path(pid: $0) }
+            return ProcessRules.terminalKind(ancestorPaths: paths) == .ghostty
         }
+        return ghostty ? .ghostty : .notGhostty
     }
 
-    /// Same rule as `ProcessRules.terminalKind`.
-    static func isGhosttyExecutable(_ path: String?) -> Bool {
-        path?.contains("/Ghostty.app/") ?? false
-    }
-
-    /// Pids whose controlling tty is device `dev` (`sysctl KERN_PROC_TTY`).
-    static func pids(withControllingTTY dev: dev_t) -> [Int32] {
+    /// Pids whose controlling tty is device `dev` (`sysctl KERN_PROC_TTY`); nil if the sysctl
+    /// failed (unknown, not "none").
+    static func pids(withControllingTTY dev: dev_t) -> [Int32]? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_TTY, dev]
         for _ in 0..<3 {  // the table can grow between the size query and the read
             var size = 0
-            guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 else { return [] }
+            guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 else { return nil }
             guard size > 0 else { return [] }
             let stride = MemoryLayout<kinfo_proc>.stride
             var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + 8)
@@ -363,20 +363,21 @@ public final class TerminalHighlighter: @unchecked Sendable {
             if rc == 0 {
                 return procs.prefix(size / stride).map(\.kp_proc.p_pid).filter { $0 > 0 }
             }
-            guard errno == ENOMEM else { return [] }
+            guard errno == ENOMEM else { return nil }
         }
-        return []
+        return nil
     }
 
     // MARK: - Recovery file
 
     private func loadRecorded() -> Set<String> {
         if let recorded { return recorded }
-        let text = (try? String(contentsOf: recoveryFile, encoding: .utf8)) ?? ""
-        let loaded = Self.parseRecoveryFile(text)
+        // Lossy decode: a file that isn't valid UTF-8 keeps its readable lines and is rewritten.
+        let data = try? Data(contentsOf: recoveryFile)
+        let loaded = Self.parseRecoveryFile(data.map { String(decoding: $0, as: UTF8.self) } ?? "")
         recorded = loaded
-        // Junk lines (or a non-canonical layout) get cleaned up by the next save.
-        recoveryFileDirty = text != Self.formatRecoveryFile(loaded)
+        // Junk lines, invalid bytes or a non-canonical layout get cleaned up by the next save.
+        recoveryFileDirty = data.map { $0 != Data(Self.formatRecoveryFile(loaded).utf8) } ?? false
         return loaded
     }
 
@@ -420,6 +421,7 @@ public final class TerminalHighlighter: @unchecked Sendable {
             try Data(Self.formatRecoveryFile(set).utf8).write(to: recoveryFile, options: .atomic)
             return true
         } catch {
+            recoveryDirectoryCreated = false  // it may have been deleted: recreate it next time
             Self.logger.error("highlight: couldn't write recovery file: \(error.localizedDescription, privacy: .public)")
             return false
         }
@@ -448,10 +450,19 @@ struct TerminalHighlighterIO: Sendable {
     var write: @Sendable (_ bytes: [UInt8], _ tty: String) -> Int = { OSC7Probe.write($0, toTTY: $1) }
     var isControllingTTY: @Sendable (_ tty: String, _ pid: Int32) -> Bool = { OSC7Probe.isControllingTTY($0, ofPID: $1) }
     var isInsideTmux: @Sendable (_ pid: Int32) -> Bool = { ProcessTree.isInsideTmux($0) }
-    /// Gate for `resetAll` (the session may be gone): the path is a `/dev/ttysN` char device.
-    var isTTYDevice: @Sendable (_ path: String) -> Bool = { TerminalHighlighter.isTTYDevice($0) }
-    /// Second `resetAll` gate: a live process on that tty descends from Ghostty.
-    var hasGhosttyProcess: @Sendable (_ path: String) -> Bool = { TerminalHighlighter.hasGhosttyProcess(onTTY: $0) }
+    /// Gate for `resetAll` (the session may be gone): is the path a `/dev/ttysN` char device
+    /// with a live Ghostty-hosted process on it.
+    var recoveryState: @Sendable (_ path: String) -> RecoveryTTYState = { TerminalHighlighter.recoveryState(ofTTY: $0) }
+}
+
+/// Whether `resetAll` may send a recovery reset to a recorded tty.
+enum RecoveryTTYState: Sendable, Equatable {
+    /// A `/dev/ttysN` char device with a live Ghostty-hosted process on it: reset it.
+    case ghostty
+    /// Gone, not a tty device, or no live Ghostty-hosted process on it: drop the entry.
+    case notGhostty
+    /// The processes on it couldn't be listed: keep the entry for the next try.
+    case unknown
 }
 
 struct TerminalHighlighterTiming: Sendable {

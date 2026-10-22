@@ -97,8 +97,9 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   package (argv read via `KERN_PROCARGS2`, only for `node`): argv[0] `claude` (`process.title`),
   any argument literally naming `@anthropic-ai/claude-code` (`node …/cli.js`), or the script
   (`ProcessRules.nodeScript`: skip leading `-` options; at `--`, the next argument) with basename
-  `claude` (npm's `bin/claude` symlink) or, if absolute, a realpath into that package. The hook's
-  `is_claude_process` (used by `find_claude` and GC) applies the same rule; keep both in sync.
+  `claude` (npm's `bin/claude` symlink) or, if absolute, a realpath into that package (a relative
+  script is never resolved: it's relative to node's cwd). The hook's `is_claude_process` (used by
+  `find_claude` and GC) applies the same rule, realpath only for absolute scripts; keep both in sync.
 - Hook state dir `~/Library/Application Support/ClaudeWatcher/hook-state/` (layout documented at
   the top of `hooks/claude-watcher-hook.sh`; keep both sides in sync):
   - `<sid>.json`: replaced wholesale (temp + rename) by every event, no lock, no Ghostty id.
@@ -146,15 +147,22 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   A tint is skipped (never waits) while `.probe-<tty>.lock` exists with an mtime under 10 s, so it
   can't race a probe's restore. Stuck-tint recovery: a tty is added to
   `~/Library/Application Support/ClaudeWatcher/tinted-ttys` (atomic write) before a tint and
-  removed once its reset fully went out; `resetAll()` (launch, panel hide; `resetAllSync` at
-  terminate) sends OSC 111 only to recorded paths that are still a `/dev/ttysN` char device
-  **and** that some live process has as its controlling tty (`KERN_PROC_TTY`) with a Ghostty
-  ancestor. Other entries are dropped silently (tty numbers get reused); entries whose reset
-  didn't fully go out stay recorded for the next try. The file is rewritten only when its
+  removed once its reset fully went out; a failed tint write keeps an already-recorded tty, and a
+  failed recolor keeps tracking the pane's old tint, so it's still reset later. `resetAll()`
+  (launch, panel hide; `resetAllSync` at terminate) sends OSC 111 only to recorded paths that are
+  still a `/dev/ttysN` char device **and** that some live process has as its controlling tty
+  (`KERN_PROC_TTY`) with a Ghostty ancestor (`ProcessRules.terminalKind`). Only entries failing
+  that (not a tty device, or no Ghostty-hosted process) are dropped silently (tty numbers get
+  reused); entries whose processes can't be listed (sysctl failure, `.unknown`) or whose reset
+  didn't fully go out stay recorded for the next `resetAll`. The file is rewritten only when its
   contents change (removed when empty).
 - Highlight UI (`EdgeController`; the highlighter is nil in demo mode, and demo mode hides the
-  highlight toggles): a focus result only ends its own row's hover tint. The dwell is re-armed
-  for a still-hovered row (`reportedHoverID`) on show and when the hover pref is turned on.
+  highlight toggles): a focus result only ends its own row's hover tint. On show, after a click
+  when the panel stays up, and when the hover pref is turned back on, the dwell is re-armed for
+  the row hit-tested under the pointer (rows don't re-report a pointer that never left them):
+  `SidebarView` reports laid-out row frames (a PreferenceKey) and the list viewport in a named
+  pane coordinate space, and the pointer is converted via `targetFrame`. The keep-alive drops
+  the tint once the pointer is no longer over that row.
 - Ghostty AppleScript `focus <terminal>` switches Spaces to the target window (verified).
 - Terminal.app: `activate` first, then `set index of w to 1` and `set frontmost of w to true`.
   Raising before `activate` never switches Spaces.

@@ -565,17 +565,13 @@ import Testing
         #expect(box.status(source: box.source) == .installed)
     }
 
-    @Test func noOpStubRunsAndExitsZero() throws {
+    @Test func noOpStubRunsAndExitsZero() async throws {
         let box = try Sandbox(settings: Self.fixture)
         defer { box.cleanup() }
         _ = try box.install()
         _ = try box.uninstall()
-        let process = Process()
-        process.executableURL = HookInstaller.installedScriptURL(installDirectory: box.installDir)
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        #expect(process.terminationStatus == 0)
+        let result = try await runProcess(HookInstaller.installedScriptURL(installDirectory: box.installDir))
+        #expect(result.status == 0)
     }
 
     // MARK: Lost-update protection

@@ -166,6 +166,155 @@ import Testing
         }
     }
 
+    /// `hooks` holding only our (current) entries, followed by other root keys: a reinstall
+    /// must not remove and re-append them (which would move `hooks` after `model`).
+    @Test func reinstallOverOnlyOurEntriesChangesNothing() throws {
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        let command = HookInstaller.hookCommand(
+            scriptPath: HookInstaller.installedScriptURL(installDirectory: box.installDir).path)
+        let hooks = OrderedJSON.object(HookInstaller.events.map {
+            ($0, .array([HookInstaller.desiredGroup(event: $0, command: command)]))
+        })
+        let original = OrderedJSON.object([("hooks", hooks), ("model", .string("opus"))]).serialized() + "\n"
+        try Data(original.utf8).write(to: box.settings)
+
+        #expect(try HookInstaller.transformedSettings(Data(original.utf8)) {
+            try HookInstaller.mergeEntries(into: &$0, command: command)
+        } == nil)
+        #expect(try box.install() == nil) // no write, no backup
+        #expect(try box.read() == original)
+        #expect(try box.backups().isEmpty)
+        #expect(box.status(source: box.source) == .installed)
+
+        // Uninstall still prunes the containers that held only ours.
+        #expect(try box.uninstall() != nil)
+        #expect(try box.read() == "{\n  \"model\": \"opus\"\n}\n")
+    }
+
+    /// Outdated handlers of ours are rewritten where they are: same event key, same group
+    /// (matcher kept), same position among foreign handlers; duplicates are dropped, a handler
+    /// stuck in a group with a restricting matcher is moved out, missing events are appended.
+    @Test func outdatedEntriesAreUpdatedInPlace() throws {
+        let box = try Sandbox(settings: nil)
+        defer { box.cleanup() }
+        let old = "'/old/place/claude-watcher-hook.sh'"
+        let original = """
+        {
+          "hooks": {
+            "Stop": [
+              {
+                "matcher": "",
+                "hooks": [
+                  {
+                    "type": "command",
+                    "command": "before.sh"
+                  },
+                  {
+                    "type": "command",
+                    "command": "\(old)",
+                    "timeout": 5
+                  },
+                  {
+                    "type": "command",
+                    "command": "after.sh"
+                  }
+                ]
+              },
+              {
+                "hooks": [
+                  {
+                    "type": "command",
+                    "command": "\(old)"
+                  }
+                ]
+              }
+            ],
+            "Notification": [
+              {
+                "matcher": "idle_prompt",
+                "hooks": [
+                  {
+                    "type": "command",
+                    "command": "\(old)"
+                  },
+                  {
+                    "type": "command",
+                    "command": "notifier.sh"
+                  }
+                ]
+              }
+            ],
+            "SessionEnd": [
+              {
+                "hooks": [
+                  {
+                    "type": "command",
+                    "command": "\(old)",
+                    "async": true
+                  }
+                ]
+              }
+            ],
+            "PreCompact": [
+              {
+                "hooks": [
+                  {
+                    "type": "command",
+                    "command": "\(old)"
+                  }
+                ]
+              }
+            ]
+          },
+          "model": "opus"
+        }
+
+        """
+        try Data(original.utf8).write(to: box.settings)
+        #expect(box.status() == .outdated)
+        #expect(try box.install() != nil)
+        #expect(box.status(source: box.source) == .installed)
+
+        let command = HookInstaller.hookCommand(
+            scriptPath: HookInstaller.installedScriptURL(installDirectory: box.installDir).path)
+        let root = try OrderedJSON.parse(Data(contentsOf: box.settings))
+        guard case let .object(rootPairs) = root, case let .object(eventPairs)? = root["hooks"] else {
+            Issue.record("not an object"); return
+        }
+        #expect(rootPairs.map(\.0) == ["hooks", "model"])
+        // Existing events keep their order; the stray PreCompact entry is gone; missing events appended.
+        #expect(eventPairs.map(\.0) == ["Stop", "Notification", "SessionEnd", "SessionStart", "UserPromptSubmit"])
+
+        let desiredStop = HookInstaller.desiredHandler(event: "Stop", command: command)
+        #expect(root["hooks"]?["Stop"] == .array([
+            .object([("matcher", .string("")), ("hooks", .array([
+                .object([("type", .string("command")), ("command", .string("before.sh"))]),
+                desiredStop,
+                .object([("type", .string("command")), ("command", .string("after.sh"))]),
+            ]))]),
+        ]))
+        #expect(root["hooks"]?["Notification"] == .array([
+            .object([("matcher", .string("idle_prompt")), ("hooks", .array([
+                .object([("type", .string("command")), ("command", .string("notifier.sh"))]),
+            ]))]),
+            HookInstaller.desiredGroup(event: "Notification", command: command),
+        ]))
+        #expect(root["hooks"]?["SessionEnd"] == .array([HookInstaller.desiredGroup(event: "SessionEnd", command: command)]))
+
+        // Now current: a second install changes nothing.
+        let after = try box.read()
+        #expect(try box.install() == nil)
+        #expect(try box.read() == after)
+    }
+
+    @Test func defaultSettingsURLFollowsClaudeHome() {
+        #expect(HookInstaller.defaultSettingsURL
+            == SessionDiscovery.defaultClaudeHome.appendingPathComponent("settings.json"))
+        let custom = URL(fileURLWithPath: "/tmp/custom-claude", isDirectory: true)
+        #expect(HookInstaller.settingsURL(claudeHome: custom).path == "/tmp/custom-claude/settings.json")
+    }
+
     @Test func uninstallRemovesOnlyOursAndRestoresOriginal() throws {
         let box = try Sandbox(settings: Self.fixture)
         defer { box.cleanup() }

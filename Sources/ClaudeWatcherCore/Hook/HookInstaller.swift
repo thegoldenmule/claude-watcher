@@ -3,7 +3,7 @@ import Foundation
 /// Installs / uninstalls the ClaudeWatcher hook in Claude Code's user settings.
 ///
 /// Install copies the hook script to `~/Library/Application Support/ClaudeWatcher/` and merges
-/// one matcher group per event into `~/.claude/settings.json` `hooks`. Our entries are
+/// one matcher group per event into Claude Code's `settings.json` `hooks` (see `defaultSettingsURL`). Our entries are
 /// identified by their command containing `/claude-watcher-hook.sh`; everything else in the
 /// file is preserved (key order, other hooks, other settings). The settings file is edited
 /// with an order-preserving JSON model and printed in `JSON.stringify(_, null, 2)` style, so
@@ -52,11 +52,14 @@ public enum HookInstaller {
     public static let events = ["SessionStart", "UserPromptSubmit", "Stop", "Notification", "SessionEnd"]
     static let synchronousEvents: Set<String> = ["SessionEnd"]
 
-    /// `~/.claude/settings.json`
+    /// `settings.json` in Claude Code's config directory: `$CLAUDE_CONFIG_DIR` when set, else
+    /// `~/.claude` (the same directory session discovery reads).
     public static var defaultSettingsURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude", isDirectory: true)
-            .appendingPathComponent("settings.json")
+        settingsURL(claudeHome: SessionDiscovery.defaultClaudeHome)
+    }
+
+    static func settingsURL(claudeHome: URL) -> URL {
+        claudeHome.appendingPathComponent("settings.json")
     }
 
     /// `~/Library/Application Support/ClaudeWatcher`
@@ -170,20 +173,46 @@ public enum HookInstaller {
         .object([("hooks", .array([desiredHandler(event: event, command: command)]))])
     }
 
+    /// Brings our entries up to date with minimal edits: for each registered event, the first
+    /// handler of ours in a match-all group is replaced in place (its group, the event key and
+    /// `hooks` keep their positions) and any further handlers of ours are removed; a group is
+    /// appended only for an event that has no such handler. Stray handlers of ours under events
+    /// we no longer register are removed. Settings that already hold exactly our entries are
+    /// left equal, so `transformedSettings` reports no change and nothing is written.
     static func mergeEntries(into root: inout OrderedJSON, command: String) throws {
-        try removeEntries(from: &root)
         guard case .object = root else { throw InstallError.settingsNotAnObject }
-        var hooks = root["hooks"] ?? .object([])
-        guard case .object = hooks else { throw InstallError.hooksNotAnObject }
+        let hooksValue = root["hooks"] ?? .object([])
+        guard case let .object(eventPairs) = hooksValue else { throw InstallError.hooksNotAnObject }
         for event in events {
-            var groups = hooks[event]?.arrayValue ?? []
-            if let existing = hooks[event], existing.arrayValue == nil { throw InstallError.eventNotAnArray(event) }
-            groups.append(desiredGroup(event: event, command: command))
-            hooks.set(event, .array(groups))
+            if let existing = hooksValue[event], existing.arrayValue == nil { throw InstallError.eventNotAnArray(event) }
         }
-        root.set("hooks", hooks)
+        var newPairs: [(String, OrderedJSON)] = []
+        for (event, value) in eventPairs {
+            guard case let .array(groups) = value else { newPairs.append((event, value)); continue }
+            guard events.contains(event) else {
+                // Stray entries of ours: drop them, and the event key if only ours were there.
+                let kept = rewritingOurs(in: groups, keep: nil)
+                if kept.isEmpty && !groups.isEmpty { continue }
+                newPairs.append((event, .array(kept)))
+                continue
+            }
+            let desired = desiredHandler(event: event, command: command)
+            if let keep = keeperIndex(in: groups) {
+                newPairs.append((event, .array(rewritingOurs(in: groups, keep: (keep, desired)))))
+            } else {
+                var kept = rewritingOurs(in: groups, keep: nil)
+                kept.append(desiredGroup(event: event, command: command))
+                newPairs.append((event, .array(kept)))
+            }
+        }
+        for event in events where !newPairs.contains(where: { $0.0 == event }) {
+            newPairs.append((event, .array([desiredGroup(event: event, command: command)])))
+        }
+        root.set("hooks", .object(newPairs))
     }
 
+    /// Removes only our handlers. Groups, event arrays and the `hooks` object that this leaves
+    /// empty are pruned (only when they held something of ours, never pre-existing empties).
     static func removeEntries(from root: inout OrderedJSON) throws {
         guard case .object = root else { throw InstallError.settingsNotAnObject }
         guard let hooksValue = root["hooks"] else { return }
@@ -192,19 +221,10 @@ public enum HookInstaller {
         var newPairs: [(String, OrderedJSON)] = []
         for (event, value) in eventPairs {
             guard case let .array(groups) = value else { newPairs.append((event, value)); continue }
-            var newGroups: [OrderedJSON] = []
-            for group in groups {
-                guard case let .array(handlers)? = group["hooks"] else { newGroups.append(group); continue }
-                let kept = handlers.filter { !isOurs($0) }
-                if kept.count == handlers.count { newGroups.append(group); continue }
-                changed = true
-                if kept.isEmpty { continue }
-                var g = group
-                g.set("hooks", .array(kept))
-                newGroups.append(g)
-            }
-            if newGroups.isEmpty && !groups.isEmpty { continue } // only ours were there
-            newPairs.append((event, .array(newGroups)))
+            let kept = rewritingOurs(in: groups, keep: nil)
+            if kept != groups { changed = true }
+            if kept.isEmpty && !groups.isEmpty { continue } // only ours were there
+            newPairs.append((event, .array(kept)))
         }
         guard changed else { return }
         if newPairs.isEmpty {
@@ -212,6 +232,53 @@ public enum HookInstaller {
         } else {
             root.set("hooks", .object(newPairs))
         }
+    }
+
+    /// A group our handler may stay in: no matcher, or one that matches everything. A handler of
+    /// ours in a group with a restricting matcher (e.g. a foreign `idle_prompt` group) would not
+    /// fire for every event, so it is moved out into a group of its own instead.
+    static func isMatchAll(_ group: OrderedJSON) -> Bool {
+        switch group["matcher"] {
+        case nil, .string("")?, .string("*")?: true
+        default: false
+        }
+    }
+
+    /// (group, handler) index of the first handler of ours that can be updated in place.
+    static func keeperIndex(in groups: [OrderedJSON]) -> (group: Int, handler: Int)? {
+        for (gi, group) in groups.enumerated() where isMatchAll(group) {
+            if let hi = group["hooks"]?.arrayValue?.firstIndex(where: isOurs) { return (gi, hi) }
+        }
+        return nil
+    }
+
+    /// Returns `groups` with every handler of ours removed, except the one at `keep`, which is
+    /// replaced by its handler value in place. A group left with no handlers by the removal is
+    /// dropped; groups without handlers of ours are returned untouched.
+    static func rewritingOurs(
+        in groups: [OrderedJSON],
+        keep: ((group: Int, handler: Int), OrderedJSON)?
+    ) -> [OrderedJSON] {
+        var result: [OrderedJSON] = []
+        for (gi, group) in groups.enumerated() {
+            guard case let .array(handlers)? = group["hooks"], handlers.contains(where: isOurs) else {
+                result.append(group)
+                continue
+            }
+            var kept: [OrderedJSON] = []
+            for (hi, handler) in handlers.enumerated() {
+                if !isOurs(handler) {
+                    kept.append(handler)
+                } else if let keep, keep.0.group == gi, keep.0.handler == hi {
+                    kept.append(keep.1)
+                }
+            }
+            if kept.isEmpty { continue }
+            var g = group
+            g.set("hooks", .array(kept))
+            result.append(g)
+        }
+        return result
     }
 
     static func entriesStatus(root: OrderedJSON, command: String) -> InstallStatus {

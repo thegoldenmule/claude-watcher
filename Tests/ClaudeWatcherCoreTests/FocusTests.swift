@@ -277,7 +277,8 @@ func focuserFallsThroughStaleAndCaches() async {
 // MARK: - OSC 7 probe (pure parts)
 
 @Test func osc7Nonce() {
-    #expect(OSC7Probe.makeNonce(pid: 42, random: 0xBEEF) == "CW-42-beef")
+    #expect(OSC7Probe.makeNonce(pid: 42, random: 0xBEEF) == "CW-42-000000000000beef")
+    #expect(OSC7Probe.makeNonce(pid: 42, random: .max) == "CW-42-ffffffffffffffff")
     let a = OSC7Probe.makeNonce(pid: 42), b = OSC7Probe.makeNonce(pid: 42)
     #expect(a != b)
     #expect(a.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") })
@@ -304,6 +305,90 @@ func focuserFallsThroughStaleAndCaches() async {
 
 @Test func osc7HostName() {
     #expect(!OSC7Probe.hostName().isEmpty)
+}
+
+// MARK: - Nonce lookup polling
+
+/// A nonce-lookup reply: `id US US wd RS` per terminal.
+private func nonceReply(_ pairs: [(String, String)]) -> String {
+    pairs.map { "\($0.0)\u{1F}\u{1F}\($0.1)\u{1E}" }.joined()
+}
+
+@Test func noGeneratedScriptDelays() {
+    let scripts = [
+        GhosttyScripting.listScript,
+        GhosttyScripting.focusScript(terminalID: "X"),
+        GhosttyScripting.ttyLookupScript(tty: "/dev/ttys001"),
+        GhosttyScripting.nonceLookupScript(nonce: "CW-1-a"),
+        AppleTerminalFocuser.focusScript(tty: "ttys001"),
+    ]
+    for source in scripts {
+        #expect(!source.contains("delay"))
+        #expect(source.contains("with timeout of 3 seconds"))
+    }
+}
+
+@Test func noncePollingRunsShortScriptsUntilFirstUniqueHit() async throws {
+    let nonce = "CW-7-00000000000000ab"
+    let calls = Counter()
+    let fake = FakeRunner { _ in
+        calls.next() < 3 ? .success("") : .success(nonceReply([("T1", "/tmp/\(nonce)")]))
+    }
+    let g = GhosttyScripting(runner: fake)
+    let ids = try await g.terminalIDs(withNonceWorkingDirectory: nonce, interval: .milliseconds(1))
+    #expect(ids == ["T1"])
+    let scripts = fake.lock.withLock { fake.scripts }
+    #expect(scripts.count == 4)  // stopped at the first hit, not all 6 attempts
+    #expect(scripts.allSatisfy { !$0.contains("delay") && !$0.contains(" times") })
+    #expect(scripts.allSatisfy { $0.contains("\"\(nonce)\"") })
+}
+
+@Test func noncePollingStopsImmediatelyOnHitAndGivesUpAfterBudget() async throws {
+    let nonce = "CW-7-00000000000000ab"
+    let hit = FakeRunner { _ in .success(nonceReply([("T1", "/private/tmp/\(nonce)/")])) }
+    #expect(try await GhosttyScripting(runner: hit).terminalIDs(withNonceWorkingDirectory: nonce) == ["T1"])
+    #expect(hit.lock.withLock { hit.scripts.count } == 1)
+
+    let miss = FakeRunner { _ in .success("") }
+    #expect(try await GhosttyScripting(runner: miss).terminalIDs(withNonceWorkingDirectory: nonce,
+                                                                   interval: .milliseconds(1)) == [])
+    #expect(miss.lock.withLock { miss.scripts.count } == 6)  // same budget as the old in-script loop
+
+    let denied = FakeRunner { _ in .failure(.notPermitted(app: "Ghostty")) }
+    await #expect(throws: AppleScriptError.notPermitted(app: "Ghostty")) {
+        _ = try await GhosttyScripting(runner: denied).terminalIDs(withNonceWorkingDirectory: nonce)
+    }
+    #expect(denied.lock.withLock { denied.scripts.count } == 1)
+}
+
+@Test func nonceMatchIsDelimitedAgainstPrefixCollisions() {
+    let nonce = "CW-7-00000000000000ab"
+    // A longer nonce containing ours, a deeper path, and a sibling suffix never match.
+    let out = nonceReply([
+        ("LONGER", "/tmp/\(nonce)0"),
+        ("DEEPER", "/tmp/\(nonce)/sub"),
+        ("SUFFIX", "/tmp/x\(nonce)"),
+        ("EXACT", "/tmp/\(nonce)"),
+        ("URL", "file://host/tmp/\(nonce)"),
+    ])
+    #expect(GhosttyScripting.nonceMatches(out, nonce: nonce) == ["EXACT", "URL"])
+    #expect(GhosttyScripting.nonceMatches(out, nonce: "") == [])
+    #expect(GhosttyScripting.nonceMatches("", nonce: nonce) == [])
+}
+
+@Test func nonceCollisionOnlyIsTreatedAsNoHit() async throws {
+    let nonce = "CW-7-00000000000000ab"
+    let fake = FakeRunner { _ in .success(nonceReply([("OTHER", "/tmp/\(nonce)ff")])) }
+    let ids = try await GhosttyScripting(runner: fake).terminalIDs(withNonceWorkingDirectory: nonce,
+                                                                     interval: .milliseconds(1))
+    #expect(ids == [])
+    #expect(fake.lock.withLock { fake.scripts.count } == 6)
+}
+
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    func next() -> Int { lock.withLock { defer { value += 1 }; return value } }
 }
 
 @Test func parsesIDs() {
@@ -335,4 +420,20 @@ func liveListsGhosttyTerminals() async throws {
     #expect(!FocusResult.appActivatedOnly(reason: "x").needsAutomationPermission)
     #expect(FocusResult.focused.reason == nil)
     #expect(!FocusResult.focused.needsAutomationPermission)
+}
+
+/// Probes a Ghostty terminal you created yourself: `CW_LIVE_NONCE_TTY=/dev/ttysNNN
+/// CW_LIVE_NONCE_ID=<its terminal id> swift test --filter liveNonceLookup`. Writes OSC 7 only to
+/// that tty and restores the cwd to $HOME afterwards.
+@Test(.enabled(if: ProcessInfo.processInfo.environment["CW_LIVE_NONCE_TTY"] != nil))
+func liveNonceLookup() async throws {
+    let env = ProcessInfo.processInfo.environment
+    let tty = try #require(env["CW_LIVE_NONCE_TTY"]), want = try #require(env["CW_LIVE_NONCE_ID"])
+    let host = OSC7Probe.hostName(), nonce = OSC7Probe.makeNonce(pid: getpid())
+    #expect(OSC7Probe.write(OSC7Probe.probeSequence(host: host, nonce: nonce), toTTY: tty))
+    defer { _ = OSC7Probe.write(OSC7Probe.restoreSequence(host: host, cwd: NSHomeDirectory()), toTTY: tty) }
+    let start = ContinuousClock.now
+    let ids = try await GhosttyScripting().terminalIDs(withNonceWorkingDirectory: nonce)
+    print("liveNonceLookup: \(ids) in \(ContinuousClock.now - start)")
+    #expect(ids == [want])
 }

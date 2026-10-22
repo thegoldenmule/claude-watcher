@@ -8,9 +8,12 @@ import Foundation
 ///
 /// Pure pieces (nonce, escape building, tty validation) are static and unit-tested.
 public enum OSC7Probe {
-    /// "CW-<pid>-<random hex>". Only [A-Za-z0-9-], so it's safe in a URL path and AppleScript.
+    /// "CW-<pid>-<16 hex digits>". Only [A-Za-z0-9-], so it's safe in a URL path and
+    /// AppleScript. Fixed-width random part; the lookup also requires it to be the whole last
+    /// path component (see `GhosttyScripting.nonceMatches`).
     public static func makeNonce(pid: Int32, random: UInt64 = .random(in: .min ... .max)) -> String {
-        "CW-\(pid)-\(String(random, radix: 16))"
+        let hex = String(random, radix: 16)
+        return "CW-\(pid)-\(String(repeating: "0", count: max(0, 16 - hex.count)))\(hex)"
     }
 
     /// `ESC ] 7 ; file://<host>/tmp/<nonce> BEL`
@@ -145,7 +148,7 @@ public actor OSC7ProbeCoordinator {
             _ = OSC7Probe.write(OSC7Probe.restoreSequence(host: host, cwd: cwd), toTTY: tty)
         }
         do throws(AppleScriptError) {
-            let ids = try await ghostty.terminalIDs(withWorkingDirectoryContaining: nonce)
+            let ids = try await ghostty.terminalIDs(withNonceWorkingDirectory: nonce)
             return .success(ids.count == 1 ? ids[0] : nil)
         } catch {
             return .failure(error)

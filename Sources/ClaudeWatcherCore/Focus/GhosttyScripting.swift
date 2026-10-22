@@ -88,28 +88,41 @@ public struct GhosttyScripting: Sendable {
         """
     }
 
-    /// Polls up to `attempts` times, `interval` seconds apart, for terminals whose working
-    /// directory contains `nonce` (set via OSC 7). Returns ids joined by RS ("" if none).
-    public static func nonceLookupScript(nonce: String, attempts: Int = 6, interval: Double = 0.03) -> String {
+    /// One non-delaying lookup of terminals whose working directory contains `nonce` (set via
+    /// OSC 7). Returns `id US US wd RS …` (the listing format, empty name), "" if none.
+    /// Polling happens in Swift between separate runs, so the main thread (where
+    /// `AppleScriptRunner` executes) is free between polls. (A bulk `{id, working directory} of
+    /// every terminal whose …` doesn't evaluate in Ghostty 1.3.1, so the matches, normally 0–1,
+    /// are read one by one.)
+    public static func nonceLookupScript(nonce: String) -> String {
         """
+        set US to character id 31
         set RS to character id 30
+        set out to ""
         with timeout of 3 seconds
           \(tell)
-            repeat \(max(1, attempts)) times
-              set ids to id of every terminal whose working directory contains \(AppleScriptSource.quoted(nonce))
-              if (count of ids) > 0 then
-                set out to ""
-                repeat with i in ids
-                  set out to out & (i as text) & RS
-                end repeat
-                return out
-              end if
-              delay \(interval)
+            repeat with t in (every terminal whose working directory contains \(AppleScriptSource.quoted(nonce)))
+              set d to ""
+              try
+                set d to (working directory of t) as text
+              end try
+              set out to out & ((id of t) as text) & US & US & d & RS
             end repeat
           end tell
         end timeout
-        return ""
+        return out
         """
+    }
+
+    /// Ids from `nonceLookupScript` output whose working directory's last path component is
+    /// exactly `nonce`. The `/` before it and end-of-path after it delimit the nonce, so a
+    /// longer nonce that merely contains this one (substring/prefix collision) never matches.
+    public static func nonceMatches(_ output: String, nonce: String) -> [String] {
+        guard !nonce.isEmpty else { return [] }
+        return GhosttyMatcher.parseListing(output).filter {
+            let wd = GhosttyMatcher.normalizePath($0.workingDirectory)
+            return wd.hasPrefix("/") && (wd as NSString).lastPathComponent == nonce
+        }.map(\.id)
     }
 
     /// Splits RS-joined id output.
@@ -154,10 +167,26 @@ public struct GhosttyScripting: Sendable {
         }
     }
 
-    public func terminalIDs(withWorkingDirectoryContaining nonce: String) async throws(AppleScriptError) -> [String] {
-        switch await runner.run(Self.nonceLookupScript(nonce: nonce), app: Self.app, timeout: .seconds(5)) {
-        case .success(let out): return Self.parseIDs(out)
-        case .failure(let e): throw e
+    /// Polls up to `attempts` times, `interval` apart, for terminals whose working directory is
+    /// the OSC 7 nonce path. Each poll is a separate, short script; the wait happens here in
+    /// Swift so the main thread isn't blocked by an AppleScript `delay`. Stops at the first
+    /// non-empty result (callers treat anything but exactly one id as no match). Returns [] if
+    /// cancelled while waiting.
+    public func terminalIDs(withNonceWorkingDirectory nonce: String, attempts: Int = 6,
+                            interval: Duration = .milliseconds(30)) async throws(AppleScriptError) -> [String]
+    {
+        let script = Self.nonceLookupScript(nonce: nonce)
+        for attempt in 0..<max(1, attempts) {
+            if attempt > 0 {
+                do { try await Task.sleep(for: interval) } catch { return [] }
+            }
+            switch await runner.run(script, app: Self.app, timeout: .seconds(5)) {
+            case .success(let out):
+                let ids = Self.nonceMatches(out, nonce: nonce)
+                if !ids.isEmpty { return ids }
+            case .failure(let e): throw e
+            }
         }
+        return []
     }
 }

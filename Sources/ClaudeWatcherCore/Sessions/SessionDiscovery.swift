@@ -34,11 +34,43 @@ public actor SessionDiscovery {
         self.inspector = inspector
     }
 
-    public static var defaultClaudeHome: URL {
-        if let dir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !dir.isEmpty {
-            return URL(fileURLWithPath: dir, isDirectory: true)
+    /// Claude Code's config directory, resolved once and cached (see `ClaudeHome`).
+    /// The first call may spawn `launchctl` and a login shell (bounded at ~2 s each, ~0.1 s
+    /// typically); call `prewarmDefaultClaudeHome()` early to do that off the main thread.
+    public static var defaultClaudeHome: URL { ClaudeHome.resolved }
+
+    /// Starts resolving `defaultClaudeHome` on a background queue. Idempotent.
+    public static func prewarmDefaultClaudeHome() {
+        DispatchQueue.global(qos: .userInitiated).async { _ = ClaudeHome.resolved }
+    }
+
+    /// Pure resolution of Claude Code's config directory: the first non-empty of `env`'s
+    /// `CLAUDE_CONFIG_DIR`, `launchctlValue`, `shellValue`, with a leading `~` expanded against
+    /// `home`; `home/.claude` if none is set or the chosen directory doesn't exist. The later
+    /// sources are autoclosures so they're only evaluated when the earlier ones are empty.
+    public static func resolveClaudeHome(
+        env: [String: String],
+        launchctlValue: @autoclosure () -> String?,
+        shellValue: @autoclosure () -> String?,
+        home: String,
+        fileExists: (String) -> Bool
+    ) -> URL {
+        let fallback = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".claude", isDirectory: true)
+        func clean(_ value: String?) -> String? {
+            guard let v = value?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty else { return nil }
+            return v
         }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude", isDirectory: true)
+        guard let raw = clean(env["CLAUDE_CONFIG_DIR"]) ?? clean(launchctlValue()) ?? clean(shellValue())
+        else { return fallback }
+        var path = raw
+        if path == "~" {
+            path = home
+        } else if path.hasPrefix("~/") {
+            path = (home as NSString).appendingPathComponent(String(path.dropFirst(2)))
+        }
+        guard path.hasPrefix("/"), fileExists(path) else { return fallback }
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
     }
 
     public nonisolated var sessionsDirectory: URL { claudeHome.appendingPathComponent("sessions", isDirectory: true) }

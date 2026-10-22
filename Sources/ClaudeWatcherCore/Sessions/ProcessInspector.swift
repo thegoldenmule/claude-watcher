@@ -148,14 +148,45 @@ public enum ProcessRules {
     /// Whether `executablePath` runs Claude Code. Mirrors the hook's `find_claude`: a binary
     /// named `claude` (Homebrew cask, symlinked installs), the native installer's
     /// `…/claude/versions/<ver>`, the cask's `Caskroom/claude-code/`, or `node` running the npm
-    /// package. `arguments` is only consulted for `node`, so the argv read stays rare.
-    public static func isClaudeExecutable(_ executablePath: String?, arguments: () -> [String]?) -> Bool {
+    /// package (see `isClaudeNodeArgv`). `arguments` is only consulted for `node`, so the argv
+    /// read stays rare. `resolvePath` is `realpath(3)`, injectable for tests.
+    public static func isClaudeExecutable(
+        _ executablePath: String?, arguments: () -> [String]?,
+        resolvePath: (String) -> String? = ProcessRules.realpath
+    ) -> Bool {
         guard let path = executablePath, !path.isEmpty else { return false }
         if path.contains("/claude/versions/") || path.contains("Caskroom/claude-code/") { return true }
         let name = (path as NSString).lastPathComponent
         if name == "claude" { return true }
-        guard name == "node" else { return false }
-        return arguments()?.contains { $0.contains("@anthropic-ai/claude-code") } ?? false
+        guard name == "node", let argv = arguments() else { return false }
+        return isClaudeNodeArgv(argv, resolvePath: resolvePath)
+    }
+
+    static let npmPackage = "@anthropic-ai/claude-code"
+
+    /// Whether a `node` process's argv is Claude Code's npm package. A global npm install
+    /// links `bin/claude` to `…/@anthropic-ai/claude-code/cli.js` (`#!/usr/bin/env node`), so
+    /// the kernel's argv is `["node", "/opt/homebrew/bin/claude", …]`: the symlink, not the
+    /// package path. If Claude sets `process.title`, libuv rewrites argv to `["claude", …]`.
+    /// Accepts argv[0] or argv[1] named `claude`, an absolute argv[1] whose real path is in the
+    /// package, or any argument naming the package literally (`node …/cli.js`).
+    static func isClaudeNodeArgv(_ argv: [String], resolvePath: (String) -> String?) -> Bool {
+        guard let first = argv.first else { return false }
+        if argv.contains(where: { $0.contains(npmPackage) }) { return true }
+        if (first as NSString).lastPathComponent == "claude" { return true }
+        guard argv.count > 1 else { return false }
+        let script = argv[1]
+        if (script as NSString).lastPathComponent == "claude" { return true }
+        // Relative paths are relative to the process's cwd, which we don't know.
+        guard script.hasPrefix("/"), let real = resolvePath(script) else { return false }
+        return real.contains(npmPackage)
+    }
+
+    /// `realpath(3)`: the canonical path with every symlink resolved, or nil if it fails.
+    public static func realpath(_ path: String) -> String? {
+        guard let resolved = Darwin.realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     /// A registry record is live when its pid exists, runs a Claude Code binary, and

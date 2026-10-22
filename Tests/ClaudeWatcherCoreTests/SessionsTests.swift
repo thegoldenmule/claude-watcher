@@ -275,7 +275,8 @@ private let transcriptSample = """
         let snap = ProcessSnapshot(pid: 42, ppid: 1, startTime: start, executablePath: path)
         return ProcessRules.isLive(record, process: snap, arguments: { argv })
     }
-    let npmArgv = ["node", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js", "--resume"]
+    // What the kernel really reports for a global npm install: the `bin/claude` symlink.
+    let npmArgv = ["node", "/opt/homebrew/bin/claude", "--resume"]
 
     // Native installer.
     #expect(live(claudeBinary))
@@ -285,10 +286,18 @@ private let transcriptSample = """
     #expect(live("/usr/local/bin/claude"))
     // npm: node running the claude-code package.
     #expect(live("/opt/homebrew/Cellar/node/24.1.0/bin/node", argv: npmArgv))
-    #expect(live("/Users/me/.nvm/versions/node/v22.0.0/bin/node", argv: npmArgv))
+    #expect(live("/Users/me/.nvm/versions/node/v22.0.0/bin/node",
+                 argv: ["node", "/Users/me/.nvm/versions/node/v22.0.0/bin/claude"]))
+    // After `process.title = "claude"`, libuv rewrites argv.
+    #expect(live("/opt/homebrew/bin/node", argv: ["claude", "--resume"]))
+    // Explicit `node …/cli.js` still matches by package path.
+    #expect(live("/opt/homebrew/bin/node",
+                 argv: ["node", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"]))
     // Plain node, or node whose argv is unreadable: rejected.
     #expect(!live("/opt/homebrew/bin/node", argv: ["node", "server.js"]))
     #expect(!live("/opt/homebrew/bin/node", argv: nil))
+    #expect(!live("/opt/homebrew/bin/node", argv: ["node"]))
+    #expect(!live("/opt/homebrew/bin/node", argv: ["node", "/srv/app/server.js", "claude"]))
     // Unrelated binaries: rejected, and argv is never read for them.
     var argvRead = false
     let vim = ProcessSnapshot(pid: 42, ppid: 1, startTime: start, executablePath: "/usr/bin/vim")
@@ -299,6 +308,35 @@ private let transcriptSample = """
     let reused = ProcessSnapshot(pid: 42, ppid: 1, startTime: start.addingTimeInterval(3600),
                                  executablePath: "/opt/homebrew/bin/node")
     #expect(!ProcessRules.isLive(record, process: reused, arguments: { npmArgv }))
+}
+
+@Test func npmArgvResolvesRenamedSymlinkToPackage() throws {
+    // bin/<anything> -> …/@anthropic-ai/claude-code/cli.js is accepted via realpath(3).
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cw-npm-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let pkg = root.appendingPathComponent("lib/node_modules/@anthropic-ai/claude-code")
+    let other = root.appendingPathComponent("lib/node_modules/other")
+    try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent("bin"), withIntermediateDirectories: true)
+    try Data("#!/usr/bin/env node\n".utf8).write(to: pkg.appendingPathComponent("cli.js"))
+    try Data("#!/usr/bin/env node\n".utf8).write(to: other.appendingPathComponent("cli.js"))
+    let cc = root.appendingPathComponent("bin/cc").path
+    let tool = root.appendingPathComponent("bin/tool").path
+    try FileManager.default.createSymbolicLink(atPath: cc, withDestinationPath: pkg.appendingPathComponent("cli.js").path)
+    try FileManager.default.createSymbolicLink(atPath: tool, withDestinationPath: other.appendingPathComponent("cli.js").path)
+
+    let node = "/opt/homebrew/bin/node"
+    #expect(ProcessRules.isClaudeExecutable(node, arguments: { ["node", cc] }))
+    #expect(!ProcessRules.isClaudeExecutable(node, arguments: { ["node", tool] }))
+    #expect(!ProcessRules.isClaudeExecutable(node, arguments: { ["node", root.appendingPathComponent("bin/missing").path] }))
+    // Relative script paths aren't resolved (they're relative to the target's cwd).
+    var resolved = false
+    #expect(!ProcessRules.isClaudeExecutable(
+        node, arguments: { ["node", "bin/cc"] }, resolvePath: { resolved = true; return $0 }))
+    #expect(!resolved)
 }
 
 @Test func parsesProcArgs2() {
@@ -412,7 +450,7 @@ private let transcriptSample = """
 @Test func discoversCaskAndNpmInstalls() async throws {
     let home = try TempHome()
     let t0 = Date(timeIntervalSince1970: 1792681136)
-    for pid: Int32 in [700, 800, 900] {
+    for pid: Int32 in [700, 800, 900, 1000] {
         try home.write("sessions/\(pid).json", recordJSON(
             pid: pid, sessionId: "s-\(pid)", cwd: "/p\(pid)",
             startedAt: t0.timeIntervalSince1970 * 1000 + Double(pid), procStart: procStartString(t0)))
@@ -424,13 +462,78 @@ private let transcriptSample = """
                                  executablePath: "/opt/homebrew/Caskroom/claude-code/2.1.306/claude"),
             800: ProcessSnapshot(pid: 800, ppid: 1, startTime: t0, executablePath: node),
             900: ProcessSnapshot(pid: 900, ppid: 1, startTime: t0, executablePath: node),
+            1000: ProcessSnapshot(pid: 1000, ppid: 1, startTime: t0, executablePath: node),
         ],
         argv: [
-            800: ["node", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
+            800: ["node", "/opt/homebrew/bin/claude"],
             900: ["node", "/srv/app/server.js"],
+            1000: ["claude"],
         ])
     let sessions = await SessionDiscovery(claudeHome: home.url, inspector: inspector).scan()
-    #expect(sessions.map(\.id) == ["s-700", "s-800"])
+    #expect(sessions.map(\.id) == ["s-700", "s-800", "s-1000"])
+}
+
+// MARK: - Claude home resolution
+
+@Test func resolvesClaudeHome() {
+    let home = "/Users/me"
+    let existing: Set<String> = ["/Users/me/cfg", "/opt/claude", "/Users/me"]
+    func resolve(env: [String: String] = [:], launchctl: String? = nil, shell: String? = nil,
+                 exists: Set<String> = existing) -> String {
+        SessionDiscovery.resolveClaudeHome(
+            env: env, launchctlValue: launchctl, shellValue: shell, home: home,
+            fileExists: { exists.contains($0) }).path
+    }
+    // Nothing set: ~/.claude.
+    #expect(resolve() == "/Users/me/.claude")
+    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": ""], launchctl: "", shell: " \n") == "/Users/me/.claude")
+    // Precedence: process env, then launchctl, then the login shell.
+    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "/opt/claude"], launchctl: "/Users/me/cfg", shell: "/x")
+            == "/opt/claude")
+    #expect(resolve(launchctl: "/opt/claude", shell: "/Users/me/cfg") == "/opt/claude")
+    #expect(resolve(shell: "/Users/me/cfg") == "/Users/me/cfg")
+    // Tilde expansion.
+    #expect(resolve(shell: "~/cfg") == "/Users/me/cfg")
+    #expect(resolve(launchctl: "~") == "/Users/me")
+    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "~/cfg/"]) == "/Users/me/cfg")
+    // Chosen directory missing (or relative): ~/.claude.
+    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "/gone"], shell: "/Users/me/cfg") == "/Users/me/.claude")
+    #expect(resolve(shell: "~/nope") == "/Users/me/.claude")
+    #expect(resolve(shell: "cfg") == "/Users/me/.claude")
+}
+
+@Test func claudeHomeProbesAreLazy() {
+    var launchctlCalls = 0, shellCalls = 0
+    func launchctl() -> String? { launchctlCalls += 1; return "/opt/claude" }
+    func shell() -> String? { shellCalls += 1; return nil }
+    _ = SessionDiscovery.resolveClaudeHome(
+        env: ["CLAUDE_CONFIG_DIR": "/opt/claude"], launchctlValue: launchctl(), shellValue: shell(),
+        home: "/Users/me", fileExists: { _ in true })
+    #expect(launchctlCalls == 0 && shellCalls == 0)
+    _ = SessionDiscovery.resolveClaudeHome(
+        env: [:], launchctlValue: launchctl(), shellValue: shell(),
+        home: "/Users/me", fileExists: { _ in true })
+    #expect(launchctlCalls == 1 && shellCalls == 0)
+}
+
+@Test func claudeHomeShellOutputParsing() {
+    let m = ClaudeHome.marker
+    #expect(ClaudeHome.markedValue("motd junk\nmore\n\(m)/Users/me/cfg\nbye from zlogout\n") == "/Users/me/cfg")
+    #expect(ClaudeHome.markedValue("junk without newline\(m)/a\n") == "/a")
+    #expect(ClaudeHome.markedValue("\n\(m)\n") == "")
+    #expect(ClaudeHome.markedValue("no marker at all\n") == nil)
+}
+
+@Test func claudeHomeProbeRunnerIsBounded() {
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "echo junk >&2; printf 'a\\nb'"]) == "a\nb")
+    // stdin is /dev/null, not our stdin.
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "cat"]) == "")
+    let start = Date()
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "printf x; sleep 30"], timeout: 0.3) == nil)
+    // A backgrounded grandchild holding stdout is killed with the process group.
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "sleep 30 & printf y"], timeout: 0.3) == nil)
+    #expect(Date().timeIntervalSince(start) < 5)
+    #expect(ClaudeHome.run("/nonexistent/shell", []) == nil)
 }
 
 @Test func missingClaudeHomeYieldsNoSessions() async {
@@ -494,6 +597,11 @@ private let transcriptSample = """
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["CW_LIVE"] == "1"))
 func liveDiscovery() async {
+    let probeStart = Date()
+    let launchctl = ClaudeHome.launchctlValue(), shell = ClaudeHome.shellValue()
+    print("LIVE: launchctl=\(launchctl.debugDescription) shell=\(shell.debugDescription) "
+          + "probes \(Int(Date().timeIntervalSince(probeStart) * 1000)) ms; "
+          + "defaultClaudeHome=\(SessionDiscovery.defaultClaudeHome.path)")
     let discovery = SessionDiscovery(
         claudeHome: SessionDiscovery.defaultClaudeHome, hookStateDirectory: HookStateStore.defaultDirectory)
     let start = Date()

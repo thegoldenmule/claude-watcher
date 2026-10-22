@@ -45,17 +45,15 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `Task.sleep` for waits.
 - `Resources/Info.plist`, `scripts/build-app.sh`, `Makefile`: build tooling. `build-app.sh` also
   takes `HARDENED_RUNTIME=1`, `APP_DIR`, `INFO_PLIST`, `ARCHS` (used by the release script).
-- `scripts/release.sh` (`make release`): notarized universal zip -> GitHub release (process in
-  README "Releasing"). `Resources/ClaudeWatcher.entitlements`: Apple Events, release builds only.
+- `scripts/release.sh` (`make release`): notarized universal zip -> GitHub release (see
+  "Releasing" below). `Resources/ClaudeWatcher.entitlements`: Apple Events, release builds only.
 
 ## Commands
 - `make build` (`swift build`), `make test` (`swift test`)
 - `make app`: release build, assembles and signs `build/ClaudeWatcher.app`
 - `make run`: kills any running instance, builds the app, opens it
 - `make clean`
-- `make release VERSION=X.Y.Z [DRY_RUN=1 [NOTARIZE=1]]`: bumps Info.plist, commits, tags, notarizes,
-  pushes, publishes. `DRY_RUN=1` only builds a Developer ID zip (`NOTARIZE=1` also notarizes);
-  needs a clean, pushed main, an Apple account in Xcode and `gh` auth.
+- `make release VERSION=X.Y.Z [DRY_RUN=1 [NOTARIZE=1]]`: see "Releasing" below.
 - Demo data, panel pinned: `open build/ClaudeWatcher.app --args --demo` (or `CW_DEMO=1`;
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
   show the info banner. Screenshot helpers (demo only): `CW_DEMO_NOTICE=error|info`,
@@ -65,13 +63,56 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery`.
 - Logs: `/usr/bin/log stream --predicate 'subsystem == "com.thegoldenmule.ClaudeWatcher"'`
   (in zsh, bare `log` is a builtin). Focus lines show the resolver and the hook id.
-- Signing: `$CODESIGN_IDENTITY`, else first "Apple Development" identity, else ad-hoc
-  (ad-hoc resets TCC Accessibility/Automation grants on every rebuild). Dev builds stay Apple
-  Development and non-hardened; releases are Developer ID (Xcode cloud-managed signing via
-  `xcodebuild -exportArchive`), hardened runtime + entitlements, notarized and stapled.
+- Signing (dev): `$CODESIGN_IDENTITY`, else first "Apple Development" identity, else ad-hoc
+  (ad-hoc resets TCC Accessibility/Automation grants on every rebuild).
+
+## Releasing
+Only when the user asks. It publishes a public GitHub release and can't really be undone (the
+tag and build number stay). Pick `X.Y.Z` by semver; ask the user if the bump is unclear. Real
+releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
+- Dev vs release signing: dev builds (`make app`/`make run`) are Apple Development, not hardened,
+  not notarized, so TCC grants survive rebuilds. Releases are Developer ID via Xcode cloud-managed
+  signing (team `QKMK66X2FU`, no local Developer ID cert), hardened runtime + entitlements,
+  notarized and stapled.
+- Preconditions (preflight fails a real release on each; a dry run only warns, except Xcode):
+  clean tree; on main; main pushed and equal to origin/main (it fetches); tag `vX.Y.Z` unused
+  locally and on origin; an Apple account in Xcode > Settings > Accounts (Account Holder/Admin);
+  `gh` authenticated. Run `make test` first (the script doesn't).
+- Dry runs commit, tag, push and publish nothing (Info.plist is stamped on a copy):
+  `DRY_RUN=1` builds a Developer ID-signed, un-notarized zip (Gatekeeper rejection expected);
+  `DRY_RUN=1 NOTARIZE=1` also notarizes, staples and verifies like a real release.
+- Steps, as bare commands: `git push origin main`, then `make release VERSION=X.Y.Z`. A local,
+  git-excluded `.claude/settings.local.json` allows `git push` and `make`; piped forms
+  (`make release ... | tail`) don't match the allow rule and are denied.
+- What it does: sets `CFBundleShortVersionString` and `CFBundleVersion` (`git rev-list --count
+  HEAD` + 1, bumped past the current value; v0.1.0 was 75), commits "Release vX.Y.Z" (Info.plist
+  only) and an annotated tag, locally. `build-app.sh` builds universal arm64 + x86_64 in
+  `.build-release` (`HARDENED_RUNTIME=1`, the entitlements file holds only
+  `com.apple.security.automation.apple-events`), wrapped in an `.xcarchive`;
+  `xcodebuild -exportArchive -allowProvisioningUpdates` (developer-id) signs and uploads it, and
+  `-exportNotarizedApp` is polled for up to `NOTARY_TIMEOUT` s (default 1800; pass
+  `NOTARY_TIMEOUT=3600` on the make line). It checks team, runtime flag and entitlements, zips,
+  verifies a quarantined extracted copy (`codesign`, `spctl`, `stapler`, `syspolicy_check
+  distribution`), writes the SHA-256, runs `git push --atomic origin main vX.Y.Z`, then
+  `gh release create ... --repo thegoldenmule/claude-watcher --verify-tag --generate-notes
+  --notes-file ...`. Assets `ClaudeWatcher-X.Y.Z.zip` + `.zip.sha256`, in `build/dist/`.
+- Failure before the push (incl. notarization timeout): deletes the tag and drops the release
+  commit (`git reset --keep`, only if both still point at it), or restores Info.plist; fix and
+  re-run. A failed push asks `git ls-remote origin refs/tags/vX.Y.Z`: our tag there = pushed;
+  empty = rolled back; unreachable or a different tag = local commit/tag left with undo steps
+  printed. Failure after the push (e.g. `gh`): nothing is undone and it prints the
+  `gh release create` to finish by hand; don't re-run `make release`. Once the release exists
+  (`RELEASED`), a later failure or interrupt only reports the URL.
+- Verify: `gh release view vX.Y.Z`; download both assets into an empty dir, `shasum -a 256 -c
+  ClaudeWatcher-X.Y.Z.zip.sha256`, unzip, `spctl -a -vvv -t exec ClaudeWatcher.app`,
+  `xcrun stapler validate ClaudeWatcher.app`; `git rev-parse main origin/main` match.
+- Afterwards: `make run` to rebuild the local dev app (Apple Development, not hardened, so TCC
+  grants persist), and check `build/ClaudeWatcher.app/Contents/Resources/claude-watcher-hook.sh`
+  matches `~/Library/Application Support/ClaudeWatcher/claude-watcher-hook.sh` (`cmp`); if not,
+  the menu shows "Claude Code Hook: Needs Update"; use its "Update Hook".
 
 ## Conventions
-- Commit with one-line messages only (no body/trailers). Don't push.
+- Commit with one-line messages only (no body/trailers). Don't push (except to release, above).
 - If several agents work at once: give each its own SwiftPM scratch dir
   (`swift build --scratch-path .build-<name>`; `scripts/build-app.sh` honours `SCRATCH_PATH`)
   and stage only your own paths (never `git add -A`).

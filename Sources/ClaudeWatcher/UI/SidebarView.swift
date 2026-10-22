@@ -2,8 +2,9 @@ import AppKit
 import ClaudeWatcherCore
 import SwiftUI
 
-/// The sidebar's content: a header with counts and a list of sessions. Waiting sessions sort
-/// to the top and are tinted, since that's when the user needs to act.
+/// The sidebar's content, drawn as a Ghostty pane: the theme's background and font, a prompt
+/// header with status counts, then one block per session. Waiting sessions sort to the top and
+/// are marked in the palette's yellow, since that's when the user needs to act.
 struct SidebarView: View {
     let sessions: [ClaudeSession]
     var isPinned: Bool = false
@@ -14,6 +15,8 @@ struct SidebarView: View {
     let onSelect: (ClaudeSession) -> Void
     var onDismissNotice: () -> Void = {}
     var onOpenAutomationSettings: () -> Void = {}
+
+    @Environment(\.terminalStyle) private var style
 
     private var ordered: [ClaudeSession] {
         // Only "waiting" jumps the queue; busy/idle flips don't reshuffle rows.
@@ -30,120 +33,140 @@ struct SidebarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             SidebarHeader(sessions: sessions, isPinned: isPinned)
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .padding(.bottom, 10)
+                .padding(.horizontal, style.paddingX)
+                .padding(.top, style.paddingY)
+                .padding(.bottom, style.lineHeight * 0.5)
+
+            Rectangle().fill(style.divider).frame(height: 1)
 
             if sessions.isEmpty {
                 EmptyStateView()
+                    .padding(.horizontal, style.paddingX)
+                    .padding(.top, style.lineHeight * 0.5)
             } else {
                 ScrollView(.vertical) {
-                    LazyVStack(spacing: 4) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(ordered) { session in
                             SessionRow(session: session, isPending: session.id == pendingSessionID) {
                                 onSelect(session)
                             }
                         }
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 10)
+                    .padding(.vertical, style.lineHeight * 0.25)
                 }
                 .scrollIndicators(.never)
             }
 
+            Spacer(minLength: 0)
+
             if let notice {
                 FocusNoticeBanner(
                     notice: notice, onDismiss: onDismissNotice, onOpenSettings: onOpenAutomationSettings)
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 8)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .font(style.font)
+        .foregroundStyle(style.foreground)
         .animation(.easeOut(duration: 0.18), value: notice)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .background(PaneBackground())
+        .clipShape(.rect(cornerRadius: TerminalStyle.cornerRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: TerminalStyle.cornerRadius, style: .continuous)
+                .strokeBorder(style.border, lineWidth: 1))
+        .environment(\.colorScheme, style.colorScheme)
+    }
+}
+
+/// The theme background at `background-opacity`, over a blur when `background-blur` is set.
+private struct PaneBackground: View {
+    @Environment(\.terminalStyle) private var style
+
+    var body: some View {
+        let theme = style.theme
+        ZStack {
+            switch theme.backgroundBlur {
+            case .off:
+                EmptyView()
+            case .radius:
+                Rectangle().fill(.ultraThinMaterial)
+            case .glass(let clear):
+                Rectangle().fill(.clear)
+                    .glassEffect(clear ? .clear : .regular, in: .rect(cornerRadius: TerminalStyle.cornerRadius))
+            }
+            Rectangle().fill(style.background.opacity(theme.backgroundOpacity))
+        }
     }
 }
 
 // MARK: - Header
 
+/// `❯ claude sessions` plus a line of colored counts, like a prompt and its output.
 private struct SidebarHeader: View {
     let sessions: [ClaudeSession]
     let isPinned: Bool
+
+    @Environment(\.terminalStyle) private var style
 
     private func count(_ status: SessionStatus) -> Int {
         sessions.lazy.filter { $0.status == status }.count
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("Claude Code")
-                    .font(.system(size: 15, weight: .semibold))
-                if !sessions.isEmpty {
-                    Text("\(sessions.count)")
-                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1)
-                        .background(.quaternary, in: .capsule)
-                }
-                Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
+                Text(.span("❯ ", style.success, font: style.boldFont)
+                    + .span("claude", font: style.boldFont) + .span(" sessions"))
+                Spacer(minLength: style.cellWidth)
                 if isPinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .help("Pinned")
+                    Text("[pinned] ").foregroundStyle(style.faint).help("Pinned")
+                }
+                if !sessions.isEmpty {
+                    Text("\(sessions.count)").foregroundStyle(style.faint)
                 }
             }
+            .lineLimit(1)
             if !sessions.isEmpty {
-                HStack(spacing: 10) {
-                    let waiting = count(.waiting), busy = count(.busy)
-                    if waiting > 0 {
-                        SummaryChip(color: .orange, text: "\(waiting) waiting", emphasized: true)
-                    }
-                    if busy > 0 {
-                        SummaryChip(color: .accentColor, text: "\(busy) working", emphasized: false)
-                    }
-                    if waiting == 0 && busy == 0 {
-                        SummaryChip(color: .secondary, text: "All idle", emphasized: false)
-                    }
-                }
+                summary.lineLimit(1).truncationMode(.tail)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
-}
 
-private struct SummaryChip: View {
-    let color: Color
-    let text: String
-    let emphasized: Bool
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Circle().fill(color).frame(width: 6, height: 6)
-            Text(text)
-                .font(.system(size: 11, weight: emphasized ? .semibold : .regular))
-                .foregroundStyle(emphasized ? AnyShapeStyle(color) : AnyShapeStyle(.secondary))
-        }
+    private var summary: Text {
+        let waiting = count(.waiting), busy = count(.busy)
+        let idle = sessions.count - waiting - busy
+        var parts: [AttributedString] = []
+        if waiting > 0 { parts.append(.span("● \(waiting) waiting", style.waiting, font: style.boldFont)) }
+        if busy > 0 { parts.append(.span("✳ \(busy) working", style.busy)) }
+        if idle > 0 { parts.append(.span("○ \(idle) idle", style.idle)) }
+        return Text(parts.dropFirst().reduce(parts.first ?? "") { $0 + .span("  ") + $1 })
     }
 }
 
 // MARK: - Empty state
 
+/// A prompt with nothing to show and a blinking block cursor.
 private struct EmptyStateView: View {
+    @Environment(\.terminalStyle) private var style
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "terminal")
-                .font(.system(size: 26, weight: .light))
-                .foregroundStyle(.tertiary)
-            Text("No Claude Code sessions running")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        VStack(alignment: .leading, spacing: 0) {
+            Text("no claude code sessions running").foregroundStyle(style.faint)
+            HStack(spacing: 0) {
+                Text("❯ ").foregroundStyle(style.success).font(style.boldFont)
+                TimelineView(.periodic(from: .now, by: 0.6)) { context in
+                    let on = reduceMotion || Int(context.date.timeIntervalSinceReferenceDate / 0.6) % 2 == 0
+                    Rectangle()
+                        .fill(style.cursor.opacity(on ? 1 : 0))
+                        .frame(width: style.cellWidth, height: style.lineHeight)
+                }
+            }
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("No Claude Code sessions running")
     }
 }
 
@@ -154,9 +177,19 @@ private struct SessionRow: View {
     var isPending = false
     let action: () -> Void
 
-    @State private var hovering = false
+    @Environment(\.terminalStyle) private var style
+    @State private var hoverState = false
+    private var hovering: Bool { hoverState || DemoMode.previewHoverID == session.id }
 
     private var isWaiting: Bool { session.status == .waiting }
+    private var isSelected: Bool { hovering || isPending }
+
+    /// Text color under the selection highlight: the theme's `selection-foreground`, as Ghostty
+    /// draws selected cells; nil keeps the palette colors.
+    private func ink(_ color: Color, faint: Bool = false) -> Color {
+        guard isSelected, let fg = style.selectionText else { return color }
+        return faint ? fg.opacity(0.7) : fg
+    }
 
     private var folderName: String {
         let name = URL(fileURLWithPath: session.cwd).lastPathComponent
@@ -165,80 +198,88 @@ private struct SessionRow: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(alignment: .top, spacing: 10) {
-                StatusIndicator(status: session.status)
-                    .frame(width: 14, height: 18)
+            HStack(alignment: .top, spacing: 0) {
+                StatusGlyph(status: session.status, dimColor: isSelected ? style.selectionText : nil)
+                    .frame(width: style.gutterWidth, height: style.lineHeight, alignment: .leading)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(session.title)
-                        .font(.system(size: 13, weight: .semibold))
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 0) {
+                        Text(session.title)
+                            .font(style.boldFont)
+                            .foregroundStyle(ink(style.foreground))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if isPending {
+                            BrailleSpinner().padding(.leading, style.cellWidth)
+                        }
+                    }
+
+                    if isWaiting {
+                        Text(waitingTag + .span(" ")
+                            + .span(session.waitingFor ?? "needs your input", ink(style.waiting)))
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    locationLine
                         .lineLimit(1)
                         .truncationMode(.tail)
 
-                    if isWaiting {
-                        Label(session.waitingFor ?? "Waiting for you", systemImage: "exclamationmark.bubble.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.orange)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .labelStyle(TightLabelStyle())
-                    }
-
-                    HStack(spacing: 4) {
-                        Text(folderName)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        if let branch = session.branch, !branch.isEmpty {
-                            Text("·").foregroundStyle(.tertiary)
-                            Image(systemName: "arrow.triangle.branch")
-                                .font(.system(size: 9, weight: .medium))
-                            Text(branch)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                    }
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-
                     if let prompt = session.lastPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
                        !prompt.isEmpty {
-                        Text(prompt.replacingOccurrences(of: "\n", with: " "))
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
+                        Text("> \(prompt.replacingOccurrences(of: "\n", with: " "))")
+                            .foregroundStyle(ink(style.faint, faint: true))
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-
-                Group {
-                    if isPending {
-                        ProgressView().controlSize(.mini).frame(width: 16, height: 16)
-                    } else {
-                        TerminalBadge(kind: session.terminal)
-                    }
-                }
-                .padding(.top, 1)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.leading, style.paddingX)
+            .padding(.trailing, style.paddingX)
+            .padding(.vertical, style.lineHeight * 0.35)
             .background(background)
-            .contentShape(.rect(cornerRadius: 10))
+            .contentShape(.rect)
         }
         .buttonStyle(RowButtonStyle())
-        .onHover { hovering = $0 }
-        .animation(.easeOut(duration: 0.12), value: hovering)
+        .onHover { hoverState = $0 }
         .help(session.cwd)
     }
 
+    /// Inverse-video ` waiting ` tag, as a terminal would draw it with SGR 7.
+    private var waitingTag: AttributedString {
+        .span(" waiting ", style.background, font: style.boldFont, background: style.waiting)
+    }
+
+    /// `folder (branch)`, like git's `__git_ps1` prompt.
+    private var locationLine: Text {
+        let punctuation = ink(style.faint, faint: true)
+        var line = AttributedString.span(folderName, ink(style.cyan))
+        if let branch = session.branch, !branch.isEmpty {
+            line += .span(" (", punctuation) + .span(branch, ink(style.magenta)) + .span(")", punctuation)
+        }
+        if case .ghostty = session.terminal {} else {
+            line += .span(" [\(Self.terminalName(session.terminal))]", punctuation)
+        }
+        return Text(line)
+    }
+
+    private static func terminalName(_ kind: TerminalKind) -> String {
+        switch kind {
+        case .ghostty: "ghostty"
+        case .appleTerminal: "terminal"
+        case .other(let name): name.lowercased()
+        }
+    }
+
     @ViewBuilder private var background: some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
-        if isWaiting {
-            shape
-                .fill(Color.orange.opacity(hovering ? 0.22 : 0.14))
-                .overlay(shape.strokeBorder(Color.orange.opacity(0.45), lineWidth: 1))
-        } else {
-            shape.fill(Color.primary.opacity(hovering ? 0.08 : 0))
+        ZStack(alignment: .leading) {
+            if isWaiting { style.waiting.opacity(0.10) }
+            if isSelected { style.selection }
+            if isWaiting {
+                Rectangle().fill(style.waiting).frame(width: 3)
+            }
         }
     }
 }
@@ -246,117 +287,53 @@ private struct SessionRow: View {
 private struct RowButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.98 : 1)
-            .opacity(configuration.isPressed ? 0.85 : 1)
-            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
-private struct TightLabelStyle: LabelStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 4) {
-            configuration.icon.font(.system(size: 10))
-            configuration.title
-        }
-    }
-}
+// MARK: - Glyphs
 
-// MARK: - Focus notice
-
-private struct FocusNoticeBanner: View {
-    let notice: FocusNotice
-    let onDismiss: () -> Void
-    let onOpenSettings: () -> Void
-
-    private var tint: Color { notice.isError ? .red : .secondary }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: notice.isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(notice.isError ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
-                    .padding(.top, 1)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(notice.isError ? "Couldn't focus \(notice.sessionTitle)" : notice.sessionTitle)
-                        .font(.system(size: 11, weight: .semibold))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Text(notice.message)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 16, height: 16)
-                        .contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-                .help("Dismiss")
-            }
-            if notice.needsAutomationPermission {
-                Button("Open Automation Settings…", action: onOpenSettings)
-                    .controlSize(.small)
-                    .padding(.leading, 17)
-            }
-        }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(tint.opacity(notice.isError ? 0.12 : 0.10))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(tint.opacity(0.35), lineWidth: 1))
-        )
-        .accessibilityElement(children: .contain)
-    }
-}
-
-// MARK: - Status indicator
-
-private struct StatusIndicator: View {
+/// One terminal cell's worth of status: Claude's own spinner while working, a yellow dot when
+/// waiting, a hollow dot when idle.
+private struct StatusGlyph: View {
     let status: SessionStatus
+    /// Replaces the dim idle/unknown colors (which vanish on a selection highlight).
+    var dimColor: Color? = nil
 
+    @Environment(\.terminalStyle) private var style
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pulsing = false
+
+    /// Claude Code's thinking spinner, played forwards then backwards.
+    private static let frames = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"]
 
     var body: some View {
-        ZStack {
+        Group {
             switch status {
             case .busy:
-                if !reduceMotion {
-                    Circle()
-                        .fill(Color.accentColor.opacity(0.35))
-                        .frame(width: 8, height: 8)
-                        .scaleEffect(pulsing ? 2.1 : 1)
-                        .opacity(pulsing ? 0 : 1)
+                if reduceMotion {
+                    Text("✳")
+                } else {
+                    TimelineView(.periodic(from: .now, by: 0.12)) { context in
+                        let tick = Int(context.date.timeIntervalSinceReferenceDate / 0.12)
+                        Text(Self.frames[tick % Self.frames.count])
+                    }
                 }
-                Circle()
-                    .fill(Color.accentColor)
-                    .frame(width: 8, height: 8)
-            case .waiting:
-                Circle()
-                    .fill(Color.orange.opacity(0.25))
-                    .frame(width: 14, height: 14)
-                Circle()
-                    .fill(Color.orange)
-                    .frame(width: 8, height: 8)
-            case .idle:
-                Circle()
-                    .fill(Color.secondary.opacity(0.5))
-                    .frame(width: 8, height: 8)
-            case .unknown:
-                Circle()
-                    .strokeBorder(Color.secondary.opacity(0.6), lineWidth: 1.2)
-                    .frame(width: 8, height: 8)
+            case .waiting: Text("●").font(style.boldFont)
+            case .idle: Text("○")
+            case .unknown: Text("?")
             }
         }
-        .onAppear { startPulse() }
-        .onChange(of: status) { startPulse() }
+        .foregroundStyle(color)
         .accessibilityLabel(Text(label))
+    }
+
+    private var color: Color {
+        switch status {
+        case .busy: style.busy
+        case .waiting: style.waiting
+        case .idle: dimColor ?? style.idle
+        case .unknown: dimColor ?? style.faint
+        }
     }
 
     private var label: String {
@@ -367,63 +344,105 @@ private struct StatusIndicator: View {
         case .unknown: "Unknown"
         }
     }
-
-    private func startPulse() {
-        pulsing = false
-        guard status == .busy, !reduceMotion else { return }
-        withAnimation(.easeOut(duration: 1.3).repeatForever(autoreverses: false)) {
-            pulsing = true
-        }
-    }
 }
 
-// MARK: - Terminal badge
+/// Focus request in flight: a braille spinner, as CLI tools draw them.
+private struct BrailleSpinner: View {
+    @Environment(\.terminalStyle) private var style
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-private struct TerminalBadge: View {
-    let kind: TerminalKind
+    private static let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     var body: some View {
-        Group {
-            if let icon = TerminalIcons.icon(for: kind) {
-                Image(nsImage: icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 16, height: 16)
-            } else {
-                Image(systemName: "terminal")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 16, height: 16)
-            }
+        TimelineView(.periodic(from: .now, by: 0.08)) { context in
+            let tick = reduceMotion ? 0 : Int(context.date.timeIntervalSinceReferenceDate / 0.08)
+            Text(Self.frames[tick % Self.frames.count])
         }
-        .opacity(0.9)
-        .help(TerminalIcons.name(for: kind))
+        .foregroundStyle(style.foreground)
+        .accessibilityLabel("Focusing")
     }
 }
 
-@MainActor
-private enum TerminalIcons {
-    private static var cache: [String: NSImage?] = [:]
+// MARK: - Focus notice
 
-    static func name(for kind: TerminalKind) -> String {
-        switch kind {
-        case .ghostty: "Ghostty"
-        case .appleTerminal: "Terminal"
-        case .other(let name): name
+/// Compiler-style diagnostic at the bottom of the pane: `error:` in red for a failed focus,
+/// `note:` for informational outcomes.
+private struct FocusNoticeBanner: View {
+    let notice: FocusNotice
+    let onDismiss: () -> Void
+    let onOpenSettings: () -> Void
+
+    @Environment(\.terminalStyle) private var style
+
+    private var tint: Color { notice.isError ? style.failure : style.blue }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Rectangle().fill(notice.isError ? style.failure : style.divider).frame(height: 1)
+            VStack(alignment: .leading, spacing: style.lineHeight * 0.25) {
+                HStack(alignment: .top, spacing: 0) {
+                    Text(.span(notice.isError ? "error: " : "note: ", tint)
+                        + .span(notice.isError ? "couldn't focus \(notice.sessionTitle)" : notice.sessionTitle))
+                        .font(style.boldFont)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button(action: onDismiss) {
+                        Text("×")
+                            .foregroundStyle(style.faint)
+                            .frame(width: style.cellWidth * 2, height: style.lineHeight)
+                            .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
+                }
+                Text(notice.message)
+                    .foregroundStyle(style.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+                if notice.needsAutomationPermission {
+                    TerminalButton(title: "Open Automation Settings…", tint: tint, action: onOpenSettings)
+                        .padding(.top, style.lineHeight * 0.25)
+                }
+            }
+            .padding(.horizontal, style.paddingX)
+            .padding(.vertical, style.lineHeight * 0.5)
+            .background(tint.opacity(notice.isError ? 0.10 : 0.06))
         }
+        .accessibilityElement(children: .contain)
     }
+}
 
-    static func icon(for kind: TerminalKind) -> NSImage? {
-        let bundleID: String
-        switch kind {
-        case .ghostty: bundleID = "com.mitchellh.ghostty"
-        case .appleTerminal: bundleID = "com.apple.Terminal"
-        case .other: return nil
+/// A bracketed text button: `[ Open Automation Settings… ]`, inverse video on hover.
+private struct TerminalButton: View {
+    let title: String
+    let tint: Color
+    let action: () -> Void
+
+    @Environment(\.terminalStyle) private var style
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text("[ \(title) ]")
+                .font(style.boldFont)
+                .foregroundStyle(hovering ? style.background : tint)
+                .background(hovering ? tint : .clear)
+                .contentShape(.rect)
         }
-        if let cached = cache[bundleID] { return cached }
-        let image = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
-            .map { NSWorkspace.shared.icon(forFile: $0.path) }
-        cache[bundleID] = image
-        return image
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+extension AttributedString {
+    /// A run of text with optional color, font and (inverse-video) background, for building
+    /// multi-colored terminal lines.
+    static func span(
+        _ text: String, _ color: Color? = nil, font: Font? = nil, background: Color? = nil
+    ) -> AttributedString {
+        var run = AttributedString(text)
+        if let color { run.foregroundColor = color }
+        if let font { run.font = font }
+        if let background { run.backgroundColor = background }
+        return run
     }
 }

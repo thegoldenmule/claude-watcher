@@ -22,7 +22,7 @@ final class SidebarPanel: NSPanel {
         animationBehavior = .none
         backgroundColor = .clear
         isOpaque = false
-        hasShadow = false  // the glass shape draws its own shadow
+        hasShadow = true  // derived from the rounded pane's alpha; see invalidateShadow()
     }
 
     override var canBecomeKey: Bool { false }

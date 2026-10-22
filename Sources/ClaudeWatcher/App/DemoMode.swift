@@ -23,6 +23,10 @@ enum DemoMode {
     /// rows fail with the Automation-permission error, "other" terminals only activate the app.
     static func focusResult(for session: ClaudeSession) async -> FocusResult {
         try? await Task.sleep(for: .milliseconds(250))
+        return cannedResult(for: session)
+    }
+
+    static func cannedResult(for session: ClaudeSession) -> FocusResult {
         switch session.terminal {
         case .ghostty: return .focused
         case .appleTerminal:
@@ -32,7 +36,31 @@ enum DemoMode {
         }
     }
 
-    static let sessions: [ClaudeSession] = {
+    /// Screenshot helpers, demo only: `CW_DEMO_NOTICE=error|info` shows that banner at launch
+    /// (and keeps it up), `CW_DEMO_HOVER=<id>` / `CW_DEMO_PENDING=<id>` draw a row hovered or
+    /// with its focus spinner, `CW_DEMO_EMPTY=1` lists no sessions.
+    static var previewNoticeSession: ClaudeSession? {
+        guard isEnabled else { return nil }
+        switch ProcessInfo.processInfo.environment["CW_DEMO_NOTICE"] {
+        case "error": return allSessions.first { $0.terminal == .appleTerminal }
+        case "info": return allSessions.first { if case .other = $0.terminal { true } else { false } }
+        default: return nil
+        }
+    }
+
+    static var previewHoverID: String? {
+        isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_HOVER"] : nil
+    }
+
+    static var previewPendingID: String? {
+        isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_PENDING"] : nil
+    }
+
+    static var sessions: [ClaudeSession] {
+        ProcessInfo.processInfo.environment["CW_DEMO_EMPTY"] == "1" ? [] : allSessions
+    }
+
+    private static let allSessions: [ClaudeSession] = {
         let now = Date()
         func ago(_ minutes: Double) -> Date { now.addingTimeInterval(-minutes * 60) }
         let home = NSHomeDirectory()

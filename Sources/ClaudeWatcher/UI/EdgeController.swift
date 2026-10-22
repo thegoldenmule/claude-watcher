@@ -18,8 +18,10 @@ import SwiftUI
 @MainActor
 @Observable
 final class EdgeController {
-    static let panelWidth: CGFloat = 280
     static let edgeInset: CGFloat = 6
+
+    /// The user's Ghostty look; the panel's width follows its font.
+    let themeStore = ThemeStore()
 
     /// When true the panel stays visible on the primary screen and never auto-hides.
     var isPinned: Bool {
@@ -89,6 +91,7 @@ final class EdgeController {
     func start() {
         guard panel == nil else { return }
         let panel = SidebarPanel()
+        panel.appearance = themeStore.style.nsAppearance
         let host = FirstMouseHostingView(rootView: SidebarRoot(controller: self))
         host.sizingOptions = []  // the controller owns the frame
         panel.contentView = host
@@ -111,6 +114,14 @@ final class EdgeController {
             MainActor.assumeIsolated { self?.screensDidChange() }
         }
 
+        themeStore.onChange = { [weak self] in self?.themeDidChange() }
+        themeStore.start()
+
+        if let session = DemoMode.previewNoticeSession {
+            notice = FocusNotice(session: session, result: DemoMode.cannedResult(for: session))
+        }
+        pendingSessionID = DemoMode.previewPendingID
+
         if pinned { showPinned() }
     }
 
@@ -118,6 +129,7 @@ final class EdgeController {
     func stop() {
         monitors.forEach(NSEvent.removeMonitor)
         monitors = []
+        themeStore.stop()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
         hide(animated: false)
@@ -207,6 +219,19 @@ final class EdgeController {
         }
     }
 
+    /// New font/colors: re-theme the window and resize it in place if it's showing.
+    private func themeDidChange() {
+        guard let panel else { return }
+        panel.appearance = themeStore.style.nsAppearance
+        guard isVisible, let current = targetFrame,
+              let screen = NSScreen.screens.first(where: { $0.frame.intersects(current) })
+        else { return }
+        let target = frame(on: screen)
+        targetFrame = target
+        panel.setFrame(target, display: true)
+        panel.invalidateShadow()
+    }
+
     private func screensDidChange() {
         // Frames (and visibleFrame) may all have changed; never reuse a cached frame.
         policy.reset()
@@ -221,12 +246,13 @@ final class EdgeController {
         show(on: screen, animated: !isVisible)
     }
 
-    private static func frame(on screen: NSScreen) -> NSRect {
+    private func frame(on screen: NSScreen) -> NSRect {
         let vf = screen.visibleFrame
+        let edgeInset = Self.edgeInset
         return NSRect(
             x: vf.minX + edgeInset,
             y: vf.minY + edgeInset,
-            width: panelWidth,
+            width: themeStore.style.panelWidth,
             height: vf.height - 2 * edgeInset
         )
     }
@@ -235,7 +261,7 @@ final class EdgeController {
 
     private func show(on screen: NSScreen, animated: Bool) {
         guard let panel else { return }
-        let target = Self.frame(on: screen)
+        let target = frame(on: screen)
         let offscreen = target.offsetBy(dx: -(target.maxX - screen.frame.minX) - 2, dy: 0)
         targetFrame = target
         isVisible = true
@@ -245,6 +271,7 @@ final class EdgeController {
             panel.alphaValue = 1
             panel.setFrame(target, display: true)
             panel.orderFrontRegardless()
+            panel.invalidateShadow()
             return
         }
         if reduceMotion {
@@ -337,5 +364,6 @@ private struct SidebarRoot: View {
             onDismissNotice: { controller.dismissNotice() },
             onOpenAutomationSettings: { controller.openAutomationSettings() }
         )
+        .environment(\.terminalStyle, controller.themeStore.style)
     }
 }

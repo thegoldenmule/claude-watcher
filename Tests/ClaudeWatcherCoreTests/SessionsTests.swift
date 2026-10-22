@@ -527,3 +527,50 @@ private func hookStateJSON(
     let plain = SessionDiscovery(claudeHome: home.url, inspector: inspector)
     #expect(await plain.scan().allSatisfy { $0.ghosttyTerminalID == nil })
 }
+
+/// Rewrites a file in place (same inode), the way Claude Code updates `sessions/<pid>.json`.
+private func rewriteInPlace(_ url: URL, _ text: String) throws {
+    let handle = try FileHandle(forWritingTo: url)
+    try handle.truncate(atOffset: 0)
+    try handle.write(contentsOf: Data(text.utf8))
+    try handle.close()
+}
+
+@MainActor
+@Test func storePicksUpInPlaceStatusRewritesAndHookUpdatesQuickly() async throws {
+    let home = try TempHome()
+    let hookDir = home.url.appendingPathComponent("hook-state", isDirectory: true)
+    try FileManager.default.createDirectory(at: hookDir, withIntermediateDirectories: true)
+    let t0 = Date(timeIntervalSince1970: 1792681136)
+    let registry = home.url.appendingPathComponent("sessions/100.json")
+    try home.write("sessions/100.json", recordJSON(
+        pid: 100, sessionId: "s-100", cwd: "/x", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0), status: "idle"))
+    let inspector = FakeInspector(table: [
+        100: ProcessSnapshot(pid: 100, ppid: 103, startTime: t0, tty: "/dev/ttys001", executablePath: claudeBinary),
+        103: ProcessSnapshot(pid: 103, ppid: 1, startTime: t0, executablePath: ghosttyBinary),
+    ])
+    // Long poll interval: only the vnode sources can deliver updates in time.
+    let store = SessionStore(
+        claudeHome: home.url, hookStateDirectory: hookDir, inspector: inspector, pollInterval: .seconds(60))
+    store.start()
+    defer { store.stop() }
+    for _ in 0..<40 where store.sessions.isEmpty { try await Task.sleep(for: .milliseconds(25)) }
+    #expect(store.sessions.first?.status == .idle)
+    let inode = try FileManager.default.attributesOfItem(atPath: registry.path)[.systemFileNumber] as? Int
+
+    try rewriteInPlace(registry, recordJSON(
+        pid: 100, sessionId: "s-100", cwd: "/x", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0), status: "busy"))
+    #expect(try FileManager.default.attributesOfItem(atPath: registry.path)[.systemFileNumber] as? Int == inode)
+    for _ in 0..<40 where store.sessions.first?.status != .busy { try await Task.sleep(for: .milliseconds(25)) }
+    #expect(store.sessions.first?.status == .busy)
+
+    try Data(hookStateJSON(
+        sessionID: "s-100", pid: 100, tty: "/dev/ttys001", ghosttyID: "GID-100", updatedAt: t0.addingTimeInterval(5)
+    ).utf8).write(to: hookDir.appendingPathComponent("s-100.json"), options: .atomic)
+    for _ in 0..<40 where store.sessions.first?.ghosttyTerminalID == nil {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    #expect(store.sessions.first?.ghosttyTerminalID == "GID-100")
+}

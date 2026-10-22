@@ -6,6 +6,9 @@ import Observation
 /// Change notification:
 /// - vnode sources on `~/.claude/sessions` and the hook-state directory catch files being
 ///   created, deleted or atomically replaced (the hook writes temp + rename);
+/// - one vnode source per live session's `<pid>.json` catches in-place rewrites: Claude Code
+///   rewrites the registry file in place on every status change (same inode since the session
+///   started; the directory's mtime doesn't move), which a directory source never sees;
 /// - a `pollInterval` poll is the safety net (process exit, transcripts, missing directories).
 /// Discovery runs off the main actor; `sessions` is only assigned when it changes.
 @MainActor
@@ -93,6 +96,7 @@ public final class SessionStore {
 
     private func apply(_ result: [ClaudeSession]) {
         if result != sessions { sessions = result }
+        syncRegistryFileWatchers()
     }
 
     // MARK: - Watchers
@@ -103,6 +107,21 @@ public final class SessionStore {
 
     private func installDirectoryWatchers() {
         for dir in watchedDirectories { watch(path: dir.path, events: [.write, .delete, .rename, .extend, .attrib]) }
+    }
+
+    /// Watches exactly the registry files of the sessions currently listed.
+    private func syncRegistryFileWatchers() {
+        guard running else { return }
+        let dirPaths = Set(watchedDirectories.map(\.path))
+        let wanted = Set(sessions.map {
+            discovery.sessionsDirectory.appendingPathComponent("\($0.pid).json").path
+        })
+        for (path, source) in sources where !dirPaths.contains(path) && !wanted.contains(path) {
+            source.cancel()
+            sources[path] = nil
+        }
+        // No .attrib: our own reads could touch atime and loop.
+        for path in wanted { watch(path: path, events: [.write, .extend, .delete, .rename]) }
     }
 
     /// Installs a vnode source on `path` (file or directory) that triggers `refresh()`. If the

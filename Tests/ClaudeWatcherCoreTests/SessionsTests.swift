@@ -5,7 +5,7 @@ import Testing
 // MARK: - Fixtures
 
 private let sampleRecordJSON = """
-{"pid":5004,"sessionId":"7b25c51d-d0b9-4471-81ec-ae45057b535d","cwd":"/Users/me/projects/claude-watcher",\
+{"pid":5004,"sessionId":"00000000-0000-4000-8000-000000000001","cwd":"/Users/me/projects/claude-watcher",\
 "startedAt":1792681139260,"procStart":"Thu Oct 22 14:58:56 2026","version":"2.1.306","peerProtocol":1,\
 "peerFeatures":["notify_idle"],"kind":"interactive","entrypoint":"cli","pidDomain":"darwin",\
 "messagingSocketPath":"/tmp/cc-socks/5004.sock","name":"claude-watcher-6d","nameSource":"derived",\
@@ -76,7 +76,7 @@ private let terminalBinary = "/System/Applications/Utilities/Terminal.app/Conten
 @Test func parsesSessionRecordSample() throws {
     let record = try #require(SessionRecord.parse(Data(sampleRecordJSON.utf8)))
     #expect(record.pid == 5004)
-    #expect(record.sessionId == "7b25c51d-d0b9-4471-81ec-ae45057b535d")
+    #expect(record.sessionId == "00000000-0000-4000-8000-000000000001")
     #expect(record.cwd == "/Users/me/projects/claude-watcher")
     #expect(record.kind == "interactive")
     #expect(record.isInteractive)

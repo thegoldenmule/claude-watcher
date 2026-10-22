@@ -2,9 +2,9 @@
 # Build, sign, notarize and publish a ClaudeWatcher release.
 #
 #   make release VERSION=1.2.3                      # full release
-#   make release VERSION=1.2.3 DRY_RUN=1            # Developer ID-signed zip only; nothing
-#                                                   # notarized, committed or published
-#   make release VERSION=1.2.3 DRY_RUN=1 NOTARIZE=1 # signed, notarized and stapled zip;
+#   make release VERSION=1.2.3 DRY_RUN=1            # Developer ID-signed DMG + zip only;
+#                                                   # nothing notarized, committed or published
+#   make release VERSION=1.2.3 DRY_RUN=1 NOTARIZE=1 # signed, notarized and stapled DMG + zip;
 #                                                   # nothing committed or published
 #
 # Mirrors claude-tray's scripts/release.sh. The app is built by scripts/build-app.sh with
@@ -19,6 +19,13 @@
 # is needed. The account needs the Account Holder or Admin role (with access to
 # cloud-managed Developer ID certificates) on the team.
 #
+# Assets: ClaudeWatcher-X.Y.Z.dmg (drag-to-Applications window, built by
+# scripts/build-dmg.sh), ClaudeWatcher-X.Y.Z.zip (the same stapled app, for scripted
+# installs), and ClaudeWatcher-X.Y.Z.sha256 covering both. The DMG itself is unsigned: the
+# cloud-managed certificate can only sign through xcodebuild's export, which handles app
+# archives, not disk images. Gatekeeper mounts an unsigned DMG without a prompt and checks
+# the notarized, stapled app inside on first launch.
+#
 # Environment:
 #   VERSION          required. X.Y.Z (a dry run also accepts X.Y.Z-suffix).
 #   DRY_RUN=1        sign with Developer ID and package, but skip the version commit/tag,
@@ -28,6 +35,8 @@
 #   SCRATCH_PATH     SwiftPM scratch dir for the release build. Default: .build-release.
 #   TEAM_ID          Apple developer team. Default: QKMK66X2FU.
 #   NOTARY_TIMEOUT   seconds to wait for notarization. Default: 1800.
+#   PYTHON           Python 3.10+ for dmgbuild (see scripts/build-dmg.sh); its venv lives in
+#                    $SCRATCH_PATH/dmgbuild-venv.
 #
 # Build number (CFBundleVersion): the number of commits on main including the release
 # commit (`git rev-list --count HEAD` + 1), bumped past the current value if that would
@@ -89,17 +98,21 @@ TAG_CREATED=0
 PUSH_ATTEMPTED=0
 PUSHED=0
 RELEASED=0
+VERIFY_MOUNT=""  # the DMG verification mount point while it is attached
 
 # Prints the command that finishes a release whose commit and tag are on origin.
 finish_hint() {
     cat >&2 <<EOF
-    gh release create $TAG $ZIP_PATH $SUM_PATH --repo $GH_REPO --verify-tag \\
+    gh release create $TAG $DMG_PATH $ZIP_PATH $SUM_PATH --repo $GH_REPO --verify-tag \\
         --title "$APP_NAME $VERSION" --generate-notes --notes-file $NOTES_PATH
 EOF
 }
 
 on_exit() {
     local rc=$?
+    if [[ -n "$VERIFY_MOUNT" ]]; then
+        hdiutil detach -force -quiet "$VERIFY_MOUNT" 2>/dev/null || true
+    fi
     [[ $rc -eq 0 ]] && return
 
     if [[ $RELEASED -eq 1 ]]; then
@@ -118,7 +131,7 @@ on_exit() {
 ${RED}git push failed and origin could not be checked;${RESET} left the release commit
 ${RELEASE_SHA:0:7} and tag $TAG in place. Check with: git ls-remote origin refs/tags/$TAG
   - if it prints ${TAG_OBJ:0:7}... (or ${RELEASE_SHA:0:7}...), the push went through. Finish it
-    with the notarized zip in $DIST_DIR/:
+    with the notarized DMG and zip in $DIST_DIR/:
 EOF
             finish_hint
             cat >&2 <<EOF
@@ -141,7 +154,7 @@ EOF
     fi
 
     if [[ $PUSHED -eq 1 ]]; then
-        printf '\n%sRelease failed after %s was pushed.%s The notarized zip is in %s/.\nFinish publishing by hand:\n' \
+        printf '\n%sRelease failed after %s was pushed.%s The notarized DMG and zip are in %s/.\nFinish publishing by hand:\n' \
             "$RED" "$TAG" "$RESET" "$DIST_DIR" >&2
         finish_hint
         return
@@ -183,9 +196,9 @@ trap 'exit 130' INT TERM
 
 step "Preflight"
 if [[ $DRY_RUN -eq 1 && $NOTARIZE -eq 1 ]]; then
-    info "${YELLOW}DRY RUN${RESET}: builds a signed, notarized and stapled zip; no commit, tag, push or release."
+    info "${YELLOW}DRY RUN${RESET}: builds a signed, notarized and stapled DMG + zip; no commit, tag, push or release."
 elif [[ $DRY_RUN -eq 1 ]]; then
-    info "${YELLOW}DRY RUN${RESET}: builds a Developer ID-signed zip; no commit, tag, notarization, push or release."
+    info "${YELLOW}DRY RUN${RESET}: builds a Developer ID-signed DMG + zip; no commit, tag, notarization, push or release."
 fi
 
 [[ -n "$VERSION" ]] || die "VERSION is required, e.g.: make release VERSION=1.2.3"
@@ -200,9 +213,18 @@ fi
 TAG="v$VERSION"
 ok "version $VERSION (tag $TAG)"
 
-for tool in swift codesign xcodebuild xcrun ditto git gh shasum lipo spctl "$PLISTBUDDY"; do
+for tool in swift codesign xcodebuild xcrun ditto hdiutil git gh shasum lipo spctl "$PLISTBUDDY"; do
     command -v "$tool" >/dev/null || die "required tool not found: $tool"
 done
+# scripts/build-dmg.sh installs dmgbuild with Python 3.10+ (not macOS's 3.9), using the same
+# candidates as here; check now rather than after notarizing.
+HAVE_PY310=0
+for py in ${PYTHON:-} python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if "$py" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+        HAVE_PY310=1; break
+    fi
+done
+[[ $HAVE_PY310 -eq 1 ]] || die "the DMG build (dmgbuild) needs Python 3.10+: brew install python, or set PYTHON"
 
 # owner/name from origin (git@github.com:o/n.git, https://github.com/o/n, ssh://...), so gh
 # targets origin even if another remote or GH_REPO would make it guess differently.
@@ -301,11 +323,12 @@ ARCHIVE_PATH="$WORK_DIR/$APP_NAME.xcarchive"
 ARCHIVED_APP="$ARCHIVE_PATH/Products/Applications/$APP_NAME.app"
 EXPORT_DIR="$WORK_DIR/export"         # Developer ID-signed app (dry run without NOTARIZE)
 NOTARIZED_DIR="$WORK_DIR/notarized"   # notarized, stapled app
+DMG_PATH="$DIST_DIR/$APP_NAME-$VERSION.dmg"
 ZIP_PATH="$DIST_DIR/$APP_NAME-$VERSION.zip"
-SUM_PATH="$ZIP_PATH.sha256"
+SUM_PATH="$DIST_DIR/$APP_NAME-$VERSION.sha256"   # covers the DMG and the zip
 NOTES_PATH="$DIST_DIR/release-notes-$VERSION.md"
 LOG_PATH="$WORK_DIR/xcodebuild.log"
-rm -rf "$WORK_DIR" "$ZIP_PATH" "$SUM_PATH"
+rm -rf "$WORK_DIR" "$DMG_PATH" "$ZIP_PATH" "$SUM_PATH"
 mkdir -p "$WORK_DIR"
 
 step "Build universal app bundle"
@@ -469,16 +492,22 @@ ok "entitlements: com.apple.security.automation.apple-events"
 
 # ---------------------------------------------------------------- package + verify
 
-# A zip of the stapled app rather than a DMG: the cloud-managed certificate can't sign a
-# disk image locally, and Gatekeeper rejects an unsigned, unnotarized DMG ("no usable
-# signature"). A zip isn't assessed itself; the app inside carries its own ticket.
+step "Package $DMG_PATH"
+# Unsigned on purpose (see the header). Never sign it with a non-Developer ID identity:
+# Gatekeeper then refuses to open it ("Not Opened ... could not verify").
+if ! DMG_VENV="$SCRATCH_PATH/dmgbuild-venv" scripts/build-dmg.sh "$APP_PATH" "$DMG_PATH" 2>&1 \
+    | sed 's/^/    /'; then
+    die "scripts/build-dmg.sh failed"
+fi
+ok "created $DMG_PATH ($(du -h "$DMG_PATH" | awk '{print $1}'))"
+
 step "Package $ZIP_PATH"
 ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
 ok "created $ZIP_PATH ($(du -h "$ZIP_PATH" | awk '{print $1}'))"
 
 step "Verify as a download"
-# Mark a copy as downloaded by Safari, extract it, and assess the result like Gatekeeper
-# would on first launch. Expected to be rejected in a dry run (not notarized).
+# Mark copies as downloaded by Safari, mount / extract them, and assess the app inside like
+# Gatekeeper would on first launch. Expected to be rejected in a dry run (not notarized).
 gatekeeper() {
     if "$@" 2>&1 | sed 's/^/    /'; [[ ${PIPESTATUS[0]} -eq 0 ]]; then
         return 0
@@ -488,40 +517,67 @@ gatekeeper() {
         die "Gatekeeper rejected: $*"
     fi
 }
+quarantine() { xattr -w com.apple.quarantine "0083;$(printf %x "$(date +%s)");Safari;" "$1"; }
+verify_app() {   # $1 = app bundle, $2 = where it came from (for messages)
+    codesign --verify --deep --strict "$1"
+    ok "$2: app signature verifies"
+    [[ -x "$1/$HOOK_SCRIPT" ]] || die "$2: app is missing an executable $HOOK_SCRIPT"
+    ok "$2: hook script is executable"
+    gatekeeper spctl -a -vv -t exec "$1"
+    if [[ $NOTARIZE -eq 1 ]]; then
+        xcrun stapler validate -q "$1" || die "$2: app has no stapled ticket"
+        ok "$2: app has a stapled ticket"
+        if command -v syspolicy_check >/dev/null; then
+            syspolicy_check distribution "$1" 2>&1 | sed 's/^/    /' \
+                || die "$2: syspolicy_check distribution failed"
+        fi
+    fi
+}
 VERIFY_DIR="$WORK_DIR/verify"
-rm -rf "$VERIFY_DIR" && mkdir -p "$VERIFY_DIR/extracted"
+rm -rf "$VERIFY_DIR" && mkdir -p "$VERIFY_DIR/extracted" "$VERIFY_DIR/mnt"
+
+# DMG: must be unsigned (a foreign signature blocks opening it), hold the app and an
+# Applications symlink, and the app inside must pass like the notarized app itself.
+cp "$DMG_PATH" "$VERIFY_DIR/"
+VERIFY_DMG="$VERIFY_DIR/$(basename "$DMG_PATH")"
+quarantine "$VERIFY_DMG"
+if codesign -d "$VERIFY_DMG" >/dev/null 2>&1; then
+    die "$DMG_PATH is signed; Gatekeeper refuses to open a disk image signed with anything but a notarized Developer ID"
+fi
+ok "dmg: unsigned (the app inside carries the signature and ticket)"
+hdiutil attach -quiet -readonly -nobrowse -noautoopen -mountpoint "$VERIFY_DIR/mnt" "$VERIFY_DMG"
+VERIFY_MOUNT="$VERIFY_DIR/mnt"
+[[ -d "$VERIFY_MOUNT/$APP_NAME.app" ]] || die "dmg does not contain $APP_NAME.app at its root"
+[[ "$(readlink "$VERIFY_MOUNT/Applications")" == /Applications ]] \
+    || die "dmg is missing the Applications -> /Applications symlink"
+[[ -f "$VERIFY_MOUNT/.DS_Store" && -f "$VERIFY_MOUNT/.background.tiff" ]] \
+    || die "dmg is missing its window layout (.DS_Store / .background.tiff)"
+ok "dmg: app, Applications symlink and window layout present"
+verify_app "$VERIFY_MOUNT/$APP_NAME.app" dmg
+hdiutil detach -quiet "$VERIFY_MOUNT"
+VERIFY_MOUNT=""
+
+# Zip: extracted copy.
 cp "$ZIP_PATH" "$VERIFY_DIR/"
-xattr -w com.apple.quarantine "0083;$(printf %x "$(date +%s)");Safari;" "$VERIFY_DIR/$(basename "$ZIP_PATH")"
+quarantine "$VERIFY_DIR/$(basename "$ZIP_PATH")"
 ditto -x -k "$VERIFY_DIR/$(basename "$ZIP_PATH")" "$VERIFY_DIR/extracted"
 EXTRACTED_APP="$VERIFY_DIR/extracted/$APP_NAME.app"
 [[ -d "$EXTRACTED_APP" ]] || die "zip does not contain $APP_NAME.app at its root"
-xattr -p com.apple.quarantine "$EXTRACTED_APP" >/dev/null 2>&1 \
-    || xattr -w com.apple.quarantine "0083;$(printf %x "$(date +%s)");Safari;" "$EXTRACTED_APP"
-codesign --verify --deep --strict "$EXTRACTED_APP"
-ok "extracted app signature verifies"
-[[ -x "$EXTRACTED_APP/$HOOK_SCRIPT" ]] || die "extracted app is missing an executable $HOOK_SCRIPT"
-ok "extracted hook script is executable"
-gatekeeper spctl -a -vv -t exec "$EXTRACTED_APP"
-if [[ $NOTARIZE -eq 1 ]]; then
-    xcrun stapler validate -q "$EXTRACTED_APP" || die "extracted app has no stapled ticket"
-    ok "extracted app has a stapled ticket"
-    if command -v syspolicy_check >/dev/null; then
-        syspolicy_check distribution "$EXTRACTED_APP" 2>&1 | sed 's/^/    /' \
-            || die "syspolicy_check distribution failed"
-    fi
-fi
+xattr -p com.apple.quarantine "$EXTRACTED_APP" >/dev/null 2>&1 || quarantine "$EXTRACTED_APP"
+verify_app "$EXTRACTED_APP" zip
 rm -rf "$VERIFY_DIR"
 
-(cd "$DIST_DIR" && shasum -a 256 "$(basename "$ZIP_PATH")" >"$(basename "$SUM_PATH")")
-ok "sha256 $(awk '{print $1}' "$SUM_PATH")"
+(cd "$DIST_DIR" && shasum -a 256 "$(basename "$DMG_PATH")" "$(basename "$ZIP_PATH")" >"$(basename "$SUM_PATH")")
+sed 's/^/    sha256 /' "$SUM_PATH"
 
 # ---------------------------------------------------------------- publish
 
 cat >"$NOTES_PATH" <<EOF
 ## Install
 
-1. Download \`$APP_NAME-$VERSION.zip\` below and unzip it (Safari does this automatically).
-2. Move **$APP_NAME.app** to your **Applications** folder.
+1. Download \`$APP_NAME-$VERSION.dmg\` below and open it.
+2. Drag **$APP_NAME** onto the **Applications** folder in the window that opens, then eject
+   the disk image.
 3. Open $APP_NAME from Applications. It appears in the menu bar; the sidebar slides in from
    the left screen edge.
 4. Optional: choose **Claude Code Hook > Install** in its menu for faster, more reliable
@@ -529,18 +585,19 @@ cat >"$NOTES_PATH" <<EOF
 
 Requires macOS 26 or later, [Claude Code](https://claude.com/claude-code), and Ghostty 1.3+
 or Terminal.app. macOS asks for Automation access to your terminal the first time you click
-a session. The app is signed with Developer ID and notarized by Apple. Verify the download
-with \`shasum -a 256 -c $APP_NAME-$VERSION.zip.sha256\`.
+a session. The app is signed with Developer ID and notarized by Apple.
+\`$APP_NAME-$VERSION.zip\` holds the same app for scripted installs. Verify a download with
+\`shasum -a 256 -c --ignore-missing $APP_NAME-$VERSION.sha256\`.
 EOF
 
 step "Publish"
 if [[ $DRY_RUN -eq 1 ]]; then
     skip "git push --atomic origin main $TAG"
-    skip "gh release create $TAG $ZIP_PATH $SUM_PATH --repo $GH_REPO --title \"$APP_NAME $VERSION\" --generate-notes (notes: $NOTES_PATH)"
+    skip "gh release create $TAG $DMG_PATH $ZIP_PATH $SUM_PATH --repo $GH_REPO --title \"$APP_NAME $VERSION\" --generate-notes (notes: $NOTES_PATH)"
     if [[ $NOTARIZE -eq 1 ]]; then
-        printf '\n%sDry run complete.%s Signed, notarized and stapled zip: %s\n' "$GREEN" "$RESET" "$ZIP_PATH"
+        printf '\n%sDry run complete.%s Signed, notarized and stapled DMG + zip: %s, %s\n' "$GREEN" "$RESET" "$DMG_PATH" "$ZIP_PATH"
     else
-        printf '\n%sDry run complete.%s Developer ID-signed (not notarized) zip: %s\n' "$GREEN" "$RESET" "$ZIP_PATH"
+        printf '\n%sDry run complete.%s Developer ID-signed (not notarized) DMG + zip: %s, %s\n' "$GREEN" "$RESET" "$DMG_PATH" "$ZIP_PATH"
     fi
     exit 0
 fi
@@ -549,7 +606,7 @@ PUSH_ATTEMPTED=1
 git push --atomic origin main "$TAG"
 PUSHED=1
 ok "pushed main and $TAG"
-gh release create "$TAG" "$ZIP_PATH" "$SUM_PATH" --repo "$GH_REPO" --verify-tag \
+gh release create "$TAG" "$DMG_PATH" "$ZIP_PATH" "$SUM_PATH" --repo "$GH_REPO" --verify-tag \
     --title "$APP_NAME $VERSION" --generate-notes --notes-file "$NOTES_PATH"
 RELEASED=1
 RELEASE_URL="$(gh release view "$TAG" --repo "$GH_REPO" --json url -q .url 2>/dev/null || true)"

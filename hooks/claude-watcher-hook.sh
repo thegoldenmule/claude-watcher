@@ -141,12 +141,13 @@ main() {
 # pid, adopt their Ghostty id when the tty matches, and delete the live ones.
 # Uses caller's: sid, claude_pid, tty, ghostty_id.
 supersede_same_pid() {
-  local dir=$1 f content
+  local dir=$1 f content tty_json=null
+  [[ -n $tty ]] && tty_json="\"$tty\""
   for f in $dir/[^.]*.(json|ended)(N); do
     [[ ${f:t:r} == $sid ]] && [[ $f == *.json ]] && continue
     content=$(<"$f")
     [[ $content == *\"claude_pid\":${claude_pid}[,}]* ]] || continue
-    if [[ -z $ghostty_id && -n $tty && $content == *\"tty\":\"$tty\"* ]]; then
+    if [[ -z $ghostty_id && $content == *\"tty\":${tty_json}[,}]* ]]; then
       ghostty_id=$(json_string_value "$content" ghostty_terminal_id)
     fi
     [[ $f == *.json ]] && zf_rm -f "$f"

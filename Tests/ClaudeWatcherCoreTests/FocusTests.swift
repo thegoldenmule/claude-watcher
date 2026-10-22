@@ -508,13 +508,24 @@ private func nonceRunner(_ id: String) -> FakeRunner {
 
 @Test func probeLockWaitsBoundedThenSkips() async throws {
     let dir = tempDir()
-    let lock = OSC7ProbeLock(directory: dir, maxWait: .milliseconds(150), pollInterval: .milliseconds(25))
+    let maxWait = Duration.milliseconds(150), poll = Duration.milliseconds(25)
+    let lock = OSC7ProbeLock(directory: dir, maxWait: maxWait, pollInterval: poll)
     let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
 
+    // The loop overshoots `maxWait` by at most one poll, but each poll is a `Task.sleep` whose
+    // resumption needs a free cooperative thread. In full-suite runs, synchronous tests (bash
+    // subprocesses, `Thread.sleep`) can occupy the whole pool, and a single 25 ms sleep has been
+    // seen resuming ~1 s late. So bound the wait with scheduling slack, and use a backstop that
+    // releases the lock (off the pool) if the waiter is still waiting long past that: a waiter
+    // that ignored its deadline would then return the lock instead of nil (and not hang the test).
+    let gaveUp = DispatchSemaphore(value: 0)
+    Thread { if gaveUp.wait(timeout: .now() + 5) == .timedOut { held.release() } }.start()
     let start = ContinuousClock.now
     #expect(await lock.acquire(tty: "/dev/ttys001") == nil)
     let elapsed = ContinuousClock.now - start
-    #expect(elapsed >= .milliseconds(150) && elapsed < .seconds(1))
+    gaveUp.signal()
+    #expect(elapsed >= maxWait)
+    #expect(elapsed < maxWait + poll + .milliseconds(2500))
 
     // Released mid-wait: the waiter gets it.
     let releaser = Task.detached { try? await Task.sleep(for: .milliseconds(50)); held.release() }

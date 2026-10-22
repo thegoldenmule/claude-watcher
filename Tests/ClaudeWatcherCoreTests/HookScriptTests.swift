@@ -295,6 +295,24 @@ import Testing
         #expect(!env.exists("gc-other.json"))
     }
 
+    /// A relative script is relative to node's cwd, which the hook doesn't know, so (like
+    /// ProcessRules.isClaudeNodeArgv) it is never realpathed, even when the hook runs in a
+    /// directory where it would resolve into the package. An absolute one still is.
+    @Test func realpathsOnlyAbsoluteNodeScripts() async throws {
+        let env = try Env(noJQ: false)
+        let node = try FakeNode()
+        let relative = try node.spawn(["-f", "bin/cc"])
+        let absolute = try node.spawn(["-f", "$ROOT/bin/cc"])
+        try await Task.sleep(for: .seconds(0.2))
+        for (sid, pid) in [("rel", relative), ("abs", absolute)] {
+            try await env.run(Self.input(sid, "SessionStart"), extraEnv: [
+                "CLAUDE_WATCHER_CLAUDE_PID": "", "CLAUDE_WATCHER_WALK_FROM": String(pid),
+            ], cwd: node.root)
+        }
+        #expect(try env.state("rel")?.claudePID != relative)
+        #expect(try env.state("abs")?.claudePID == absolute)
+    }
+
     // MARK: Hook version 1 migration (Ghostty id inline in <sid>.json)
 
     /// Rewrites `<sid>.json` as hook version 1 wrote it: with the id inline.

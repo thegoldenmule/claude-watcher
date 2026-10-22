@@ -490,7 +490,8 @@ find_claude() {
 # Homebrew's cask runs Caskroom/claude-code/…/claude. npm installs run node on the package:
 # argv is "node /opt/homebrew/bin/claude …", where bin/claude is a symlink to
 # …/@anthropic-ai/claude-code/cli.js, so for node look at the script (first non-option arg,
-# or the one right after `--`, like Swift's ProcessRules.nodeScript).
+# or the one right after `--`, like Swift's ProcessRules.nodeScript): named claude or, if
+# absolute, resolving into the package.
 is_claude_process() {
   local ucomm=$1 args=$2 a dashdash=0
   [[ $ucomm == claude || $ucomm == <->.<->.<->* || ${${args%% *}:t} == claude \
@@ -501,7 +502,8 @@ is_claude_process() {
       [[ $a == -- ]] && { dashdash=1; continue }
       [[ $a == -* ]] && continue
     fi
-    [[ ${a:t} == claude || ${a:A} == *@anthropic-ai/claude-code* ]]
+    # Realpath only absolute scripts: a relative one is relative to node's cwd, not ours.
+    [[ ${a:t} == claude || ( $a == /* && ${a:A} == *@anthropic-ai/claude-code* ) ]]
     return
   done
   return 1

@@ -168,18 +168,31 @@ public enum ProcessRules {
     /// links `bin/claude` to `…/@anthropic-ai/claude-code/cli.js` (`#!/usr/bin/env node`), so
     /// the kernel's argv is `["node", "/opt/homebrew/bin/claude", …]`: the symlink, not the
     /// package path. If Claude sets `process.title`, libuv rewrites argv to `["claude", …]`.
-    /// Accepts argv[0] or argv[1] named `claude`, an absolute argv[1] whose real path is in the
-    /// package, or any argument naming the package literally (`node …/cli.js`).
+    /// Accepts argv[0] named `claude`, any argument naming the package literally
+    /// (`node …/cli.js`), or a script (the first argument after node's `-` options, or the one
+    /// after `--`) named `claude` or, if absolute, whose real path is in the package.
     static func isClaudeNodeArgv(_ argv: [String], resolvePath: (String) -> String?) -> Bool {
         guard let first = argv.first else { return false }
         if argv.contains(where: { $0.contains(npmPackage) }) { return true }
         if (first as NSString).lastPathComponent == "claude" { return true }
-        guard argv.count > 1 else { return false }
-        let script = argv[1]
+        guard let script = nodeScript(argv) else { return false }
         if (script as NSString).lastPathComponent == "claude" { return true }
         // Relative paths are relative to the process's cwd, which we don't know.
         guard script.hasPrefix("/"), let real = resolvePath(script) else { return false }
         return real.contains(npmPackage)
+    }
+
+    /// The script node runs: the first argument after argv[0] that isn't a `-` option, or
+    /// the argument following `--`. Option values given as separate words (`-r mod`) aren't
+    /// recognised; the hook makes the same approximation.
+    static func nodeScript(_ argv: [String]) -> String? {
+        var rest = argv.dropFirst()
+        while let arg = rest.first {
+            rest = rest.dropFirst()
+            if arg == "--" { return rest.first }
+            if !arg.hasPrefix("-") { return arg }
+        }
+        return nil
     }
 
     /// `realpath(3)`: the canonical path with every symlink resolved, or nil if it fails.

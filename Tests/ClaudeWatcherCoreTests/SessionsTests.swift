@@ -293,6 +293,14 @@ private let transcriptSample = """
     // Explicit `node …/cli.js` still matches by package path.
     #expect(live("/opt/homebrew/bin/node",
                  argv: ["node", "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"]))
+    // node's own options before the script are skipped; `--` ends them.
+    #expect(live("/opt/homebrew/bin/node", argv: ["node", "--no-warnings", "/opt/homebrew/bin/claude"]))
+    #expect(live("/opt/homebrew/bin/node",
+                 argv: ["node", "--max-old-space-size=4096", "--enable-source-maps", "/usr/local/bin/claude", "-c"]))
+    #expect(live("/opt/homebrew/bin/node", argv: ["node", "--", "/opt/homebrew/bin/claude"]))
+    #expect(!live("/opt/homebrew/bin/node", argv: ["node", "--no-warnings", "server.js", "claude"]))
+    #expect(!live("/opt/homebrew/bin/node", argv: ["node", "--", "--x", "/opt/homebrew/bin/claude"]))
+    #expect(!live("/opt/homebrew/bin/node", argv: ["node", "--no-warnings"]))
     // Plain node, or node whose argv is unreadable: rejected.
     #expect(!live("/opt/homebrew/bin/node", argv: ["node", "server.js"]))
     #expect(!live("/opt/homebrew/bin/node", argv: nil))
@@ -332,6 +340,9 @@ private let transcriptSample = """
     #expect(ProcessRules.isClaudeExecutable(node, arguments: { ["node", cc] }))
     #expect(!ProcessRules.isClaudeExecutable(node, arguments: { ["node", tool] }))
     #expect(!ProcessRules.isClaudeExecutable(node, arguments: { ["node", root.appendingPathComponent("bin/missing").path] }))
+    // The script after node's options is resolved too.
+    #expect(ProcessRules.isClaudeExecutable(node, arguments: { ["node", "--no-warnings", cc, "--resume"] }))
+    #expect(!ProcessRules.isClaudeExecutable(node, arguments: { ["node", "--no-warnings", tool] }))
     // Relative script paths aren't resolved (they're relative to the target's cwd).
     var resolved = false
     #expect(!ProcessRules.isClaudeExecutable(
@@ -477,12 +488,9 @@ private let transcriptSample = """
 
 @Test func resolvesClaudeHome() {
     let home = "/Users/me"
-    let existing: Set<String> = ["/Users/me/cfg", "/opt/claude", "/Users/me"]
-    func resolve(env: [String: String] = [:], launchctl: String? = nil, shell: String? = nil,
-                 exists: Set<String> = existing) -> String {
+    func resolve(env: [String: String] = [:], launchctl: String? = nil, shell: String? = nil) -> String {
         SessionDiscovery.resolveClaudeHome(
-            env: env, launchctlValue: launchctl, shellValue: shell, home: home,
-            fileExists: { exists.contains($0) }).path
+            env: env, launchctlValue: launchctl, shellValue: shell, home: home).path
     }
     // Nothing set: ~/.claude.
     #expect(resolve() == "/Users/me/.claude")
@@ -496,10 +504,12 @@ private let transcriptSample = """
     #expect(resolve(shell: "~/cfg") == "/Users/me/cfg")
     #expect(resolve(launchctl: "~") == "/Users/me")
     #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "~/cfg/"]) == "/Users/me/cfg")
-    // Chosen directory missing (or relative): ~/.claude.
-    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "/gone"], shell: "/Users/me/cfg") == "/Users/me/.claude")
-    #expect(resolve(shell: "~/nope") == "/Users/me/.claude")
+    // A configured directory that doesn't exist yet is still honoured (watchers cope).
+    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "/gone"], shell: "/Users/me/cfg") == "/gone")
+    #expect(resolve(shell: "~/nope") == "/Users/me/nope")
+    // Relative values can't be resolved: ~/.claude.
     #expect(resolve(shell: "cfg") == "/Users/me/.claude")
+    #expect(resolve(env: ["CLAUDE_CONFIG_DIR": "cfg"], shell: "/Users/me/cfg") == "/Users/me/.claude")
 }
 
 @Test func claudeHomeProbesAreLazy() {
@@ -508,11 +518,11 @@ private let transcriptSample = """
     func shell() -> String? { shellCalls += 1; return nil }
     _ = SessionDiscovery.resolveClaudeHome(
         env: ["CLAUDE_CONFIG_DIR": "/opt/claude"], launchctlValue: launchctl(), shellValue: shell(),
-        home: "/Users/me", fileExists: { _ in true })
+        home: "/Users/me")
     #expect(launchctlCalls == 0 && shellCalls == 0)
     _ = SessionDiscovery.resolveClaudeHome(
         env: [:], launchctlValue: launchctl(), shellValue: shell(),
-        home: "/Users/me", fileExists: { _ in true })
+        home: "/Users/me")
     #expect(launchctlCalls == 1 && shellCalls == 0)
 }
 
@@ -522,6 +532,10 @@ private let transcriptSample = """
     #expect(ClaudeHome.markedValue("junk without newline\(m)/a\n") == "/a")
     #expect(ClaudeHome.markedValue("\n\(m)\n") == "")
     #expect(ClaudeHome.markedValue("no marker at all\n") == nil)
+    #expect(ClaudeHome.hasMarkedLine("junk\n\(m)/a\nbye"))
+    #expect(ClaudeHome.hasMarkedLine("\(m)\n"))
+    #expect(!ClaudeHome.hasMarkedLine("junk\n\(m)/a"))
+    #expect(!ClaudeHome.hasMarkedLine("no marker\n"))
 }
 
 @Test func claudeHomeProbeRunnerIsBounded() {
@@ -530,10 +544,28 @@ private let transcriptSample = """
     #expect(ClaudeHome.run("/bin/sh", ["-c", "cat"]) == "")
     let start = Date()
     #expect(ClaudeHome.run("/bin/sh", ["-c", "printf x; sleep 30"], timeout: 0.3) == nil)
-    // A backgrounded grandchild holding stdout is killed with the process group.
-    #expect(ClaudeHome.run("/bin/sh", ["-c", "sleep 30 & printf y"], timeout: 0.3) == nil)
+    // A backgrounded job inheriting stdout doesn't hold the probe until the timeout: once the
+    // shell exits, what it printed is used (and the job is killed with the process group).
+    // (A long timeout, so falling back to it would fail the elapsed-time check.)
+    let bgStart = Date()
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "sleep 10 & printf y"], timeout: 8) == "y")
+    let m = ClaudeHome.marker
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "echo motd; sleep 10 & printf '\\n%s%s\\n' '\(m)' /cfg"],
+                           timeout: 8).flatMap(ClaudeHome.markedValue) == "/cfg")
+    #expect(Date().timeIntervalSince(bgStart) < 6)
+    // At the timeout, output already holding a complete marker line is accepted; else nil.
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "printf '%s/cfg\\n' '\(m)'; sleep 30"], timeout: 0.3,
+                           acceptOnTimeout: ClaudeHome.hasMarkedLine).flatMap(ClaudeHome.markedValue) == "/cfg")
+    #expect(ClaudeHome.run("/bin/sh", ["-c", "printf '%s/cfg' '\(m)'; sleep 30"], timeout: 0.3,
+                           acceptOnTimeout: ClaudeHome.hasMarkedLine) == nil)
     #expect(Date().timeIntervalSince(start) < 5)
     #expect(ClaudeHome.run("/nonexistent/shell", []) == nil)
+}
+
+@Test func asyncClaudeHomeMatchesCachedValue() async {
+    SessionDiscovery.prewarmDefaultClaudeHome()
+    let home = await SessionDiscovery.resolvedClaudeHome()
+    #expect(home == SessionDiscovery.defaultClaudeHome)
 }
 
 @Test func missingClaudeHomeYieldsNoSessions() async {

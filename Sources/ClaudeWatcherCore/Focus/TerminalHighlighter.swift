@@ -192,8 +192,16 @@ public final class TerminalHighlighter: @unchecked Sendable {
             if pulsing[current.tty] == nil { writeReset(current.tty) }
         }
         guard let wanted, let tty = target else { return }
+        let previous = hover  // nil, or this pane in another color
         hover = AppliedHover(tty: tty, tint: wanted.tint, generation: wanted.generation)
-        if pulsing[tty] == nil, !writeTint(wanted.tint, to: tty) { hover = nil; return }
+        if pulsing[tty] == nil, !writeTint(wanted.tint, to: tty) {
+            // Nothing went out: the pane still shows the previous tint (if any). Keep tracking
+            // it, under this request's generation and cap, so endHover/the cap reset it and a
+            // keep-alive beginHover retries the recolor.
+            guard var previous else { hover = nil; return }
+            previous.generation = wanted.generation
+            hover = previous
+        }
         scheduleCap(generation: wanted.generation)
     }
 
@@ -232,7 +240,9 @@ public final class TerminalHighlighter: @unchecked Sendable {
             guard self.pulsing[tty] == id else { return }  // superseded or reset
             self.pulsing[tty] = nil
             if let h = self.hover, h.tty == tty {
-                if h.tint != tint { self.writeTint(h.tint, to: tty) }
+                // A failed settle leaves the pulse tint up: track that, so a keep-alive
+                // beginHover retries the hover tint.
+                if h.tint != tint, !self.writeTint(h.tint, to: tty) { self.hover?.tint = tint }
             } else {
                 self.writeReset(tty)
             }
@@ -258,14 +268,17 @@ public final class TerminalHighlighter: @unchecked Sendable {
 
     // MARK: - Writes
 
-    /// Records `tty`, then writes the tint. False if nothing went out (no tint to undo).
+    /// Records `tty`, then writes the tint. False if nothing went out. A tty this call newly
+    /// recorded is then forgotten again; one that was already recorded may still show an earlier
+    /// tint, so it stays recorded.
     @discardableResult
     private func writeTint(_ color: GhosttyColor, to tty: String) -> Bool {
+        let wasRecorded = loadRecorded().contains(tty)
         record(tty)
         let bytes = Self.tintSequence(color)
         let sent = io.write(bytes, tty)
         if sent == 0 {
-            unrecord(tty)
+            if !wasRecorded { unrecord(tty) }
             return false
         }
         if sent < bytes.count {

@@ -73,10 +73,12 @@ private enum Op: Equatable, CustomStringConvertible {
 }
 
 /// Records writes; OSC 111 writes to a tty in `failResets` send nothing (any tty if
-/// `failAllResets`), and to one in `partialResets` only 3 bytes.
+/// `failAllResets`), and to one in `partialResets` only 3 bytes. OSC 11 writes send nothing
+/// while `failTints` is set.
 private final class Recorder: @unchecked Sendable {
     private let lock = NSLock()
     private var _ops: [Op] = []
+    private var _failTints = false
     private var _failAllResets = false
     private var _failResets: Set<String> = []
     private var _partialResets: Set<String> = []
@@ -85,6 +87,11 @@ private final class Recorder: @unchecked Sendable {
     var failResets: Bool {
         get { lock.withLock { _failAllResets } }
         set { lock.withLock { _failAllResets = newValue } }
+    }
+
+    var failTints: Bool {
+        get { lock.withLock { _failTints } }
+        set { lock.withLock { _failTints = newValue } }
     }
 
     func failResets(on ttys: Set<String>, partial: Set<String> = []) {
@@ -101,6 +108,7 @@ private final class Recorder: @unchecked Sendable {
                 }
                 _ops.append(.reset(tty))
             } else if let s = String(bytes: bytes, encoding: .utf8), s.hasPrefix("\u{1B}]11;"), s.hasSuffix("\u{1B}\\") {
+                if _failTints { return 0 }
                 _ops.append(.tint(tty, String(s.dropFirst(5).dropLast(2))))
             } else {
                 _ops.append(.other(tty, bytes))
@@ -373,6 +381,96 @@ private let blue = GhosttyColor(0x202040)
     try await g.idle()
     g.highlighter.endHover()
     try await Task.sleep(for: .milliseconds(300))
+    try await g.idle()
+    #expect(g.recorder.tinted.isEmpty)
+    #expect(!g.recoveryFileExists)
+}
+
+@Test func failedRecolorKeepsTrackingTheOldTint() async throws {
+    let f = Fixture()
+    defer { f.cleanup() }
+    f.highlighter.beginHover(session(1), tint: red)
+    try await f.idle()
+    // A keep-alive recolor (e.g. after an appearance switch) gets nothing out: the pane still
+    // shows red, so it stays recorded and tracked.
+    f.recorder.failTints = true
+    f.highlighter.beginHover(session(1), tint: blue)
+    try await f.idle()
+    #expect(f.recorder.ops == [.tint("/dev/ttys91", "#402020")])
+    #expect(f.recorded == ["/dev/ttys91"])
+    // The next keep-alive retries the recolor.
+    f.recorder.failTints = false
+    f.highlighter.beginHover(session(1), tint: blue)
+    try await f.idle()
+    #expect(f.recorder.ops.last == .tint("/dev/ttys91", "#202040"))
+    f.highlighter.endHover()
+    try await f.idle()
+    #expect(f.recorder.tinted.isEmpty)
+    #expect(!f.recoveryFileExists)
+
+    // Pointer leaves right after the failed recolor: the old tint is still reset.
+    let g = Fixture()
+    defer { g.cleanup() }
+    g.highlighter.beginHover(session(1), tint: red)
+    try await g.idle()
+    g.recorder.failTints = true
+    g.highlighter.beginHover(session(1), tint: blue)
+    try await g.idle()
+    g.highlighter.endHover()
+    try await g.idle()
+    #expect(g.recorder.ops == [.tint("/dev/ttys91", "#402020"), .reset("/dev/ttys91")])
+    #expect(!g.recoveryFileExists)
+
+    // A failed tint on a pane that wasn't tinted isn't tracked or recorded.
+    let k = Fixture()
+    defer { k.cleanup() }
+    k.recorder.failTints = true
+    k.highlighter.beginHover(session(1), tint: red)
+    try await k.idle()
+    k.highlighter.endHover()
+    try await k.idle()
+    #expect(k.recorder.ops.isEmpty)
+    #expect(!k.recoveryFileExists)
+}
+
+@Test func failedPulseOnHoveredPaneKeepsItRecorded() async throws {
+    let f = Fixture()
+    defer { f.cleanup() }
+    f.highlighter.beginHover(session(1), tint: blue)
+    try await f.idle()
+    f.recorder.failTints = true
+    f.highlighter.pulse(session(1), tint: red)
+    try await Task.sleep(for: .milliseconds(250))
+    try await f.idle()
+    #expect(f.recorder.ops == [.tint("/dev/ttys91", "#202040")])
+    #expect(f.recorded == ["/dev/ttys91"])
+    f.recorder.failTints = false
+    f.highlighter.endHover()
+    try await f.idle()
+    #expect(f.recorder.ops.last == .reset("/dev/ttys91"))
+    #expect(!f.recoveryFileExists)
+
+    // The pulse's settle back to the hover tint fails: the pane keeps the pulse tint, stays
+    // recorded, and a keep-alive beginHover retries the hover tint.
+    let pulse = Duration.milliseconds(400)
+    let g = Fixture(pulseDuration: pulse)
+    defer { g.cleanup() }
+    let clock = ContinuousClock()
+    g.highlighter.beginHover(session(1), tint: blue)
+    let start = clock.now
+    g.highlighter.pulse(session(1), tint: red)
+    try await g.idle()
+    g.recorder.failTints = true
+    guard clock.now - start < pulse - .milliseconds(100) else { return }  // run delayed past the settle
+    try await Task.sleep(for: pulse + .milliseconds(200))
+    try await g.idle()
+    #expect(g.recorder.ops == [.tint("/dev/ttys91", "#202040"), .tint("/dev/ttys91", "#402020")])
+    #expect(g.recorded == ["/dev/ttys91"])
+    g.recorder.failTints = false
+    g.highlighter.beginHover(session(1), tint: blue)
+    try await g.idle()
+    #expect(g.recorder.ops.last == .tint("/dev/ttys91", "#202040"))
+    g.highlighter.endHover()
     try await g.idle()
     #expect(g.recorder.tinted.isEmpty)
     #expect(!g.recoveryFileExists)

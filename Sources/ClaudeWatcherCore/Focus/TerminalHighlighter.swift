@@ -11,12 +11,24 @@ import os
 /// no longer the session's controlling terminal. A tint is skipped (never waited for) while an
 /// OSC 7 probe of the same tty holds a fresh `.probe-<tty>.lock`.
 ///
+/// Our writes share the tty with Claude's own output, so one could land inside a multi-write
+/// escape sequence Claude is drawing. To keep that rare, writes are minimal: a hover tint
+/// isn't applied to a `.busy` session (it streams output; a busy hover just shows no tint, or
+/// drops the tint when a keep-alive `beginHover` sees the session turn busy), re-tinting the
+/// hovered pane in a new color is one write (no reset first), and a pulse is one tint plus one
+/// reset (or settle to the hover tint). A pulse is still allowed on a busy session: it follows
+/// an explicit focus, and it's only two writes.
+///
 /// Every public method returns immediately: tty I/O runs on a private serial queue. Hover
 /// changes are coalesced (the queue applies only the latest wanted hover, resetting the previous
 /// pane first), so a burst of hovers never queues stale tints.
 ///
 /// A tty is recorded in `recoveryFile` before it's tinted and removed once its reset went out,
 /// so `resetAll()` (at launch, panel hide, terminate) can clear a tint left behind by a crash.
+/// A recovery reset only goes to a recorded tty that is still a `/dev/ttysN` char device with a
+/// live process on it (controlling tty) descended from Ghostty: after a crash the tty number may
+/// have been reused by an unrelated terminal. Other entries are dropped without a write; a
+/// reset that didn't fully go out keeps its entry for the next `resetAll()`.
 public final class TerminalHighlighter: @unchecked Sendable {
     public static let shared = TerminalHighlighter()
 
@@ -64,6 +76,10 @@ public final class TerminalHighlighter: @unchecked Sendable {
     private var nextPulseID: UInt64 = 0
     /// Recovery-file contents, loaded on first use.
     private var recorded: Set<String>?
+    /// The file on disk doesn't match `recorded` (it held lines that didn't parse): rewrite it
+    /// on the next save even if the set is unchanged.
+    private var recoveryFileDirty = false
+    private var recoveryDirectoryCreated = false
 
     public convenience init(recoveryFile: URL = TerminalHighlighter.defaultRecoveryFile,
                             lockDirectory: URL = HookStateStore.defaultDirectory)
@@ -96,6 +112,7 @@ public final class TerminalHighlighter: @unchecked Sendable {
 
     /// Tint this session's pane until endHover()/another beginHover. Non-blocking; returns immediately.
     /// No-op unless session.terminal == .ghostty, tty is /dev/ttysN and is the pid's controlling tty, and not under tmux.
+    /// Also a no-op (resetting a tint this pane already has) while `session.status == .busy`.
     /// Auto-resets after a 3 s safety cap.
     public func beginHover(_ session: ClaudeSession, tint: GhosttyColor) {
         requests.withLock {
@@ -111,8 +128,9 @@ public final class TerminalHighlighter: @unchecked Sendable {
         scheduleReconcile()
     }
 
-    /// Brief attention pulse (tint, reset, tint at `pulseStep` intervals, ~450 ms in all, then
-    /// OSC 111, or the hover tint if that pane is still hovered). Non-blocking, fire-and-forget.
+    /// Brief attention pulse: one tint, then after `pulseDuration` (~400 ms) one OSC 111, or the
+    /// hover tint if that pane is still hovered. Non-blocking, fire-and-forget. Allowed on busy
+    /// sessions (two writes).
     public func pulse(_ session: ClaudeSession, tint: GhosttyColor) {
         queue.async { self.startPulse(session, tint: tint) }
     }
@@ -151,33 +169,42 @@ public final class TerminalHighlighter: @unchecked Sendable {
     }
 
     /// Moves the panes from `hover` to the latest requested hover: resets the old pane, then
-    /// tints the new one. A pane owned by a running pulse isn't written; the pulse's last step
-    /// leaves it in the hover state.
+    /// tints the new one; the same pane in a new color gets just the new tint. A pane owned by a
+    /// running pulse isn't written; the pulse's last step leaves it in the hover state.
     private func reconcile() {
         dispatchPrecondition(condition: .onQueue(queue))
         let wanted = requests.withLock { r -> HoverRequest? in
             r.reconcileScheduled = false
             return r.hover
         }
-        if let current = hover, let wanted, current.tty == wanted.session.tty, current.tint == wanted.tint {
+        if let current = hover, let wanted, current.tty == wanted.session.tty, current.tint == wanted.tint,
+           wanted.session.status != .busy
+        {
             if current.generation != wanted.generation {
                 hover?.generation = wanted.generation
                 scheduleCap(generation: wanted.generation)
             }
             return
         }
-        if let current = hover {
+        let target = wanted.flatMap(hoverTTY)
+        if let current = hover, current.tty != target {
             hover = nil
             if pulsing[current.tty] == nil { writeReset(current.tty) }
         }
-        guard let wanted, let tty = eligibleTTY(wanted.session) else { return }
-        guard !isProbeLockFresh(tty: tty) else {
-            Self.logger.debug("highlight skipped: probe lock held tty=\(tty, privacy: .public)")
-            return
-        }
+        guard let wanted, let tty = target else { return }
         hover = AppliedHover(tty: tty, tint: wanted.tint, generation: wanted.generation)
         if pulsing[tty] == nil, !writeTint(wanted.tint, to: tty) { hover = nil; return }
         scheduleCap(generation: wanted.generation)
+    }
+
+    /// The tty a hover on `request` may tint: eligible, not busy, no fresh probe lock.
+    private func hoverTTY(_ request: HoverRequest) -> String? {
+        guard request.session.status != .busy, let tty = eligibleTTY(request.session) else { return nil }
+        guard !isProbeLockFresh(tty: tty) else {
+            Self.logger.debug("highlight skipped: probe lock held tty=\(tty, privacy: .public)")
+            return nil
+        }
+        return tty
     }
 
     /// Safety cap: if the hover with `generation` is still wanted after `hoverCap`, drop it.
@@ -199,22 +226,16 @@ public final class TerminalHighlighter: @unchecked Sendable {
         let id = nextPulseID
         pulsing[tty] = id
         guard writeTint(tint, to: tty) else { pulsing[tty] = nil; return }
-        // tint (0) -> reset (1 step) -> tint (2 steps) -> settle (3 steps, ~450 ms).
-        let step = timing.pulseStep
-        schedulePulseStep(after: step, tty: tty, id: id) { self.writeReset(tty) }
-        schedulePulseStep(after: step * 2, tty: tty, id: id) { self.writeTint(tint, to: tty) }
-        schedulePulseStep(after: step * 3, tty: tty, id: id) {
-            self.pulsing[tty] = nil
-            if let h = self.hover, h.tty == tty { self.writeTint(h.tint, to: tty) } else { self.writeReset(tty) }
-        }
-    }
-
-    private func schedulePulseStep(after delay: Duration, tty: String, id: UInt64,
-                                   _ body: @escaping @Sendable () -> Void)
-    {
-        queue.asyncAfter(deadline: .now() + Self.dispatchInterval(delay)) {
+        // Two writes in all: the tint now, then settle to the hover tint (if that pane is hovered
+        // in another color; nothing if it's the same) or reset.
+        queue.asyncAfter(deadline: .now() + Self.dispatchInterval(timing.pulseDuration)) {
             guard self.pulsing[tty] == id else { return }  // superseded or reset
-            body()
+            self.pulsing[tty] = nil
+            if let h = self.hover, h.tty == tty {
+                if h.tint != tint { self.writeTint(h.tint, to: tty) }
+            } else {
+                self.writeReset(tty)
+            }
         }
     }
 
@@ -222,12 +243,14 @@ public final class TerminalHighlighter: @unchecked Sendable {
         dispatchPrecondition(condition: .onQueue(queue))
         hover = nil
         pulsing.removeAll()
-        for tty in loadRecorded().sorted() where io.isTTYDevice(tty) {
-            let sent = io.write(Self.resetSequence, tty)
-            if sent > 0, sent < Self.resetSequence.count { _ = io.write(Self.stringTerminator, tty) }
+        let before = loadRecorded()
+        var keep = Set<String>()
+        for tty in before.sorted() {
+            // Gone, or no live Ghostty-hosted process on it (maybe a reused tty number): drop.
+            guard io.isTTYDevice(tty), io.hasGhosttyProcess(tty) else { continue }
+            if !sendReset(tty) { keep.insert(tty) }  // retried by the next resetAll
         }
-        recorded = []
-        saveRecorded()
+        setRecorded(keep)
         // The request was cleared when resetAll was called, so a hover wanted now came later
         // (its reconcile may already have run before this reset).
         if requests.withLock({ $0.hover != nil }) { reconcile() }
@@ -254,13 +277,18 @@ public final class TerminalHighlighter: @unchecked Sendable {
 
     /// Writes OSC 111; forgets the tty once it fully went out (else `resetAll` retries it).
     private func writeReset(_ tty: String) {
+        if sendReset(tty) { unrecord(tty) }
+    }
+
+    /// Writes OSC 111 (closing a partial one with ST); true if it fully went out.
+    private func sendReset(_ tty: String) -> Bool {
         let sent = io.write(Self.resetSequence, tty)
         guard sent == Self.resetSequence.count else {
             if sent > 0 { _ = io.write(Self.stringTerminator, tty) }
             Self.logger.error("highlight: reset failed tty=\(tty, privacy: .public) wrote=\(sent)/\(Self.resetSequence.count)")
-            return
+            return false
         }
-        unrecord(tty)
+        return true
     }
 
     // MARK: - Eligibility
@@ -278,12 +306,10 @@ public final class TerminalHighlighter: @unchecked Sendable {
     /// True if an OSC 7 probe lock for `tty` exists and was touched within `probeLockFreshFor`
     /// (holders heartbeat every 2 s). Never takes the lock: a tint must not wait.
     func isProbeLockFresh(tty: String) -> Bool {
-        guard let path = OSC7ProbeLock(directory: lockDirectory).lockPath(forTTY: tty) else { return false }
-        var st = stat()
-        guard stat(path, &st) == 0 else { return false }
-        let mtime = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec)
-            + TimeInterval(st.st_mtimespec.tv_nsec) / 1e9)
-        return io.now().timeIntervalSince(mtime) < timing.probeLockFreshFor
+        guard let path = OSC7ProbeLock(directory: lockDirectory).lockPath(forTTY: tty),
+              let age = OSC7ProbeLock.age(path)
+        else { return false }
+        return age < timing.probeLockFreshFor
     }
 
     /// A `/dev/ttysN` path that exists and is a character device.
@@ -293,42 +319,96 @@ public final class TerminalHighlighter: @unchecked Sendable {
         return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFCHR
     }
 
+    /// Gate for a recovery reset: some live process has `path` as its controlling tty and a
+    /// Ghostty ancestor (the tint-time checks, minus the session we no longer know). A tty whose
+    /// number was reused by another terminal, or a pane whose processes all exited, fails.
+    static func hasGhosttyProcess(onTTY path: String) -> Bool {
+        var st = stat()
+        guard OSC7Probe.isWritableTTYPath(path), stat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFCHR
+        else { return false }
+        return pids(withControllingTTY: st.st_rdev).contains { pid in
+            ProcessTree.ancestors(of: pid).contains { isGhosttyExecutable(SystemProcessInspector.path(pid: $0)) }
+        }
+    }
+
+    /// Same rule as `ProcessRules.terminalKind`.
+    static func isGhosttyExecutable(_ path: String?) -> Bool {
+        path?.contains("/Ghostty.app/") ?? false
+    }
+
+    /// Pids whose controlling tty is device `dev` (`sysctl KERN_PROC_TTY`).
+    static func pids(withControllingTTY dev: dev_t) -> [Int32] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_TTY, dev]
+        for _ in 0..<3 {  // the table can grow between the size query and the read
+            var size = 0
+            guard sysctl(&mib, u_int(mib.count), nil, &size, nil, 0) == 0 else { return [] }
+            guard size > 0 else { return [] }
+            let stride = MemoryLayout<kinfo_proc>.stride
+            var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + 8)
+            size = procs.count * stride
+            let rc = procs.withUnsafeMutableBytes { sysctl(&mib, u_int(mib.count), $0.baseAddress, &size, nil, 0) }
+            if rc == 0 {
+                return procs.prefix(size / stride).map(\.kp_proc.p_pid).filter { $0 > 0 }
+            }
+            guard errno == ENOMEM else { return [] }
+        }
+        return []
+    }
+
     // MARK: - Recovery file
 
     private func loadRecorded() -> Set<String> {
         if let recorded { return recorded }
-        let loaded = Self.parseRecoveryFile((try? String(contentsOf: recoveryFile, encoding: .utf8)) ?? "")
+        let text = (try? String(contentsOf: recoveryFile, encoding: .utf8)) ?? ""
+        let loaded = Self.parseRecoveryFile(text)
         recorded = loaded
+        // Junk lines (or a non-canonical layout) get cleaned up by the next save.
+        recoveryFileDirty = text != Self.formatRecoveryFile(loaded)
         return loaded
     }
 
     private func record(_ tty: String) {
         var set = loadRecorded()
-        guard set.insert(tty).inserted else { return }
-        recorded = set
-        saveRecorded()
+        set.insert(tty)
+        setRecorded(set)
     }
 
     private func unrecord(_ tty: String) {
         var set = loadRecorded()
-        guard set.remove(tty) != nil else { return }
-        recorded = set
-        saveRecorded()
+        set.remove(tty)
+        setRecorded(set)
     }
 
-    /// Atomic replace; removes the file when nothing is recorded.
-    private func saveRecorded() {
-        let set = recorded ?? []
+    /// Updates the recorded set, writing the file only if that changes what's on disk.
+    private func setRecorded(_ set: Set<String>) {
+        let old = loadRecorded()
+        guard set != old || recoveryFileDirty else { return }
+        recorded = set
+        recoveryFileDirty = !saveRecorded(set)
+    }
+
+    /// Atomic replace; removes the file when nothing is recorded. False if that failed.
+    private func saveRecorded(_ set: Set<String>) -> Bool {
+        let fm = FileManager.default
         if set.isEmpty {
-            try? FileManager.default.removeItem(at: recoveryFile)
-            return
+            do {
+                try fm.removeItem(at: recoveryFile)
+            } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            } catch {
+                return false
+            }
+            return true
         }
         do {
-            try FileManager.default.createDirectory(at: recoveryFile.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
+            if !recoveryDirectoryCreated {
+                try fm.createDirectory(at: recoveryFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+                recoveryDirectoryCreated = true
+            }
             try Data(Self.formatRecoveryFile(set).utf8).write(to: recoveryFile, options: .atomic)
+            return true
         } catch {
             Self.logger.error("highlight: couldn't write recovery file: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
@@ -357,14 +437,15 @@ struct TerminalHighlighterIO: Sendable {
     var isInsideTmux: @Sendable (_ pid: Int32) -> Bool = { ProcessTree.isInsideTmux($0) }
     /// Gate for `resetAll` (the session may be gone): the path is a `/dev/ttysN` char device.
     var isTTYDevice: @Sendable (_ path: String) -> Bool = { TerminalHighlighter.isTTYDevice($0) }
-    var now: @Sendable () -> Date = { Date() }
+    /// Second `resetAll` gate: a live process on that tty descends from Ghostty.
+    var hasGhosttyProcess: @Sendable (_ path: String) -> Bool = { TerminalHighlighter.hasGhosttyProcess(onTTY: $0) }
 }
 
 struct TerminalHighlighterTiming: Sendable {
     /// A hover tint is dropped after this long without a new `beginHover`.
     var hoverCap: Duration = .seconds(3)
-    /// Pulse: tint, reset, tint, settle, one step apart.
-    var pulseStep: Duration = .milliseconds(150)
+    /// Pulse: the tint, then this long until the reset (or settle to the hover tint).
+    var pulseDuration: Duration = .milliseconds(400)
     /// A probe lock touched more recently than this blocks a tint.
     var probeLockFreshFor: TimeInterval = 10
 }

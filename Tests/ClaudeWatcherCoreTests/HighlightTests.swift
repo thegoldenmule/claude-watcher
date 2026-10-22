@@ -72,18 +72,33 @@ private enum Op: Equatable, CustomStringConvertible {
     }
 }
 
-/// Records writes; `failResets` makes OSC 111 writes send nothing.
+/// Records writes; OSC 111 writes to a tty in `failResets` send nothing (any tty if
+/// `failAllResets`), and to one in `partialResets` only 3 bytes.
 private final class Recorder: @unchecked Sendable {
     private let lock = NSLock()
     private var _ops: [Op] = []
-    var failResets = false
+    private var _failAllResets = false
+    private var _failResets: Set<String> = []
+    private var _partialResets: Set<String> = []
 
     var ops: [Op] { lock.withLock { _ops } }
+    var failResets: Bool {
+        get { lock.withLock { _failAllResets } }
+        set { lock.withLock { _failAllResets = newValue } }
+    }
+
+    func failResets(on ttys: Set<String>, partial: Set<String> = []) {
+        lock.withLock { _failResets = ttys; _partialResets = partial }
+    }
 
     func write(_ bytes: [UInt8], _ tty: String) -> Int {
         lock.withLock {
             if bytes == TerminalHighlighter.resetSequence {
-                if failResets { return 0 }
+                if _failAllResets || _failResets.contains(tty) { return 0 }
+                if _partialResets.contains(tty) {
+                    _ops.append(.other(tty, Array(bytes.prefix(3))))
+                    return 3
+                }
                 _ops.append(.reset(tty))
             } else if let s = String(bytes: bytes, encoding: .utf8), s.hasPrefix("\u{1B}]11;"), s.hasSuffix("\u{1B}\\") {
                 _ops.append(.tint(tty, String(s.dropFirst(5).dropLast(2))))
@@ -115,8 +130,10 @@ private struct Fixture {
     var recoveryFile: URL { dir.appendingPathComponent("tinted-ttys") }
     var lockDir: URL { dir.appendingPathComponent("hook-state", isDirectory: true) }
 
-    init(hoverCap: Duration = .seconds(30), pulseStep: Duration = .milliseconds(20),
-         tmuxPIDs: Set<Int32> = [], controlling: Bool = true, ttyDevices: Bool = true)
+    /// `ghosttyTTYs`: ttys with a live Ghostty-hosted process (nil: all of them).
+    init(hoverCap: Duration = .seconds(30), pulseDuration: Duration = .milliseconds(60),
+         tmuxPIDs: Set<Int32> = [], controlling: Bool = true, ttyDevices: Bool = true,
+         ghosttyTTYs: Set<String>? = nil)
     {
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("cw-hl-\(UUID().uuidString)")
         try! FileManager.default.createDirectory(at: dir.appendingPathComponent("hook-state"),
@@ -126,11 +143,12 @@ private struct Fixture {
             write: { recorder.write($0, $1) },
             isControllingTTY: { _, _ in controlling },
             isInsideTmux: { tmuxPIDs.contains($0) },
-            isTTYDevice: { _ in ttyDevices })
+            isTTYDevice: { _ in ttyDevices },
+            hasGhosttyProcess: { ghosttyTTYs?.contains($0) ?? true })
         highlighter = TerminalHighlighter(
             recoveryFile: dir.appendingPathComponent("tinted-ttys"),
             lockDirectory: dir.appendingPathComponent("hook-state", isDirectory: true),
-            io: io, timing: TerminalHighlighterTiming(hoverCap: hoverCap, pulseStep: pulseStep))
+            io: io, timing: TerminalHighlighterTiming(hoverCap: hoverCap, pulseDuration: pulseDuration))
     }
 
     func idle() async throws {
@@ -148,8 +166,8 @@ private struct Fixture {
 }
 
 private func session(_ n: Int, pid: Int32 = 4242, terminal: TerminalKind = .ghostty,
-                     tty: String? = "") -> ClaudeSession {
-    ClaudeSession(id: "s\(n)", pid: pid, cwd: "/tmp", title: "t\(n)",
+                     tty: String? = "", status: SessionStatus = .unknown) -> ClaudeSession {
+    ClaudeSession(id: "s\(n)", pid: pid, cwd: "/tmp", title: "t\(n)", status: status,
                   tty: tty == "" ? "/dev/ttys9\(n)" : tty, terminal: terminal,
                   startedAt: .distantPast, updatedAt: .distantPast)
 }
@@ -202,10 +220,11 @@ private let blue = GhosttyColor(0x202040)
     f.highlighter.beginHover(session(2), tint: blue)
     try await f.idle()
     #expect(f.recorder.ops.count == count)
-    // Same pane, new tint: rewritten.
+    // Same pane, new tint: one tint write, no reset first.
     f.highlighter.beginHover(session(2), tint: red)
     try await f.idle()
     #expect(f.recorder.tinted == ["/dev/ttys92"])
+    #expect(f.recorder.ops.count == count + 1)
     #expect(f.recorder.ops.last == .tint("/dev/ttys92", "#402020"))
     f.highlighter.endHover()
     try await f.idle()
@@ -296,32 +315,58 @@ private let blue = GhosttyColor(0x202040)
     #expect(f.recorder.ops.suffix(2) == [.reset("/dev/ttys92"), .tint("/dev/ttys91", "#402020")])
 }
 
-@Test func pulseBlinksThenResets() async throws {
-    let f = Fixture(pulseStep: .milliseconds(20))
+@Test func pulseTintsThenResets() async throws {
+    let f = Fixture()
     defer { f.cleanup() }
     f.highlighter.pulse(session(1), tint: red)
     try await Task.sleep(for: .milliseconds(250))
     try await f.idle()
-    let t = Op.tint("/dev/ttys91", "#402020"), r = Op.reset("/dev/ttys91")
-    #expect(f.recorder.ops == [t, r, t, r])
+    #expect(f.recorder.ops == [.tint("/dev/ttys91", "#402020"), .reset("/dev/ttys91")])
     #expect(!f.recoveryFileExists)
 }
 
+@Test func busySessionGetsNoHoverTintButPulses() async throws {
+    let f = Fixture()
+    defer { f.cleanup() }
+    f.highlighter.beginHover(session(1, status: .busy), tint: red)
+    try await f.idle()
+    #expect(f.recorder.ops.isEmpty)
+    #expect(!f.recoveryFileExists)
+    // A hovered pane whose session turns busy (seen on a keep-alive beginHover) is reset.
+    f.highlighter.beginHover(session(2, status: .waiting), tint: red)
+    try await f.idle()
+    f.highlighter.beginHover(session(2, status: .busy), tint: red)
+    try await f.idle()
+    #expect(f.recorder.ops == [.tint("/dev/ttys92", "#402020"), .reset("/dev/ttys92")])
+    // The pulse (two writes) still runs on a busy session.
+    f.highlighter.pulse(session(1, status: .busy), tint: red)
+    try await Task.sleep(for: .milliseconds(250))
+    try await f.idle()
+    #expect(f.recorder.ops.suffix(2) == [.tint("/dev/ttys91", "#402020"), .reset("/dev/ttys91")])
+}
+
 @Test func pulseOnHoveredPaneSettlesToHoverTint() async throws {
-    let f = Fixture(pulseStep: .milliseconds(20))
+    let f = Fixture()
     defer { f.cleanup() }
     f.highlighter.beginHover(session(1), tint: blue)
     f.highlighter.pulse(session(1), tint: red)
     try await Task.sleep(for: .milliseconds(250))
     try await f.idle()
-    #expect(f.recorder.ops.last == .tint("/dev/ttys91", "#202040"))
+    #expect(f.recorder.ops == [.tint("/dev/ttys91", "#202040"), .tint("/dev/ttys91", "#402020"),
+                               .tint("/dev/ttys91", "#202040")])
     #expect(f.recorder.tinted == ["/dev/ttys91"])
+    // Pulsing the hovered pane in the hover's own color: one write, nothing to settle.
+    f.highlighter.pulse(session(1), tint: blue)
+    try await Task.sleep(for: .milliseconds(250))
+    try await f.idle()
+    #expect(f.recorder.ops.count == 4)
+    #expect(f.recorder.ops.last == .tint("/dev/ttys91", "#202040"))
     f.highlighter.endHover()
     try await f.idle()
     #expect(f.recorder.tinted.isEmpty)
 
     // Hover leaving the pane mid-pulse: the pulse's last step resets it.
-    let g = Fixture(pulseStep: .milliseconds(30))
+    let g = Fixture(pulseDuration: .milliseconds(100))
     defer { g.cleanup() }
     g.highlighter.pulse(session(1), tint: red)
     g.highlighter.beginHover(session(1), tint: blue)
@@ -369,6 +414,64 @@ private let blue = GhosttyColor(0x202040)
     #expect(!g.recoveryFileExists)
 }
 
+@Test func resetAllKeepsTTYsWhoseResetDidNotGoOut() async throws {
+    let f = Fixture()
+    defer { f.cleanup() }
+    try "/dev/ttys901\n/dev/ttys902\n/dev/ttys903\n".write(to: f.recoveryFile, atomically: true, encoding: .utf8)
+    f.recorder.failResets(on: ["/dev/ttys901"], partial: ["/dev/ttys902"])
+    f.highlighter.resetAll()
+    try await f.idle()
+    // A partial reset is closed with ST; both failed ones stay recorded for the next resetAll.
+    #expect(f.recorder.ops == [.other("/dev/ttys902", [0x1B, 0x5D, 0x31]), .other("/dev/ttys902", [0x1B, 0x5C]),
+                               .reset("/dev/ttys903")])
+    #expect(f.recorded == ["/dev/ttys901", "/dev/ttys902"])
+    f.recorder.failResets(on: [])
+    f.highlighter.resetAll()
+    try await f.idle()
+    #expect(f.recorder.ops.suffix(2) == [.reset("/dev/ttys901"), .reset("/dev/ttys902")])
+    #expect(!f.recoveryFileExists)
+
+    // A failed reset whose device is gone is dropped.
+    let g = Fixture(ttyDevices: false)
+    defer { g.cleanup() }
+    try "/dev/ttys901\n".write(to: g.recoveryFile, atomically: true, encoding: .utf8)
+    g.recorder.failResets = true
+    g.highlighter.resetAll()
+    try await g.idle()
+    #expect(!g.recoveryFileExists)
+}
+
+@Test func resetAllSkipsTTYsWithoutAGhosttyProcess() async throws {
+    let f = Fixture(ghosttyTTYs: ["/dev/ttys902"])
+    defer { f.cleanup() }
+    try "/dev/ttys901\n/dev/ttys902\n".write(to: f.recoveryFile, atomically: true, encoding: .utf8)
+    f.highlighter.resetAll()
+    try await f.idle()
+    #expect(f.recorder.ops == [.reset("/dev/ttys902")])
+    #expect(!f.recoveryFileExists)
+}
+
+@Test func resetAllWithNothingRecordedTouchesNoFiles() async throws {
+    let f = Fixture()
+    defer { f.cleanup() }
+    f.highlighter.resetAll()
+    try await f.idle()
+    // A file appearing now (not written by this instance) is left alone by a no-op resetAll.
+    try "/dev/ttys901\n".write(to: f.recoveryFile, atomically: true, encoding: .utf8)
+    f.highlighter.resetAll()
+    try await f.idle()
+    #expect(f.recoveryFileExists)
+    #expect(f.recorder.ops.isEmpty)
+
+    // A file holding only junk lines is cleaned up.
+    let g = Fixture()
+    defer { g.cleanup() }
+    try "/etc/passwd\n".write(to: g.recoveryFile, atomically: true, encoding: .utf8)
+    g.highlighter.resetAll()
+    try await g.idle()
+    #expect(!g.recoveryFileExists)
+}
+
 @Test func resetAllDropsHover() async throws {
     let f = Fixture()
     defer { f.cleanup() }
@@ -387,4 +490,18 @@ private let blue = GhosttyColor(0x202040)
     #expect(!TerminalHighlighter.isTTYDevice("/dev/null"))
     #expect(!TerminalHighlighter.isTTYDevice("/dev/ttys99999999"))
     #expect(!TerminalHighlighter.isTTYDevice("/tmp/ttys1"))
+    #expect(!TerminalHighlighter.hasGhosttyProcess(onTTY: "/dev/null"))
+    #expect(!TerminalHighlighter.hasGhosttyProcess(onTTY: "/dev/ttys99999999"))
+    #expect(TerminalHighlighter.isGhosttyExecutable("/Applications/Ghostty.app/Contents/MacOS/ghostty"))
+    #expect(!TerminalHighlighter.isGhosttyExecutable("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"))
+    #expect(!TerminalHighlighter.isGhosttyExecutable(nil))
+}
+
+@Test func controllingTTYScanFindsTheTTYsProcesses() throws {
+    // Our own tty, when the test run has one (not in CI): this process or an ancestor is on it.
+    var st = stat()
+    guard fstat(STDIN_FILENO, &st) == 0, isatty(STDIN_FILENO) == 1 else { return }
+    let pids = TerminalHighlighter.pids(withControllingTTY: st.st_rdev)
+    let mine = Set([getpid()] + ProcessTree.ancestors(of: getpid()))
+    #expect(!Set(pids).isDisjoint(with: mine))
 }

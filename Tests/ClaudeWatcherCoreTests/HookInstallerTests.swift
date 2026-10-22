@@ -281,3 +281,21 @@ import Testing
         #expect(Self.ours(try box.json(), "Stop").count == 1)
     }
 }
+
+/// Opt-in, touches the real ~/.claude/settings.json:
+///   CLAUDE_WATCHER_REAL_INSTALL=1 swift test --filter RealHookInstall
+@Suite(.enabled(if: ProcessInfo.processInfo.environment["CLAUDE_WATCHER_REAL_INSTALL"] == "1"))
+struct RealHookInstall {
+    @Test func installForReal() throws {
+        let source = HookScriptTests.script
+        // The real file must survive an order-preserving parse/print unchanged before we edit it.
+        let original = try Data(contentsOf: HookInstaller.defaultSettingsURL)
+        #expect(try HookInstaller.transformedSettings(original) { _ in } == nil)
+        let reprinted = try OrderedJSON.parse(original).serialized(indent: HookInstaller.detectIndent(original) ?? "  ")
+            + (original.last == 0x0A ? "\n" : "")
+        #expect(Data(reprinted.utf8) == original, "real settings.json does not round-trip byte-for-byte")
+        let backup = try HookInstaller.install(hookScriptSource: source)
+        print("CLAUDE_WATCHER_BACKUP=\(backup?.path ?? "none")")
+        #expect(HookInstaller.status(hookScriptSource: source) == .installed)
+    }
+}

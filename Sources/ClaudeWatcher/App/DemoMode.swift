@@ -48,13 +48,12 @@ enum DemoMode {
         }
     }
 
-    static var previewHoverID: String? {
+    /// Read once: `previewHoverID` is checked by every row on every render.
+    static let previewHoverID: String? =
         isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_HOVER"] : nil
-    }
 
-    static var previewPendingID: String? {
+    static let previewPendingID: String? =
         isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_PENDING"] : nil
-    }
 
     static var sessions: [ClaudeSession] {
         ProcessInfo.processInfo.environment["CW_DEMO_EMPTY"] == "1" ? [] : allSessions

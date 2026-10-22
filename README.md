@@ -15,9 +15,23 @@ sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/deskt
 - Menu bar: Pin Sidebar, Claude Code Hook (install / update / uninstall), Launch at Login, Quit.
 - Demo mode: `open build/ClaudeWatcher.app --args --demo`.
 
+## Install
+
+1. Download `ClaudeWatcher-X.Y.Z.dmg` from the
+   [latest release](https://github.com/thegoldenmule/claude-watcher/releases/latest) and open it.
+2. Drag **ClaudeWatcher** onto the **Applications** folder in the window that opens, then eject
+   the disk image.
+3. Open ClaudeWatcher from Applications. It lives in the menu bar; the sidebar slides in from
+   the left screen edge.
+
+The app is signed with Developer ID and notarized by Apple. Each release also has
+`ClaudeWatcher-X.Y.Z.zip` (the same app, for scripted installs) and `ClaudeWatcher-X.Y.Z.sha256`
+covering both: `shasum -a 256 -c --ignore-missing ClaudeWatcher-X.Y.Z.sha256`.
+
 ## Requirements
 
-macOS 26, a Swift 6.2+ toolchain (Xcode 26 command-line tools), and Ghostty 1.3+ or Terminal.app.
+macOS 26 and Ghostty 1.3+ or Terminal.app. Building from source also needs a Swift 6.2+
+toolchain (Xcode 26 command-line tools).
 
 ## Build and run
 
@@ -49,10 +63,16 @@ OSC 7 probe (a nonce cwd written to the session's tty) via Ghostty's AppleScript
 ## Releasing
 
 ```sh
-make release VERSION=1.2.3                       # notarized universal app (zip) -> GitHub release
-make release VERSION=1.2.3 DRY_RUN=1             # Developer ID-signed zip in build/dist/ only
+make release VERSION=1.2.3                       # notarized universal app (DMG + zip) -> GitHub release
+make release VERSION=1.2.3 DRY_RUN=1             # Developer ID-signed DMG + zip in build/dist/ only
 make release VERSION=1.2.3 DRY_RUN=1 NOTARIZE=1  # also notarized and stapled; still nothing published
+make dmg                                         # preview the DMG window with the dev app (build/ClaudeWatcher.dmg)
 ```
+
+The DMG needs Python 3.10+ (`brew install python`; macOS's own 3.9 is too old):
+`scripts/build-dmg.sh` installs [dmgbuild](https://github.com/dmgbuild/dmgbuild), pinned with
+hashes in `scripts/dmg-requirements.txt`, into a private venv and writes the window layout
+without Finder or AppleScript.
 
 Releases are signed and notarized with the Apple account signed into Xcode
 (Xcode › Settings › Accounts), the same way as
@@ -75,10 +95,14 @@ notarization. `xcodebuild -exportNotarizedApp` then returns the notarized, stapl
 bundled hook script (`Contents/Resources/claude-watcher-hook.sh`) is a sealed resource,
 covered by the app's signature.
 
-The script zips the app as `build/dist/ClaudeWatcher-X.Y.Z.zip` and checks that the zip
-passes Gatekeeper as a quarantined download. Only then does it push the commit and tag and
-create the GitHub release with the zip and its SHA-256. If anything fails before the push,
-it removes the local commit and tag. Override the team with `TEAM_ID=...`.
+The script packages the stapled app twice, as `build/dist/ClaudeWatcher-X.Y.Z.dmg` (a
+drag-to-Applications window) and `ClaudeWatcher-X.Y.Z.zip`, and checks that the app inside
+each passes Gatekeeper as a quarantined download. The DMG itself is deliberately left
+unsigned: the cloud-managed certificate can't sign a disk image, and a disk image signed with
+any other identity is refused on open; the app inside carries the signature and ticket. Only
+then does it write `ClaudeWatcher-X.Y.Z.sha256` (covering both), push the commit and tag and
+create the GitHub release with all three files. If anything fails before the push, it removes
+the local commit and tag. Override the team with `TEAM_ID=...`.
 
 Dev builds (`make app` / `make run`) are unchanged: Apple Development signing, no hardened
 runtime and no notarization, so permission grants survive rebuilds.

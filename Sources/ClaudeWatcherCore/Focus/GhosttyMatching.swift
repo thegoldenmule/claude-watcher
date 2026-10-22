@@ -100,7 +100,7 @@ public enum GhosttyMatcher {
         if both.count == 1 { return .unique(terminalID: both[0].id) }
         if both.count > 1 {
             return .ambiguous(candidates: both.map(\.id),
-                              reason: "\(both.count) Ghostty terminals are titled \"\(wantTitle)\" in \(session.cwd)")
+                              reason: "\(both.count) Ghostty terminals are titled \"\(wantTitle)\" in \((session.cwd as NSString).abbreviatingWithTildeInPath)")
         }
         if titleHits.count == 1 { return .unique(terminalID: titleHits[0].id) }
         if titleHits.count > 1 {

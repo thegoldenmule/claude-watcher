@@ -75,62 +75,38 @@ public protocol AppleScriptExecuting: Sendable {
     func run(_ source: String, app: String, timeout: Duration) async -> Result<String, AppleScriptError>
 }
 
-/// Runs `NSAppleScript` on one dedicated thread (NSAppleScript is not thread-safe), with a
-/// Swift-side watchdog in addition to the in-script `with timeout` clause.
-public final class AppleScriptRunner: AppleScriptExecuting, @unchecked Sendable {
+/// Runs `NSAppleScript` on the main thread.
+///
+/// Why main: NSAppleScript isn't thread-safe, and on a secondary thread Apple-event replies
+/// from Ghostty for element queries (`id of every terminal`) never arrive: the script hangs
+/// forever and even `with timeout` doesn't fire (reproduced with Ghostty 1.3.1; `get version`
+/// works off-main, `every terminal` doesn't). On main it takes ~10–40 ms. Hang protection comes
+/// from the `with timeout of 3 seconds` clause every generated script uses; a Swift watchdog
+/// can't help while the main thread is blocked inside the script.
+public final class AppleScriptRunner: AppleScriptExecuting, Sendable {
     public static let shared = AppleScriptRunner()
 
-    private let queue = JobQueue()
+    public init() {}
 
-    public init() {
-        let queue = self.queue
-        let thread = Thread {
-            while true {
-                let job = queue.next()
-                autoreleasepool { job() }
-            }
-        }
-        thread.name = "ClaudeWatcher.AppleScript"
-        thread.qualityOfService = .userInitiated
-        thread.start()
-    }
-
-    private func enqueue(_ job: @escaping @Sendable () -> Void) {
-        queue.append(job)
-    }
-
-    /// Executes `source` and returns its result coerced to a string ("" if none).
-    /// - Parameters:
-    ///   - app: display name of the target app, for error messages.
-    ///   - timeout: Swift-side watchdog; should exceed the script's own `with timeout`.
+    /// Executes `source` on the main actor and returns its result coerced to a string ("" if none).
+    /// `timeout` is unused (see type docs); scripts must carry their own `with timeout`.
     public func run(_ source: String, app: String, timeout: Duration = .seconds(5)) async -> Result<String, AppleScriptError> {
-        let once = OnceBox<Result<String, AppleScriptError>>()
-        return await withCheckedContinuation { continuation in
-            once.setContinuation(continuation)
-            enqueue {
-                guard !once.isDone else { return }  // watchdog already fired; skip
-                var errorInfo: NSDictionary?
-                guard let script = NSAppleScript(source: source) else {
-                    once.resume(.failure(.compileFailed("NSAppleScript init failed")))
-                    return
-                }
-                if !script.compileAndReturnError(&errorInfo) {
-                    let msg = (errorInfo?[NSAppleScript.errorMessage] as? String) ?? "unknown"
-                    once.resume(.failure(.compileFailed(msg)))
-                    return
-                }
-                let descriptor = script.executeAndReturnError(&errorInfo)
-                if let errorInfo {
-                    once.resume(.failure(AppleScriptError.from(errorInfo: errorInfo, app: app)))
-                } else {
-                    once.resume(.success(descriptor.stringValue ?? ""))
-                }
-            }
-            Task.detached {
-                try? await Task.sleep(for: timeout)
-                once.resume(.failure(.timedOut))
-            }
+        await MainActor.run { Self.execute(source, app: app) }
+    }
+
+    @MainActor
+    static func execute(_ source: String, app: String) -> Result<String, AppleScriptError> {
+        var errorInfo: NSDictionary?
+        guard let script = NSAppleScript(source: source) else {
+            return .failure(.compileFailed("NSAppleScript init failed"))
         }
+        if !script.compileAndReturnError(&errorInfo) {
+            let msg = (errorInfo?[NSAppleScript.errorMessage] as? String) ?? "unknown"
+            return .failure(.compileFailed(msg))
+        }
+        let descriptor = script.executeAndReturnError(&errorInfo)
+        if let errorInfo { return .failure(AppleScriptError.from(errorInfo: errorInfo, app: app)) }
+        return .success(descriptor.stringValue ?? "")
     }
 }
 
@@ -184,33 +160,11 @@ public struct OsascriptRunner: AppleScriptExecuting {
     }
 }
 
-/// Blocking FIFO of jobs for the script thread.
-private final class JobQueue: @unchecked Sendable {
-    private let condition = NSCondition()
-    private var jobs: [@Sendable () -> Void] = []
-
-    func append(_ job: @escaping @Sendable () -> Void) {
-        condition.lock()
-        jobs.append(job)
-        condition.signal()
-        condition.unlock()
-    }
-
-    func next() -> @Sendable () -> Void {
-        condition.lock()
-        defer { condition.unlock() }
-        while jobs.isEmpty { condition.wait() }
-        return jobs.removeFirst()
-    }
-}
-
 /// Resumes a continuation exactly once.
 private final class OnceBox<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T, Never>?
     private var done = false
-
-    var isDone: Bool { lock.withLock { done } }
 
     func setContinuation(_ c: CheckedContinuation<T, Never>) {
         lock.withLock { continuation = c }

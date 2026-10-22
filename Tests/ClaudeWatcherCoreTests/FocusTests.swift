@@ -135,7 +135,7 @@ func stripsTitleGlyph(input: String, expected: String) {
 }
 
 /// NSAppleScript isn't thread-safe, so tests that use it directly run serially.
-@Suite(.serialized) struct AppleScriptCompileTests {
+@Suite(.serialized) @MainActor struct AppleScriptCompileTests {
     @Test func quotedStringsRoundTripThroughAppleScript() throws {
         for value in ["a\"b", "back\\slash", "\" & \"injected", "tab\there", "✳ Claude Code"] {
             let script = try #require(NSAppleScript(source: "return \(AppleScriptSource.quoted(value))"))

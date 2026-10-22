@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
 # Builds a release binary and assembles + signs build/ClaudeWatcher.app.
 # Signing identity: $CODESIGN_IDENTITY, else first "Apple Development" identity, else ad-hoc.
+#
+# Dev builds (make app / make run) use the defaults. scripts/release.sh overrides:
+#   SCRATCH_PATH       SwiftPM scratch dir (default .build).
+#   APP_DIR            directory the bundle is written to (default build).
+#   INFO_PLIST         Info.plist to copy into the bundle (default Resources/Info.plist).
+#   ARCHS              e.g. "arm64 x86_64" for a universal binary (default: host arch).
+#   HARDENED_RUNTIME=1 sign with the hardened runtime and Resources/ClaudeWatcher.entitlements
+#                      (plus a secure timestamp unless ad-hoc), as notarization requires.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 APP_NAME="ClaudeWatcher"
-APP="build/${APP_NAME}.app"
-SCRATCH_ARGS=()
+APP="${APP_DIR:-build}/${APP_NAME}.app"
+INFO_PLIST="${INFO_PLIST:-Resources/Info.plist}"
+ENTITLEMENTS="Resources/ClaudeWatcher.entitlements"
+BUILD_ARGS=()
 if [[ -n "${SCRATCH_PATH:-}" ]]; then
-  SCRATCH_ARGS=(--scratch-path "$SCRATCH_PATH")
+  BUILD_ARGS=(--scratch-path "$SCRATCH_PATH")
 fi
+for arch in ${ARCHS:-}; do
+  BUILD_ARGS+=(--arch "$arch")
+done
 
-echo "==> swift build -c release ${SCRATCH_ARGS[*]:-}"
-swift build -c release ${SCRATCH_ARGS[@]+"${SCRATCH_ARGS[@]}"}
-BIN_DIR="$(swift build -c release ${SCRATCH_ARGS[@]+"${SCRATCH_ARGS[@]}"} --show-bin-path)"
+echo "==> swift build -c release ${BUILD_ARGS[*]:-}"
+swift build -c release ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
+BIN_DIR="$(swift build -c release ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --show-bin-path)"
 
 echo "==> Assembling ${APP}"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
-cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp "$INFO_PLIST" "$APP/Contents/Info.plist"
 # Hook script, installed by HookInstaller.install(hookScriptSource:) from the bundle.
 cp hooks/claude-watcher-hook.sh "$APP/Contents/Resources/claude-watcher-hook.sh"
 chmod 755 "$APP/Contents/Resources/claude-watcher-hook.sh"
@@ -51,7 +64,16 @@ if [[ -z "$IDENTITY" ]]; then
 WARN
 fi
 
-# No hardened runtime (no --options runtime): personal, unsandboxed app.
-codesign --force --sign "$IDENTITY" --identifier com.thegoldenmule.ClaudeWatcher "$APP"
+# Dev builds: no hardened runtime (personal, unsandboxed app). Release builds add it, with
+# the Apple Events entitlement it then needs to script Ghostty / Terminal.app.
+SIGN_ARGS=()
+if [[ "${HARDENED_RUNTIME:-}" == 1 ]]; then
+  SIGN_ARGS=(--options runtime --entitlements "$ENTITLEMENTS")
+  [[ "$IDENTITY" != "-" ]] && SIGN_ARGS+=(--timestamp)
+  echo "==> Hardened runtime, entitlements: $ENTITLEMENTS"
+fi
+codesign --force --sign "$IDENTITY" --identifier com.thegoldenmule.ClaudeWatcher \
+  ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} "$APP"
 codesign --verify --verbose=1 "$APP"
-echo "==> Built $ROOT/$APP"
+[[ "$APP" == /* ]] || APP="$ROOT/$APP"
+echo "==> Built $APP"

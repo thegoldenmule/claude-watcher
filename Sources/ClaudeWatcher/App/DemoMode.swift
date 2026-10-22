@@ -19,6 +19,19 @@ enum DemoMode {
         }
     }
 
+    /// Canned focus outcomes so every banner can be seen without real terminals: Terminal.app
+    /// rows fail with the Automation-permission error, "other" terminals only activate the app.
+    static func focusResult(for session: ClaudeSession) async -> FocusResult {
+        try? await Task.sleep(for: .milliseconds(250))
+        switch session.terminal {
+        case .ghostty: return .focused
+        case .appleTerminal:
+            return .failed(reason: AppleScriptError.notPermitted(app: "Terminal").userMessage(app: "Terminal"))
+        case .other(let name):
+            return .appActivatedOnly(reason: "Activated \(name); focusing a specific tab isn't supported there.")
+        }
+    }
+
     static let sessions: [ClaudeSession] = {
         let now = Date()
         func ago(_ minutes: Double) -> Date { now.addingTimeInterval(-minutes * 60) }

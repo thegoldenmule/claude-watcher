@@ -7,7 +7,13 @@ import SwiftUI
 struct SidebarView: View {
     let sessions: [ClaudeSession]
     var isPinned: Bool = false
+    /// Row whose focus request is in flight.
+    var pendingSessionID: String? = nil
+    /// Banner for the last focus attempt that didn't fully succeed.
+    var notice: FocusNotice? = nil
     let onSelect: (ClaudeSession) -> Void
+    var onDismissNotice: () -> Void = {}
+    var onOpenAutomationSettings: () -> Void = {}
 
     private var ordered: [ClaudeSession] {
         // Only "waiting" jumps the queue; busy/idle flips don't reshuffle rows.
@@ -34,7 +40,9 @@ struct SidebarView: View {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 4) {
                         ForEach(ordered) { session in
-                            SessionRow(session: session) { onSelect(session) }
+                            SessionRow(session: session, isPending: session.id == pendingSessionID) {
+                                onSelect(session)
+                            }
                         }
                     }
                     .padding(.horizontal, 8)
@@ -42,7 +50,16 @@ struct SidebarView: View {
                 }
                 .scrollIndicators(.never)
             }
+
+            if let notice {
+                FocusNoticeBanner(
+                    notice: notice, onDismiss: onDismissNotice, onOpenSettings: onOpenAutomationSettings)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .animation(.easeOut(duration: 0.18), value: notice)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .glassEffect(.regular, in: .rect(cornerRadius: 16))
     }
@@ -134,6 +151,7 @@ private struct EmptyStateView: View {
 
 private struct SessionRow: View {
     let session: ClaudeSession
+    var isPending = false
     let action: () -> Void
 
     @State private var hovering = false
@@ -193,8 +211,14 @@ private struct SessionRow: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                TerminalBadge(kind: session.terminal)
-                    .padding(.top, 1)
+                Group {
+                    if isPending {
+                        ProgressView().controlSize(.mini).frame(width: 16, height: 16)
+                    } else {
+                        TerminalBadge(kind: session.terminal)
+                    }
+                }
+                .padding(.top, 1)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -234,6 +258,60 @@ private struct TightLabelStyle: LabelStyle {
             configuration.icon.font(.system(size: 10))
             configuration.title
         }
+    }
+}
+
+// MARK: - Focus notice
+
+private struct FocusNoticeBanner: View {
+    let notice: FocusNotice
+    let onDismiss: () -> Void
+    let onOpenSettings: () -> Void
+
+    private var tint: Color { notice.isError ? .red : .secondary }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: notice.isError ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(notice.isError ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
+                    .padding(.top, 1)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(notice.isError ? "Couldn't focus \(notice.sessionTitle)" : notice.sessionTitle)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(notice.message)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 16, height: 16)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss")
+            }
+            if notice.needsAutomationPermission {
+                Button("Open Automation Settings…", action: onOpenSettings)
+                    .controlSize(.small)
+                    .padding(.leading, 17)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(tint.opacity(notice.isError ? 0.12 : 0.10))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(tint.opacity(0.35), lineWidth: 1))
+        )
+        .accessibilityElement(children: .contain)
     }
 }
 

@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 // MARK: - Resolver strategies
 
@@ -176,8 +177,16 @@ public struct GhosttyFocuser: SessionFocuser {
         self.ghostty = ghostty
     }
 
+    static let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Focus")
+
     public func focus(_ session: ClaudeSession) async -> FocusResult {
-        await focusWithReport(session).result
+        let report = await focusWithReport(session)
+        Self.logger.notice("""
+            ghostty focus pid=\(session.pid) hookID=\(session.ghosttyTerminalID ?? "-", privacy: .public) \
+            resolver=\(report.resolver ?? "-", privacy: .public) terminal=\(report.terminalID ?? "-", privacy: .public) \
+            result=\(String(describing: report.result), privacy: .public)
+            """)
+        return report.result
     }
 
     public func focusWithReport(_ session: ClaudeSession) async -> GhosttyFocusReport {

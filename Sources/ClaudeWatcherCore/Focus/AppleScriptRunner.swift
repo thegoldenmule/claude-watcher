@@ -11,11 +11,15 @@ public enum AppleScriptError: Error, Equatable, Sendable {
     case compileFailed(String)
     case scriptError(code: Int, message: String)
 
+    /// Phrase every `.notPermitted` message contains; `FocusResult.needsAutomationPermission`
+    /// keys off it.
+    static let notPermittedMarker = "isn't allowed to control"
+
     /// User-facing explanation, suitable for `FocusResult.failed(reason:)`.
     public func userMessage(app: String) -> String {
         switch self {
         case .notPermitted:
-            return "ClaudeWatcher isn't allowed to control \(app). Grant it in System Settings → "
+            return "ClaudeWatcher \(Self.notPermittedMarker) \(app). Grant it in System Settings → "
                 + "Privacy & Security → Automation (enable \(app) under ClaudeWatcher)."
         case .timedOut:
             return "\(app) didn't respond in time (it may be busy)."

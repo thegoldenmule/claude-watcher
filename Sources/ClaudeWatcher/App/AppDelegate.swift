@@ -7,6 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let isDemo = DemoMode.isEnabled
     /// nil in demo mode.
     let store: SessionStore?
+    /// The one focuser for the app's lifetime: it holds the Ghostty pid cache and probe locks.
+    let focuser = RoutingFocuser()
     let edge: EdgeController
 
     override init() {
@@ -15,13 +17,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store = nil
             edge = EdgeController(
                 sessions: { DemoMode.sessions },
-                onSelect: { logger.notice("demo select: \($0.title, privacy: .public)") }
+                onSelect: { session in
+                    logger.notice("demo select: \(session.title, privacy: .public)")
+                    return await DemoMode.focusResult(for: session)
+                }
             )
         } else {
             let store = SessionStore()
             self.store = store
-            // TODO(integration): replace LoggingFocuser with the real SessionFocuser.
-            edge = EdgeController(store: store, focuser: LoggingFocuser())
+            edge = EdgeController(store: store, focuser: focuser)
         }
         super.init()
     }

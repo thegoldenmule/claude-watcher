@@ -7,16 +7,10 @@ import SwiftUI
 /// `mouseMoved` monitors, no permissions needed), slides the panel in when the pointer rests
 /// on a screen's left edge, and slides it out after the pointer leaves.
 ///
-/// Integration (e.g. in `AppDelegate.applicationDidFinishLaunching`):
-///
-///     let store = SessionStore()
-///     store.start()
-///     edge = EdgeController(store: store, focuser: GhosttyFocuser())  // keep a strong ref
-///     edge.start()
-///
-/// Or, with any session source and selection handler:
-///
-///     edge = EdgeController(sessions: { store.sessions }, onSelect: { session in ... })
+/// Clicking a row runs `onSelect` (normally a `SessionFocuser`). On `.focused` the panel hides
+/// (unless pinned); otherwise the reason is shown in a banner at the bottom of the panel and
+/// the panel stays up while it's visible, with an "Open Settings" button when Automation
+/// permission is missing.
 ///
 /// The `sessions` closure is evaluated inside SwiftUI's `body`, so reading an `@Observable`
 /// property there (like `SessionStore.sessions`) re-renders the list whenever it changes.
@@ -40,10 +34,16 @@ final class EdgeController {
     /// Whether the panel is (or is animating to be) on screen.
     private(set) var isVisible = false
 
+    /// Session whose focus request is in flight (row shows a spinner).
+    private(set) var pendingSessionID: String?
+    /// Outcome of the last focus attempt that didn't fully succeed; holds the panel open.
+    private(set) var notice: FocusNotice?
+
     private var pinned = false
 
     @ObservationIgnored private let sessionsSource: @MainActor () -> [ClaudeSession]
-    @ObservationIgnored private let selectHandler: @MainActor (ClaudeSession) -> Void
+    @ObservationIgnored private let selectHandler: @MainActor (ClaudeSession) async -> FocusResult
+    @ObservationIgnored private var noticeTask: Task<Void, Never>?
     @ObservationIgnored private var panel: SidebarPanel?
     @ObservationIgnored private var policy = EdgeRevealPolicy()
     @ObservationIgnored private var monitors: [Any] = []
@@ -56,22 +56,29 @@ final class EdgeController {
 
     init(
         sessions: @escaping @MainActor () -> [ClaudeSession],
-        onSelect: @escaping @MainActor (ClaudeSession) -> Void
+        onSelect: @escaping @MainActor (ClaudeSession) async -> FocusResult
     ) {
         self.sessionsSource = sessions
         self.selectHandler = onSelect
     }
 
     /// Convenience: list `store.sessions`, focus the clicked session's terminal via `focuser`.
+    /// Keep `focuser` a single long-lived instance (it caches terminal ids).
     convenience init(store: SessionStore, focuser: any SessionFocuser) {
         let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Focus")
         self.init(
             sessions: { store.sessions },
             onSelect: { session in
-                Task {
-                    let result = await focuser.focus(session)
-                    logger.notice("focus \(session.id, privacy: .public): \(String(describing: result), privacy: .public)")
-                }
+                let started = ContinuousClock.now
+                let result = await focuser.focus(session)
+                let elapsed = ContinuousClock.now - started
+                logger.notice("""
+                    focus \(session.title, privacy: .public) pid=\(session.pid) \
+                    terminal=\(String(describing: session.terminal), privacy: .public) \
+                    hookID=\(session.ghosttyTerminalID ?? "-", privacy: .public): \
+                    \(String(describing: result), privacy: .public) in \(elapsed, privacy: .public)
+                    """)
+                return result
             }
         )
     }
@@ -122,14 +129,51 @@ final class EdgeController {
     fileprivate func currentSessions() -> [ClaudeSession] { sessionsSource() }
 
     fileprivate func select(_ session: ClaudeSession) {
-        selectHandler(session)
-        if !pinned { hide(animated: true) }
+        guard pendingSessionID == nil else { return }  // one focus at a time
+        clearNotice()
+        pendingSessionID = session.id
+        Task {
+            let result = await selectHandler(session)
+            pendingSessionID = nil
+            if result == .focused {
+                if !pinned { hide(animated: true) }
+            } else {
+                post(FocusNotice(session: session, result: result))
+            }
+        }
+    }
+
+    fileprivate func dismissNotice() {
+        clearNotice()
+        tick()
+    }
+
+    fileprivate func openAutomationSettings() {
+        if let url = URL(string: FocusResult.automationSettingsURL) { NSWorkspace.shared.open(url) }
+        dismissNotice()
+    }
+
+    private func post(_ notice: FocusNotice) {
+        noticeTask?.cancel()
+        self.notice = notice
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(for: notice.duration)
+            guard !Task.isCancelled, let self, self.notice?.id == notice.id else { return }
+            self.dismissNotice()
+        }
+    }
+
+    private func clearNotice() {
+        noticeTask?.cancel()
+        noticeTask = nil
+        notice = nil
     }
 
     // MARK: - Pointer tracking
 
     private func tick() {
-        guard panel != nil, !pinned else { return }
+        // A visible notice holds the panel open until it expires or is dismissed.
+        guard panel != nil, !pinned, notice == nil, pendingSessionID == nil else { return }
         let screens = NSScreen.screens
         let decision = policy.evaluate(
             pointer: NSEvent.mouseLocation,
@@ -258,6 +302,26 @@ final class EdgeController {
     }
 }
 
+/// A focus attempt that didn't fully succeed, shown as a banner at the bottom of the panel.
+struct FocusNotice: Identifiable, Equatable {
+    let id = UUID()
+    let sessionTitle: String
+    let message: String
+    /// `.failed` (vs. `.appActivatedOnly`, which is informational).
+    let isError: Bool
+    let needsAutomationPermission: Bool
+
+    init(session: ClaudeSession, result: FocusResult) {
+        sessionTitle = session.title
+        message = result.reason ?? ""
+        if case .failed = result { isError = true } else { isError = false }
+        needsAutomationPermission = result.needsAutomationPermission
+    }
+
+    /// Long enough to read; longer when there's a button to reach.
+    var duration: Duration { needsAutomationPermission ? .seconds(10) : .seconds(4) }
+}
+
 /// Root of the hosted SwiftUI tree. Reading `controller.currentSessions()` inside `body` lets
 /// Observation track whatever the source closure reads.
 private struct SidebarRoot: View {
@@ -267,7 +331,11 @@ private struct SidebarRoot: View {
         SidebarView(
             sessions: controller.currentSessions(),
             isPinned: controller.isPinned,
-            onSelect: { controller.select($0) }
+            pendingSessionID: controller.pendingSessionID,
+            notice: controller.notice,
+            onSelect: { controller.select($0) },
+            onDismissNotice: { controller.dismissNotice() },
+            onOpenAutomationSettings: { controller.openAutomationSettings() }
         )
     }
 }

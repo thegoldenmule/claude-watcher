@@ -326,3 +326,13 @@ func liveListsGhosttyTerminals() async throws {
     #expect(!terms.isEmpty)
     #expect(terms.allSatisfy { UUID(uuidString: $0.id) != nil })
 }
+
+@Test func focusResultFlagsAutomationPermissionFailures() {
+    let denied = FocusResult.failed(reason: AppleScriptError.notPermitted(app: "Ghostty").userMessage(app: "Ghostty"))
+    #expect(denied.needsAutomationPermission)
+    #expect(denied.reason?.contains("Automation") == true)
+    #expect(!FocusResult.failed(reason: AppleScriptError.timedOut.userMessage(app: "Ghostty")).needsAutomationPermission)
+    #expect(!FocusResult.appActivatedOnly(reason: "x").needsAutomationPermission)
+    #expect(FocusResult.focused.reason == nil)
+    #expect(!FocusResult.focused.needsAutomationPermission)
+}

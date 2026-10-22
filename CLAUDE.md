@@ -47,8 +47,14 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `scripts/make-icon.swift` via `make icon` and committed; `build-app.sh` bundles it.
 - `Resources/Info.plist`, `scripts/build-app.sh`, `Makefile`: build tooling. `build-app.sh` also
   takes `HARDENED_RUNTIME=1`, `APP_DIR`, `INFO_PLIST`, `ARCHS` (used by the release script).
-- `scripts/release.sh` (`make release`): notarized universal zip -> GitHub release (see
+- `scripts/release.sh` (`make release`): notarized universal DMG + zip -> GitHub release (see
   "Releasing" below). `Resources/ClaudeWatcher.entitlements`: Apple Events, release builds only.
+- `scripts/build-dmg.sh` (`make dmg`, and `release.sh`): drag-to-Applications DMG via dmgbuild
+  (hash-pinned in `scripts/dmg-requirements.txt`, venv in `$DMG_VENV`, default
+  `.build/dmgbuild-venv`; needs Python 3.10+). Layout in `scripts/dmg-settings.py`, background
+  rendered by `scripts/dmg-background.swift` (660x400 pt, 1x/2x; keep both geometries in sync),
+  volume icon `Resources/AppIcon.icns`. Don't use dmgbuild's `hide_extensions`: it breaks
+  `codesign --strict` on the app ("detritus").
 
 ## Commands
 - `make build` (`swift build`), `make test` (`swift test`)
@@ -56,6 +62,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - `make run`: kills any running instance, builds the app, opens it
 - `make clean`
 - `make icon`: regenerates `Resources/AppIcon.icns` and `docs/icon.png`.
+- `make dmg`: `make app`, then `build/ClaudeWatcher.dmg` from the dev app, to preview the DMG
+  window (`open` it; eject with `hdiutil detach /Volumes/ClaudeWatcher`). Not for distribution.
 - `make release VERSION=X.Y.Z [DRY_RUN=1 [NOTARIZE=1]]`: see "Releasing" below.
 - Demo data, panel pinned: `open build/ClaudeWatcher.app --args --demo` (or `CW_DEMO=1`;
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
@@ -80,9 +88,13 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
 - Preconditions (preflight fails a real release on each; a dry run only warns, except Xcode):
   clean tree; on main; main pushed and equal to origin/main (it fetches); tag `vX.Y.Z` unused
   locally and on origin; an Apple account in Xcode > Settings > Accounts (Account Holder/Admin);
-  `gh` authenticated. Run `make test` first (the script doesn't).
+  `gh` authenticated; a Python 3.10+ (`$PYTHON`, `python3`, Homebrew's; checked even in dry runs)
+  for dmgbuild, whose venv is `.build-release/dmgbuild-venv`. macOS's `/usr/bin/python3` (3.9)
+  only gets dmgbuild 1.6.5, whose `pBBk` bookmark makes Finder on macOS 26 drop the background;
+  `build-dmg.sh` rejects < 3.10 and checks the built `.DS_Store`. Run `make test` first (the
+  script doesn't).
 - Dry runs commit, tag, push and publish nothing (Info.plist is stamped on a copy):
-  `DRY_RUN=1` builds a Developer ID-signed, un-notarized zip (Gatekeeper rejection expected);
+  `DRY_RUN=1` builds a Developer ID-signed, un-notarized DMG + zip (Gatekeeper rejection expected);
   `DRY_RUN=1 NOTARIZE=1` also notarizes, staples and verifies like a real release.
 - Steps, as bare commands: `git push origin main`, then `make release VERSION=X.Y.Z`. A local,
   git-excluded `.claude/settings.local.json` allows `git push` and `make`; piped forms
@@ -94,11 +106,20 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   `com.apple.security.automation.apple-events`), wrapped in an `.xcarchive`;
   `xcodebuild -exportArchive -allowProvisioningUpdates` (developer-id) signs and uploads it, and
   `-exportNotarizedApp` is polled for up to `NOTARY_TIMEOUT` s (default 1800; pass
-  `NOTARY_TIMEOUT=3600` on the make line). It checks team, runtime flag and entitlements, zips,
-  verifies a quarantined extracted copy (`codesign`, `spctl`, `stapler`, `syspolicy_check
-  distribution`), writes the SHA-256, runs `git push --atomic origin main vX.Y.Z`, then
-  `gh release create ... --repo thegoldenmule/claude-watcher --verify-tag --generate-notes
-  --notes-file ...`. Assets `ClaudeWatcher-X.Y.Z.zip` + `.zip.sha256`, in `build/dist/`.
+  `NOTARY_TIMEOUT=3600` on the make line). It checks team, runtime flag and entitlements, builds
+  the DMG (`build-dmg.sh`) and the zip from the stapled app, and verifies both as quarantined
+  downloads: the DMG must be unsigned and hold the app, the `Applications` symlink and its
+  layout; the app in the mounted DMG (detached again in `on_exit` on failure) and in the
+  extracted zip each pass `codesign --strict`, `spctl`, `stapler`, `syspolicy_check
+  distribution`. It writes one SHA-256 file for both, runs `git push --atomic origin main
+  vX.Y.Z`, then `gh release create ... --repo thegoldenmule/claude-watcher --verify-tag
+  --generate-notes --notes-file ...` (install notes: open the DMG, drag to Applications).
+  Assets `ClaudeWatcher-X.Y.Z.dmg`, `.zip` and `.sha256`, in `build/dist/`.
+- Never sign the DMG. The cloud-managed Developer ID can only sign through xcodebuild's export
+  (apps, not disk images), it can't be notarized either, and a DMG signed with any other
+  identity (e.g. Apple Development) is refused by Gatekeeper on open. Unsigned DMGs mount
+  without a prompt; Gatekeeper checks the notarized, stapled app inside. Verification fails if
+  the DMG has a signature.
 - Failure before the push (incl. notarization timeout): deletes the tag and drops the release
   commit (`git reset --keep`, only if both still point at it), or restores Info.plist; fix and
   re-run. A failed push asks `git ls-remote origin refs/tags/vX.Y.Z`: our tag there = pushed;
@@ -106,9 +127,11 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   printed. Failure after the push (e.g. `gh`): nothing is undone and it prints the
   `gh release create` to finish by hand; don't re-run `make release`. Once the release exists
   (`RELEASED`), a later failure or interrupt only reports the URL.
-- Verify: `gh release view vX.Y.Z`; download both assets into an empty dir, `shasum -a 256 -c
-  ClaudeWatcher-X.Y.Z.zip.sha256`, unzip, `spctl -a -vvv -t exec ClaudeWatcher.app`,
-  `xcrun stapler validate ClaudeWatcher.app`; `git rev-parse main origin/main` match.
+- Verify: `gh release view vX.Y.Z` lists the dmg, zip and sha256; download all three into an
+  empty dir, `shasum -a 256 -c ClaudeWatcher-X.Y.Z.sha256`; quarantine the DMG, `hdiutil
+  attach -nobrowse -readonly`, then `spctl -a -vvv -t exec` and `xcrun stapler validate` on the
+  app inside, detach; same for the unzipped app; `git rev-parse main origin/main` match.
+  (v0.1.0 shipped only a zip and `.zip.sha256`.)
 - Afterwards: `make run` to rebuild the local dev app (Apple Development, not hardened, so TCC
   grants persist), and check `build/ClaudeWatcher.app/Contents/Resources/claude-watcher-hook.sh`
   matches `~/Library/Application Support/ClaudeWatcher/claude-watcher-hook.sh` (`cmp`); if not,

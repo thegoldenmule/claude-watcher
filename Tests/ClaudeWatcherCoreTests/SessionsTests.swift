@@ -389,6 +389,28 @@ private let transcriptSample = """
     #expect(store.sessions.first?.title == "derived-name")
 }
 
+@MainActor
+@Test func storeWatcherPicksUpNewRegistryFiles() async throws {
+    let home = try TempHome()
+    let t0 = Date(timeIntervalSince1970: 1792681136)
+    let inspector = FakeInspector(table: [
+        100: ProcessSnapshot(pid: 100, ppid: 1, startTime: t0, executablePath: claudeBinary),
+    ])
+    // Long poll interval: only the directory watcher can deliver the update in time.
+    let store = SessionStore(claudeHome: home.url, inspector: inspector, pollInterval: .seconds(60))
+    store.start()
+    defer { store.stop() }
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(store.sessions.isEmpty)
+    try home.write("sessions/100.json", recordJSON(
+        pid: 100, sessionId: "s-100", cwd: "/x", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0)))
+    for _ in 0..<40 where store.sessions.isEmpty {
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    #expect(store.sessions.map(\.id) == ["s-100"])
+}
+
 // MARK: - Live check (CW_LIVE=1 swift test --filter liveDiscovery)
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["CW_LIVE"] == "1"))

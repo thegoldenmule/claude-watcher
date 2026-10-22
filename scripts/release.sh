@@ -35,7 +35,9 @@
 #
 # A failed run publishes nothing: the commit and tag are pushed only after notarization
 # succeeds, and on failure before that the script deletes the tag and drops the release
-# commit it created (only if HEAD and the tag still point at it).
+# commit it created (only if HEAD and the tag still point at it), or restores Info.plist if
+# it failed before committing. If `git push` fails, origin is asked whether the tag landed
+# anyway; if it did, nothing is rolled back and the finishing `gh release create` is printed.
 
 set -euo pipefail
 
@@ -80,24 +82,83 @@ die()  { printf '\n%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 PREV_SHA=""      # HEAD before the release commit
 RELEASE_SHA=""   # the release commit this run created
 TAG=""
+TAG_OBJ=""       # the annotated tag object this run created
+GH_REPO=""       # owner/name of origin on GitHub, for gh --repo
+PLIST_EDITED=0   # $INFO_PLIST was modified in the working tree
 TAG_CREATED=0
+PUSH_ATTEMPTED=0
 PUSHED=0
+RELEASED=0
+
+# Prints the command that finishes a release whose commit and tag are on origin.
+finish_hint() {
+    cat >&2 <<EOF
+    gh release create $TAG $ZIP_PATH $SUM_PATH --repo $GH_REPO --verify-tag \\
+        --title "$APP_NAME $VERSION" --generate-notes --notes-file $NOTES_PATH
+EOF
+}
 
 on_exit() {
     local rc=$?
     [[ $rc -eq 0 ]] && return
 
-    if [[ $PUSHED -eq 1 ]]; then
-        cat >&2 <<EOF
-
-${RED}Release failed after $TAG was pushed.${RESET} The notarized zip is in $DIST_DIR/.
-Finish publishing by hand:
-    gh release create $TAG $ZIP_PATH $SUM_PATH --verify-tag --title "$APP_NAME $VERSION" \\
-        --generate-notes --notes-file $NOTES_PATH
-EOF
+    if [[ $RELEASED -eq 1 ]]; then
+        printf '\n%sReleased %s%s (interrupted afterwards; nothing left to do): https://github.com/%s/releases/tag/%s\n' \
+            "$GREEN" "$TAG" "$RESET" "$GH_REPO" "$TAG" >&2
         return
     fi
-    [[ -z "$RELEASE_SHA" ]] && return
+
+    # The push may have reached origin even though git reported failure (interrupted,
+    # connection dropped after the remote accepted it). Ask origin before rolling back.
+    if [[ $PUSHED -eq 0 && $PUSH_ATTEMPTED -eq 1 ]]; then
+        local remote
+        if ! remote="$(git ls-remote origin "refs/tags/$TAG" 2>/dev/null)"; then
+            cat >&2 <<EOF
+
+${RED}git push failed and origin could not be checked;${RESET} left the release commit
+${RELEASE_SHA:0:7} and tag $TAG in place. Check with: git ls-remote origin refs/tags/$TAG
+  - if it prints ${TAG_OBJ:0:7}... (or ${RELEASE_SHA:0:7}...), the push went through. Finish it
+    with the notarized zip in $DIST_DIR/:
+EOF
+            finish_hint
+            cat >&2 <<EOF
+  - if it prints nothing, undo the local release:
+        git tag -d $TAG; git reset --keep $PREV_SHA
+EOF
+            return
+        fi
+        case "${remote%%[[:space:]]*}" in
+            "") ;;   # tag not on origin: the push did not happen
+            "$TAG_OBJ"|"$RELEASE_SHA")
+                printf '\n%sgit push reported failure, but origin has %s;%s treating it as pushed.\n' \
+                    "$YELLOW" "$TAG" "$RESET" >&2
+                PUSHED=1 ;;
+            *)
+                warn "origin has a different $TAG (${remote:0:7}); left the local commit and tag alone. To undo them:"
+                printf '        git tag -d %s; git reset --keep %s\n' "$TAG" "$PREV_SHA" >&2
+                return ;;
+        esac
+    fi
+
+    if [[ $PUSHED -eq 1 ]]; then
+        printf '\n%sRelease failed after %s was pushed.%s The notarized zip is in %s/.\nFinish publishing by hand:\n' \
+            "$RED" "$TAG" "$RESET" "$DIST_DIR" >&2
+        finish_hint
+        return
+    fi
+
+    if [[ -z "$RELEASE_SHA" ]]; then
+        # Failed between editing Info.plist and committing it: restore it so the next run
+        # passes the clean-tree preflight.
+        if [[ $PLIST_EDITED -eq 1 ]]; then
+            if git checkout --quiet HEAD -- "$INFO_PLIST"; then
+                info "restored $INFO_PLIST" >&2
+            else
+                warn "could not restore $INFO_PLIST; run: git checkout HEAD -- $INFO_PLIST"
+            fi
+        fi
+        return
+    fi
 
     printf '\n%sRelease failed before anything was pushed; rolling back local changes.%s\n' "$RED" "$RESET" >&2
     if [[ $TAG_CREATED -eq 1 ]]; then
@@ -135,13 +196,24 @@ else
     [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
         || die "VERSION '$VERSION' must be MAJOR.MINOR.PATCH, e.g. 1.2.3 (CFBundleShortVersionString allows only digits and dots)"
 fi
-[[ "$NOTARY_TIMEOUT" =~ ^[0-9]+$ ]] || die "NOTARY_TIMEOUT must be a number of seconds"
+[[ "$NOTARY_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "NOTARY_TIMEOUT must be a positive number of seconds (no leading zeros)"
 TAG="v$VERSION"
 ok "version $VERSION (tag $TAG)"
 
 for tool in swift codesign xcodebuild xcrun ditto git gh shasum lipo spctl "$PLISTBUDDY"; do
     command -v "$tool" >/dev/null || die "required tool not found: $tool"
 done
+
+# owner/name from origin (git@github.com:o/n.git, https://github.com/o/n, ssh://...), so gh
+# targets origin even if another remote or GH_REPO would make it guess differently.
+ORIGIN_URL="$(git remote get-url origin 2>/dev/null)" || die "no git remote named origin"
+GH_REPO="${ORIGIN_URL%/}"; GH_REPO="${GH_REPO%.git}"
+GH_REPO_NAME="${GH_REPO##*/}"; GH_REPO_OWNER="${GH_REPO%/*}"
+[[ "$GH_REPO_OWNER" != "$GH_REPO" ]] || GH_REPO_OWNER=""   # no "/" in the URL
+GH_REPO="${GH_REPO_OWNER##*[/:]}/$GH_REPO_NAME"
+[[ "$GH_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || die "could not derive a GitHub owner/name from origin ($ORIGIN_URL)"
+ok "GitHub repo $GH_REPO (origin)"
 
 # Fatal for a real release; only a warning for a dry run.
 check() {
@@ -211,12 +283,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
     skip "commit of $INFO_PLIST and tag $TAG"
 else
     BUNDLE_PLIST="$INFO_PLIST"
-    "$PLISTBUDDY" -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFO_PLIST"
     PREV_SHA="$(git rev-parse HEAD)"
+    PLIST_EDITED=1   # before the edit, so a failure from here on restores the file
+    "$PLISTBUDDY" -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $BUILD_NUMBER" "$INFO_PLIST"
     git commit --quiet -m "Release $TAG" -- "$INFO_PLIST"
     RELEASE_SHA="$(git rev-parse HEAD)"
     git tag -a "$TAG" -m "$APP_NAME $VERSION"
     TAG_CREATED=1
+    TAG_OBJ="$(git rev-parse "refs/tags/$TAG")"
     ok "committed ${RELEASE_SHA:0:7} \"Release $TAG\" and tagged $TAG (local only until notarized)"
 fi
 
@@ -462,7 +536,7 @@ EOF
 step "Publish"
 if [[ $DRY_RUN -eq 1 ]]; then
     skip "git push --atomic origin main $TAG"
-    skip "gh release create $TAG $ZIP_PATH $SUM_PATH --title \"$APP_NAME $VERSION\" --generate-notes (notes: $NOTES_PATH)"
+    skip "gh release create $TAG $ZIP_PATH $SUM_PATH --repo $GH_REPO --title \"$APP_NAME $VERSION\" --generate-notes (notes: $NOTES_PATH)"
     if [[ $NOTARIZE -eq 1 ]]; then
         printf '\n%sDry run complete.%s Signed, notarized and stapled zip: %s\n' "$GREEN" "$RESET" "$ZIP_PATH"
     else
@@ -471,9 +545,13 @@ if [[ $DRY_RUN -eq 1 ]]; then
     exit 0
 fi
 
+PUSH_ATTEMPTED=1
 git push --atomic origin main "$TAG"
 PUSHED=1
 ok "pushed main and $TAG"
-gh release create "$TAG" "$ZIP_PATH" "$SUM_PATH" --verify-tag \
+gh release create "$TAG" "$ZIP_PATH" "$SUM_PATH" --repo "$GH_REPO" --verify-tag \
     --title "$APP_NAME $VERSION" --generate-notes --notes-file "$NOTES_PATH"
-printf '\n%sReleased %s%s: %s\n' "$GREEN" "$TAG" "$RESET" "$(gh release view "$TAG" --json url -q .url)"
+RELEASED=1
+RELEASE_URL="$(gh release view "$TAG" --repo "$GH_REPO" --json url -q .url 2>/dev/null || true)"
+printf '\n%sReleased %s%s: %s\n' "$GREEN" "$TAG" "$RESET" \
+    "${RELEASE_URL:-https://github.com/$GH_REPO/releases/tag/$TAG}"

@@ -126,6 +126,15 @@ private let terminalBinary = "/System/Applications/Utilities/Terminal.app/Conten
     #expect(SessionRecord(pid: 1, sessionId: "x", cwd: "/", kind: nil).isInteractive)
 }
 
+@Test func filtersHeadlessSDKEntrypoints() {
+    for entrypoint in ["sdk-cli", "sdk-ts", "sdk-py"] {
+        #expect(!SessionRecord(pid: 1, sessionId: "x", cwd: "/", kind: "interactive",
+                               entrypoint: entrypoint).isInteractive)
+    }
+    #expect(SessionRecord(pid: 1, sessionId: "x", cwd: "/", kind: "interactive",
+                          entrypoint: "cli").isInteractive)
+}
+
 @Test func onlyReadsRegistryJSONNeverKeyFiles() {
     #expect(SessionDiscovery.isRegistryFileName("5004.json"))
     #expect(!SessionDiscovery.isRegistryFileName("5004.abcdef.key"))

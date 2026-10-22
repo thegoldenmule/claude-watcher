@@ -58,8 +58,10 @@ public struct SessionRecord: Decodable, Sendable, Equatable {
     }
 
     /// Only interactive sessions are shown. Records without a `kind` (older CLI versions)
-    /// are treated as interactive.
+    /// are treated as interactive. Headless runs (`claude -p`, the Agent SDK) can still say
+    /// `kind: "interactive"`, but their `entrypoint` is `sdk-cli`/`sdk-ts`/`sdk-py`.
     public var isInteractive: Bool {
+        if entrypoint?.hasPrefix("sdk-") == true { return false }
         guard let kind else { return true }
         return kind == "interactive"
     }

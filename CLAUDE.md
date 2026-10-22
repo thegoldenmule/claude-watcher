@@ -134,8 +134,12 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   background ~25% toward palette blue (4; another accent if that's too close) and backs the
   strength off until the result stays in the background's luminance class (relative luminance
   and perceived brightness on the same side of 0.5): never a light flash on a dark theme.
-  Hover tints until `endHover`/another `beginHover`, capped at 3 s; `pulse` is tint, reset, tint,
-  then reset (or the hover tint) over ~450 ms. Only for `.ghostty` sessions whose tty is a
+  Hover tints until `endHover`/another `beginHover`, capped at 3 s; `pulse` is one tint, then
+  ~400 ms later one reset (or the hover tint, if that pane is hovered in another color). Writes
+  share the tty with Claude's output, so they're kept minimal: busy sessions (`.busy`, which
+  stream output) get no hover tint, and a keep-alive `beginHover` drops the tint when a session
+  turns busy (the pulse is still allowed for them); re-hovering the same pane in a new color is a
+  single tint write. Only for `.ghostty` sessions whose tty is a
   `/dev/ttysN` that's the pid's controlling tty and not under tmux; writes reuse the OSC 7
   probe's non-blocking `O_NOCTTY` open and bounded `writeAll`. All tty I/O is on a private
   serial queue; hover requests are coalesced (only the latest is applied, old pane reset first).
@@ -143,8 +147,14 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   can't race a probe's restore. Stuck-tint recovery: a tty is added to
   `~/Library/Application Support/ClaudeWatcher/tinted-ttys` (atomic write) before a tint and
   removed once its reset fully went out; `resetAll()` (launch, panel hide; `resetAllSync` at
-  terminate) sends OSC 111 to every recorded path that's still a `/dev/ttysN` char device and
-  deletes the file.
+  terminate) sends OSC 111 only to recorded paths that are still a `/dev/ttysN` char device
+  **and** that some live process has as its controlling tty (`KERN_PROC_TTY`) with a Ghostty
+  ancestor. Other entries are dropped silently (tty numbers get reused); entries whose reset
+  didn't fully go out stay recorded for the next try. The file is rewritten only when its
+  contents change (removed when empty).
+- Highlight UI (`EdgeController`; the highlighter is nil in demo mode, and demo mode hides the
+  highlight toggles): a focus result only ends its own row's hover tint. The dwell is re-armed
+  for a still-hovered row (`reportedHoverID`) on show and when the hover pref is turned on.
 - Ghostty AppleScript `focus <terminal>` switches Spaces to the target window (verified).
 - Terminal.app: `activate` first, then `set index of w to 1` and `set frontmost of w to true`.
   Raising before `activate` never switches Spaces.

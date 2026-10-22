@@ -108,8 +108,8 @@ private struct SidebarHeader: View {
 
     @Environment(\.terminalStyle) private var style
 
-    private func count(_ status: SessionStatus) -> Int {
-        sessions.lazy.filter { $0.status == status }.count
+    private var counts: [SessionStatus: Int] {
+        sessions.reduce(into: [:]) { $0[$1.status, default: 0] += 1 }
     }
 
     var body: some View {
@@ -127,19 +127,25 @@ private struct SidebarHeader: View {
             }
             .lineLimit(1)
             if !sessions.isEmpty {
-                summary.lineLimit(1).truncationMode(.tail)
+                summary.lineLimit(2).truncationMode(.tail)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var summary: Text {
-        let waiting = count(.waiting), busy = count(.busy)
-        let idle = sessions.count - waiting - busy
+        let counts = counts
+        let waiting = counts[.waiting, default: 0], busy = counts[.busy, default: 0]
+        let idle = counts[.idle, default: 0], unknown = counts[.unknown, default: 0]
+        // Non-breaking spaces inside each part, so a narrow pane wraps between parts only.
+        func part(_ text: String, _ color: Color, bold: Bool = false) -> AttributedString {
+            .span(text.replacingOccurrences(of: " ", with: "\u{00A0}"), color, font: bold ? style.boldFont : nil)
+        }
         var parts: [AttributedString] = []
-        if waiting > 0 { parts.append(.span("● \(waiting) waiting", style.waiting, font: style.boldFont)) }
-        if busy > 0 { parts.append(.span("✳ \(busy) working", style.busy)) }
-        if idle > 0 { parts.append(.span("○ \(idle) idle", style.idle)) }
+        if waiting > 0 { parts.append(part("● \(waiting) waiting", style.waiting, bold: true)) }
+        if busy > 0 { parts.append(part("✳ \(busy) working", style.busy)) }
+        if idle > 0 { parts.append(part("○ \(idle) idle", style.idle)) }
+        if unknown > 0 { parts.append(part("? \(unknown) unknown", style.faint)) }
         return Text(parts.dropFirst().reduce(parts.first ?? "") { $0 + .span("  ") + $1 })
     }
 }
@@ -150,13 +156,14 @@ private struct SidebarHeader: View {
 private struct EmptyStateView: View {
     @Environment(\.terminalStyle) private var style
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.panelVisible) private var panelVisible
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("no claude code sessions running").foregroundStyle(style.faint)
             HStack(spacing: 0) {
                 Text("❯ ").foregroundStyle(style.success).font(style.boldFont)
-                TimelineView(.periodic(from: .now, by: 0.6)) { context in
+                TimelineView(.animation(minimumInterval: 0.6, paused: reduceMotion || !panelVisible)) { context in
                     let on = reduceMotion || Int(context.date.timeIntervalSinceReferenceDate / 0.6) % 2 == 0
                     Rectangle()
                         .fill(style.cursor.opacity(on ? 1 : 0))
@@ -302,6 +309,7 @@ private struct StatusGlyph: View {
 
     @Environment(\.terminalStyle) private var style
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.panelVisible) private var panelVisible
 
     /// Claude Code's thinking spinner, played forwards then backwards.
     private static let frames = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"]
@@ -313,7 +321,7 @@ private struct StatusGlyph: View {
                 if reduceMotion {
                     Text("✳")
                 } else {
-                    TimelineView(.periodic(from: .now, by: 0.12)) { context in
+                    TimelineView(.animation(minimumInterval: 0.12, paused: !panelVisible)) { context in
                         let tick = Int(context.date.timeIntervalSinceReferenceDate / 0.12)
                         Text(Self.frames[tick % Self.frames.count])
                     }
@@ -350,11 +358,12 @@ private struct StatusGlyph: View {
 private struct BrailleSpinner: View {
     @Environment(\.terminalStyle) private var style
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.panelVisible) private var panelVisible
 
     private static let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.08)) { context in
+        TimelineView(.animation(minimumInterval: 0.08, paused: reduceMotion || !panelVisible)) { context in
             let tick = reduceMotion ? 0 : Int(context.date.timeIntervalSinceReferenceDate / 0.08)
             Text(Self.frames[tick % Self.frames.count])
         }
@@ -431,6 +440,12 @@ private struct TerminalButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
     }
+}
+
+extension EnvironmentValues {
+    /// Whether the sidebar panel is on screen. Spinners and the blinking cursor pause while it
+    /// isn't: `TimelineView` keeps firing after `orderOut`, and the panel is hidden most of the time.
+    @Entry var panelVisible = true
 }
 
 extension AttributedString {

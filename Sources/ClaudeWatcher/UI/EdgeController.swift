@@ -370,5 +370,6 @@ private struct SidebarRoot: View {
             onOpenAutomationSettings: { controller.openAutomationSettings() }
         )
         .environment(\.terminalStyle, controller.themeStore.style)
+        .environment(\.panelVisible, controller.isVisible)
     }
 }

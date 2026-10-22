@@ -49,7 +49,7 @@ final class EdgeController {
     var highlightOnHover: Bool = EdgeController.storedFlag(Keys.highlightOnHover) {
         didSet {
             UserDefaults.standard.set(highlightOnHover, forKey: Keys.highlightOnHover)
-            if !highlightOnHover { cancelHoverTint() }
+            if highlightOnHover { rearmHover() } else { cancelHoverTint() }
         }
     }
 
@@ -78,6 +78,9 @@ final class EdgeController {
     @ObservationIgnored private let highlighter: TerminalHighlighter?
     /// Row under the pointer, per the rows' `onHover` (ids only: data updates don't re-tint).
     @ObservationIgnored private var hoveredID: String?
+    /// Row the rows last reported as entered, cleared only by that row's exit. Unlike `hoveredID`
+    /// it survives a hide, so a row still under the pointer can re-arm its dwell on re-show.
+    @ObservationIgnored private var reportedHoverID: String?
     /// Row whose pane `beginHover` was called for (so `endHover` is only sent when needed).
     @ObservationIgnored private var tintedID: String?
     /// Dwell, then keep-alive, for the hovered row's tint.
@@ -161,7 +164,8 @@ final class EdgeController {
         Task {
             let result = await selectHandler(session)
             pendingSessionID = nil
-            endHoverTint()
+            // Only end this row's tint: another row hovered mid-focus keeps its tint and keep-alive.
+            if tintedID == session.id { endHoverTint() }
             if result == .focused {
                 if pulseOnFocus { highlighter?.pulse(session, tint: highlightTint) }
                 // Keep the pulse: this hide must not reset it.
@@ -185,9 +189,11 @@ final class EdgeController {
     fileprivate func rowHoverChanged(_ sessionID: String, inside: Bool) {
         // Enter/exit of adjacent rows may arrive in either order: an exit only clears its own row.
         if inside {
+            reportedHoverID = sessionID
             setHovered(sessionID)
-        } else if hoveredID == sessionID {
-            setHovered(nil)
+        } else {
+            if reportedHoverID == sessionID { reportedHoverID = nil }
+            if hoveredID == sessionID { setHovered(nil) }
         }
     }
 
@@ -226,6 +232,17 @@ final class EdgeController {
                 delay = Self.hoverKeepAlive
             }
         }
+    }
+
+    /// After a re-show or the hover pref coming back on, restarts the dwell for the row last
+    /// reported as hovered (rows don't re-report a pointer that never left them), if no dwell is
+    /// running and the pointer is actually over the panel.
+    private func rearmHover() {
+        guard dwellTask == nil, let id = reportedHoverID, isVisible,
+              let frame = targetFrame, frame.contains(NSEvent.mouseLocation)
+        else { return }
+        hoveredID = nil
+        setHovered(id)
     }
 
     /// Tints (or keeps tinting) `id`'s pane if it's still the hovered row; false stops the loop.
@@ -336,6 +353,7 @@ final class EdgeController {
         targetFrame = target
         isVisible = true
         transitionGeneration += 1
+        rearmHover()
 
         guard animated else {
             panel.alphaValue = 1

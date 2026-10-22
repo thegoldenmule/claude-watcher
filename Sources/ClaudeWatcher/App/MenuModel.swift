@@ -5,8 +5,8 @@ import ServiceManagement
 
 /// State behind the menu bar extra: Claude Code hook install status and Launch at Login.
 /// Refreshed whenever a menu starts tracking, so it reflects edits made outside the app.
-/// Statuses are computed off the main thread (the first `HookInstaller.status` may wait on
-/// resolving Claude Code's config dir) and published on main.
+/// The hook status is computed off the main thread once Claude Code's config dir is resolved,
+/// and published on main; the login-item status is read synchronously (it's cheap).
 @MainActor
 @Observable
 final class MenuModel {
@@ -39,14 +39,18 @@ final class MenuModel {
     func refresh() {
         refreshGeneration += 1
         let generation = refreshGeneration
+        // Cheap, and not worth delaying behind the Claude home resolution.
+        launchAtLoginStatus = SMAppService.mainApp.status
         let script = bundledHookScript
         Task {
-            let (hook, login) = await Task.detached(priority: .userInitiated) {
-                (HookInstaller.status(hookScriptSource: script), SMAppService.mainApp.status)
+            // Suspends (no thread blocked) until the config dir is resolved; the status read
+            // is then just file IO, off main.
+            _ = await SessionDiscovery.resolvedClaudeHome()
+            let hook = await Task.detached(priority: .userInitiated) {
+                HookInstaller.status(hookScriptSource: script)
             }.value
             guard generation == refreshGeneration else { return }
             hookStatus = hook
-            launchAtLoginStatus = login
         }
     }
 

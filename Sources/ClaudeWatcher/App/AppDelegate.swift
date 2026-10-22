@@ -64,9 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Creates and starts the store once the config dir is resolved (off the main thread).
     private func startStore() async {
-        let claudeHome = await Task.detached(priority: .userInitiated) {
-            SessionDiscovery.defaultClaudeHome
-        }.value
+        let claudeHome = await SessionDiscovery.resolvedClaudeHome()
         guard !terminating, slot.store == nil else { return }
         let store = SessionStore(claudeHome: claudeHome, hookStateDirectory: HookStateStore.defaultDirectory)
         slot.store = store

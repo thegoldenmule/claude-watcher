@@ -25,13 +25,6 @@ public final class SessionStore {
     @ObservationIgnored private var rescanPending = false
     @ObservationIgnored private var running = false
 
-    /// The real store: `~/.claude` plus the ClaudeWatcher hook-state directory.
-    public convenience init() {
-        self.init(
-            claudeHome: SessionDiscovery.defaultClaudeHome,
-            hookStateDirectory: HookStateStore.defaultDirectory)
-    }
-
     public init(
         claudeHome: URL,
         hookStateDirectory: URL? = nil,

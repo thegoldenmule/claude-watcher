@@ -64,27 +64,6 @@ final class EdgeController {
         self.selectHandler = onSelect
     }
 
-    /// Convenience: list `store.sessions`, focus the clicked session's terminal via `focuser`.
-    /// Keep `focuser` a single long-lived instance (it caches terminal ids).
-    convenience init(store: SessionStore, focuser: any SessionFocuser) {
-        let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Focus")
-        self.init(
-            sessions: { store.sessions },
-            onSelect: { session in
-                let started = ContinuousClock.now
-                let result = await focuser.focus(session)
-                let elapsed = ContinuousClock.now - started
-                logger.notice("""
-                    focus \(session.title, privacy: .public) pid=\(session.pid) \
-                    terminal=\(String(describing: session.terminal), privacy: .public) \
-                    hookID=\(session.ghosttyTerminalID ?? "-", privacy: .public): \
-                    \(String(describing: result), privacy: .public) in \(elapsed, privacy: .public)
-                    """)
-                return result
-            }
-        )
-    }
-
     // MARK: - Lifecycle
 
     /// Creates the panel and starts watching the pointer. Call once after app launch.

@@ -17,6 +17,14 @@ struct SidebarView: View {
     var onOpenAutomationSettings: () -> Void = {}
     /// The pointer entered (true) or left (false) a session's row.
     var onHoverChange: (_ sessionID: String, _ inside: Bool) -> Void = { _, _ in }
+    /// Laid-out rows' frames in `coordinateSpace` (the whole pane, top-left origin), for
+    /// hit-testing the pointer; rows not currently rendered are absent.
+    var onRowFrames: (_ frames: [String: CGRect]) -> Void = { _ in }
+    /// The session list's visible area in `coordinateSpace`; row frames outside it are scrolled away.
+    var onListViewport: (_ viewport: CGRect) -> Void = { _ in }
+
+    /// Named coordinate space of the whole pane, which fills the panel's content view.
+    nonisolated static let coordinateSpace = "sidebarPane"
 
     @Environment(\.terminalStyle) private var style
 
@@ -55,11 +63,19 @@ struct SidebarView: View {
                             ) {
                                 onSelect(session)
                             }
+                            .background(GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: RowFramesKey.self,
+                                    value: [session.id: geometry.frame(in: .named(Self.coordinateSpace))])
+                            })
                         }
                     }
                     .padding(.vertical, style.lineHeight * 0.25)
                 }
                 .scrollIndicators(.never)
+                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(Self.coordinateSpace)) } action: {
+                    onListViewport($0)
+                }
             }
 
             Spacer(minLength: 0)
@@ -80,6 +96,16 @@ struct SidebarView: View {
             RoundedRectangle(cornerRadius: TerminalStyle.cornerRadius, style: .continuous)
                 .strokeBorder(style.border, lineWidth: 1))
         .environment(\.colorScheme, style.colorScheme)
+        .onPreferenceChange(RowFramesKey.self) { onRowFrames($0) }  // [:] once the list is gone
+        .coordinateSpace(.named(Self.coordinateSpace))
+    }
+}
+
+/// Session rows' frames by id, in `SidebarView.coordinateSpace`.
+private struct RowFramesKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { $1 }
     }
 }
 

@@ -278,19 +278,24 @@ final class EdgeController {
             panel.setFrame(target, display: true)
             if !panel.isVisible { panel.alphaValue = 0 }
             panel.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { ctx in
+            NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.15
                 panel.animator().alphaValue = 1
-            }
+            }, completionHandler: {
+                MainActor.assumeIsolated { panel.invalidateShadow() }
+            })
         } else {
             panel.alphaValue = 1
             if !panel.isVisible { panel.setFrame(offscreen, display: false) }
             panel.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { ctx in
+            NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.18
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().setFrame(target, display: true)
-            }
+            }, completionHandler: {
+                // The shadow follows the pane's rounded alpha, which only exists once drawn.
+                MainActor.assumeIsolated { panel.invalidateShadow() }
+            })
         }
     }
 

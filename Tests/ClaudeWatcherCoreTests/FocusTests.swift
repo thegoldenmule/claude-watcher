@@ -307,6 +307,228 @@ func focuserFallsThroughStaleAndCaches() async {
     #expect(!OSC7Probe.hostName().isEmpty)
 }
 
+// MARK: - OSC 7 probe writes and restore
+
+/// Records every write; `accept` decides how many bytes of each call "go out".
+private final class FakeTTY: @unchecked Sendable {
+    let lock = NSLock()
+    var calls: [[UInt8]] = []
+    var accept: ([UInt8], Int) -> Int  // (bytes, call index) -> written
+    init(accept: @escaping ([UInt8], Int) -> Int = { bytes, _ in bytes.count }) { self.accept = accept }
+
+    var strings: [String] { lock.withLock { calls.map { String(decoding: $0, as: UTF8.self) } } }
+
+    func io(controlling: Bool = true, lockDirectory: URL) -> OSC7ProbeIO {
+        OSC7ProbeIO(
+            isControllingTTY: { _, _ in controlling },
+            write: { bytes, _ in
+                self.lock.withLock {
+                    let n = self.accept(bytes, self.calls.count)
+                    self.calls.append(bytes)
+                    return n
+                }
+            },
+            hostName: { "mac.local" },
+            lock: OSC7ProbeLock(directory: lockDirectory, maxWait: .milliseconds(100)))
+    }
+}
+
+private func tempDir() -> URL {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cw-probe-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+private let probeTTY = "/dev/ttys999"
+private let restoreSeq = "\u{1B}]7;file://mac.local/Users/me/p\u{07}"
+
+private func nonceRunner(_ id: String) -> FakeRunner {
+    FakeRunner { src in
+        let nonce = src.components(separatedBy: "\"").first { $0.hasPrefix("CW-") } ?? "?"
+        return .success("\(id)\u{1F}\u{1F}/tmp/\(nonce)\u{1E}")
+    }
+}
+
+@Test func osc7ProbeWritesNonceThenRestoresAndReleasesLock() async throws {
+    let dir = tempDir(), tty = FakeTTY()
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: nonceRunner("T1")),
+                                                 io: tty.io(lockDirectory: dir))
+    #expect(try id.get() == "T1")
+    #expect(tty.strings.count == 2)
+    #expect(tty.strings.first?.hasPrefix("\u{1B}]7;file://mac.local/tmp/CW-42-") == true)
+    #expect(tty.strings.last == restoreSeq)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)  // lock released
+}
+
+@Test func osc7ProbeSkipsWhenNotControllingTTY() async throws {
+    let dir = tempDir(), tty = FakeTTY(), fake = nonceRunner("T1")
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: fake),
+                                                 io: tty.io(controlling: false, lockDirectory: dir))
+    #expect(try id.get() == nil)
+    #expect(tty.calls.isEmpty)  // neither nonce nor restore written
+    #expect(fake.scripts.isEmpty)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path).isEmpty)
+}
+
+@Test func osc7ProbeWritesNothingMoreWhenNonceWriteFails() async throws {
+    let tty = FakeTTY { _, _ in 0 }, fake = nonceRunner("T1")
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: fake), io: tty.io(lockDirectory: tempDir()))
+    #expect(try id.get() == nil)
+    #expect(tty.calls.count == 1)  // nothing went out, so nothing to terminate or restore
+    #expect(fake.scripts.isEmpty)
+}
+
+@Test func osc7ProbeTerminatesPartialNonceAndRestores() async throws {
+    let tty = FakeTTY { bytes, call in call == 0 ? 5 : bytes.count }, fake = nonceRunner("T1")
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: fake), io: tty.io(lockDirectory: tempDir()))
+    #expect(try id.get() == nil)
+    #expect(Array(tty.strings.dropFirst()) == ["\u{07}", restoreSeq])
+    #expect(fake.scripts.isEmpty)  // no lookup for an incomplete nonce
+}
+
+@Test func osc7ProbeRestoreFailureIsReportedAndTerminated() async throws {
+    // Full nonce, lookup succeeds, restore only partly written: BEL terminates it.
+    let tty = FakeTTY { bytes, call in call == 1 ? 3 : bytes.count }
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: nonceRunner("T1")),
+                                                 io: tty.io(lockDirectory: tempDir()))
+    #expect(try id.get() == "T1")
+    #expect(Array(tty.strings.dropFirst()) == [restoreSeq, "\u{07}"])
+
+    let failing = FakeTTY { _, _ in 0 }
+    #expect(!OSC7ProbeCoordinator.restore(tty: probeTTY, host: "mac.local", cwd: "/Users/me/p",
+                                          nonceTerminated: true, io: failing.io(lockDirectory: tempDir())))
+    #expect(failing.strings == [restoreSeq])  // nothing went out: no stray BEL
+}
+
+@Test func osc7ProbeRestoresAfterLookupError() async throws {
+    let tty = FakeTTY()
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: FakeRunner { _ in .failure(.timedOut) }),
+                                                 io: tty.io(lockDirectory: tempDir()))
+    #expect(throws: AppleScriptError.self) { try id.get() }
+    #expect(tty.strings.last == restoreSeq)
+}
+
+@Test func osc7ProbeSkipsWhileAnotherProcessHoldsTheLock() async throws {
+    let dir = tempDir(), tty = FakeTTY(), fake = nonceRunner("T1")
+    let other = try #require(await OSC7ProbeLock(directory: dir).acquire(tty: probeTTY))
+    defer { other.release() }
+    let id = await OSC7ProbeCoordinator.runProbe(tty: probeTTY, pid: 42, restoreCwd: "/Users/me/p",
+                                                 ghostty: GhosttyScripting(runner: fake), io: tty.io(lockDirectory: dir))
+    #expect(try id.get() == nil)
+    #expect(tty.calls.isEmpty)
+    #expect(fake.scripts.isEmpty)
+}
+
+/// A FIFO whose buffer is full stands in for a flow-controlled (XOFF) tty.
+@Test func osc7WriteAllRetriesUntilDrainedAndIsBounded() async throws {
+    let path = tempDir().appendingPathComponent("fifo").path
+    #expect(mkfifo(path, 0o600) == 0)
+    let rfd = open(path, O_RDONLY | O_NONBLOCK)
+    let wfd = open(path, O_WRONLY | O_NONBLOCK)
+    #expect(rfd >= 0 && wfd >= 0)
+    defer { close(rfd); close(wfd) }
+    let chunk = [UInt8](repeating: 0x41, count: 4096)
+    while chunk.withUnsafeBytes({ Darwin.write(wfd, $0.baseAddress, $0.count) }) > 0 {}
+
+    // Full and nobody reading: gives up after the timeout instead of hanging.
+    let start = ContinuousClock.now
+    #expect(OSC7Probe.writeAll(Array("hello".utf8), to: wfd, timeout: .milliseconds(50)) == 0)
+    let elapsed = ContinuousClock.now - start
+    #expect(elapsed >= .milliseconds(40) && elapsed < .milliseconds(500))
+
+    // A reader drains it shortly after: the whole payload goes out.
+    let drainFD = rfd
+    let drainer = Task.detached {
+        try? await Task.sleep(for: .milliseconds(30))
+        var buf = [UInt8](repeating: 0, count: 65536)
+        _ = buf.withUnsafeMutableBytes { read(drainFD, $0.baseAddress, $0.count) }
+    }
+    let payload = Array(OSC7Probe.restoreSequence(host: "mac.local", cwd: "/Users/me/p").utf8)
+    #expect(OSC7Probe.writeAll(payload, to: wfd, timeout: .milliseconds(200)) == payload.count)
+    await drainer.value
+}
+
+@Test func osc7WriteRejectsNonTTYPaths() {
+    #expect(OSC7Probe.write(Array("x".utf8), toTTY: "/tmp/ttys001") == 0)
+    #expect(!OSC7Probe.write("x", toTTY: "/dev/console"))
+}
+
+// MARK: - Cross-process probe lock
+
+@Test func probeLockAcquireRelease() async throws {
+    let dir = tempDir().appendingPathComponent("hook-state")  // created on demand
+    let lock = OSC7ProbeLock(directory: dir)
+    #expect(lock.lockPath(forTTY: "/dev/ttys001") == dir.appendingPathComponent(".probe-ttys001.lock").path)
+    #expect(lock.lockPath(forTTY: "/dev/tty s;x") == nil)
+
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    let owner = try String(contentsOfFile: held.path + "/owner", encoding: .utf8)
+    #expect(owner == "\(getpid()) \(held.token)\n")
+    guard case .busy = lock.tryAcquire(tty: "/dev/ttys001") else { Issue.record("expected busy"); return }
+    guard case .acquired(let other) = lock.tryAcquire(tty: "/dev/ttys002") else { Issue.record("per-tty"); return }
+    other.release()
+
+    #expect(held.release())
+    #expect(!FileManager.default.fileExists(atPath: held.path))
+    let again = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    #expect(again.token != held.token)
+    again.release()
+}
+
+@Test func probeLockWaitsBoundedThenSkips() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir, maxWait: .milliseconds(150), pollInterval: .milliseconds(25))
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+
+    let start = ContinuousClock.now
+    #expect(await lock.acquire(tty: "/dev/ttys001") == nil)
+    let elapsed = ContinuousClock.now - start
+    #expect(elapsed >= .milliseconds(150) && elapsed < .seconds(1))
+
+    // Released mid-wait: the waiter gets it.
+    let releaser = Task.detached { try? await Task.sleep(for: .milliseconds(50)); held.release() }
+    let waited = await lock.acquire(tty: "/dev/ttys001")
+    #expect(waited != nil)
+    waited?.release()
+    await releaser.value
+}
+
+@Test func probeLockBreaksStaleLockByRename() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir, maxWait: .zero)
+    let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
+    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+    try "999 deadbeef\n".write(toFile: path + "/owner", atomically: false, encoding: .utf8)
+
+    // Fresh lock held by someone else: busy.
+    #expect(await lock.acquire(tty: "/dev/ttys001") == nil)
+
+    try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -20)], ofItemAtPath: path)
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    #expect(held.path == path)
+    let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+    #expect(names == [".probe-ttys001.lock"])  // the renamed-aside stale lock was removed
+    #expect(held.release())
+}
+
+@Test func probeLockReleaseRequiresOurToken() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir)
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    // Broken as stale and re-taken by another process meanwhile.
+    try "123 0123456789abcdef\n".write(toFile: held.path + "/owner", atomically: false, encoding: .utf8)
+    #expect(!held.release())
+    #expect(FileManager.default.fileExists(atPath: held.path + "/owner"))
+    #expect(OSC7ProbeLock.ownerToken("123 0123456789abcdef\n") == "0123456789abcdef")
+    #expect(OSC7ProbeLock.ownerToken("") == nil)
+}
+
 // MARK: - Nonce lookup polling
 
 /// A nonce-lookup reply: `id US US wd RS` per terminal.

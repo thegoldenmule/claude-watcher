@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 
 /// Maps a session's tty to a Ghostty terminal by writing an OSC 7 ("current directory") escape
 /// with a unique nonce path to the tty, asking Ghostty which terminal's `working directory`
@@ -50,15 +51,48 @@ public enum OSC7Probe {
         return name.isEmpty ? "localhost" : name
     }
 
-    /// Writes `string` to `tty` without making it our controlling terminal and without blocking
-    /// (a flow-controlled tty returns EAGAIN instead of hanging).
+    /// Bound on how long one sequence write waits for a flow-controlled tty to drain.
+    static let writeTimeout: Duration = .milliseconds(200)
+
+    /// Writes `string` to `tty`; true if every byte went out (see `write(_:toTTY:)`).
     static func write(_ string: String, toTTY tty: String) -> Bool {
-        guard isWritableTTYPath(tty) else { return false }
-        let fd = open(tty, O_WRONLY | O_NOCTTY | O_NONBLOCK)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
         let bytes = Array(string.utf8)
-        return bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) } == bytes.count
+        return write(bytes, toTTY: tty) == bytes.count
+    }
+
+    /// Writes `bytes` to `tty` without making it our controlling terminal and without blocking
+    /// indefinitely (a flow-controlled tty returns EAGAIN instead of hanging; we then wait up to
+    /// `writeTimeout` for it to drain). Returns how many bytes were written.
+    static func write(_ bytes: [UInt8], toTTY tty: String) -> Int {
+        guard isWritableTTYPath(tty) else { return 0 }
+        let fd = open(tty, O_WRONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return 0 }
+        defer { close(fd) }
+        return writeAll(bytes, to: fd, timeout: writeTimeout)
+    }
+
+    /// Writes `bytes` to a non-blocking `fd`, retrying short writes and EAGAIN by waiting for
+    /// `POLLOUT`, for at most `timeout` in total. Returns how many bytes were written.
+    static func writeAll(_ bytes: [UInt8], to fd: Int32, timeout: Duration) -> Int {
+        let deadline = ContinuousClock.now + timeout
+        var offset = 0
+        while offset < bytes.count {
+            let n = bytes.withUnsafeBytes { buf in
+                Darwin.write(fd, buf.baseAddress! + offset, buf.count - offset)
+            }
+            if n > 0 { offset += n; continue }
+            if n < 0, errno == EINTR { continue }
+            guard n == 0 || errno == EAGAIN else { break }
+            let remaining = deadline - ContinuousClock.now
+            guard remaining > .zero else { break }
+            let (secs, attos) = remaining.components
+            let ms = Int32(clamping: secs * 1000 + (attos + 999_999_999_999_999) / 1_000_000_000_000_000)
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let ready = poll(&pfd, 1, max(1, ms))
+            if ready < 0, errno == EINTR { continue }
+            guard ready > 0, pfd.revents & Int16(POLLERR | POLLHUP | POLLNVAL) == 0 else { break }
+        }
+        return offset
     }
 
     /// True if `pid` is alive and `tty` is its controlling terminal (guards against writing to a
@@ -110,21 +144,41 @@ enum ProcessTree {
     }
 }
 
-/// Serialises OSC 7 probes per tty (concurrent probes on one tty clobber each other's pwd)
-/// and coalesces concurrent requests for the same tty into one probe.
+/// Side effects of a probe, injectable for tests.
+struct OSC7ProbeIO: Sendable {
+    var isControllingTTY: @Sendable (_ tty: String, _ pid: Int32) -> Bool = { OSC7Probe.isControllingTTY($0, ofPID: $1) }
+    /// Writes bytes to the tty with bounded retry; returns how many were written.
+    var write: @Sendable (_ bytes: [UInt8], _ tty: String) -> Int = { OSC7Probe.write($0, toTTY: $1) }
+    var hostName: @Sendable () -> String = { OSC7Probe.hostName() }
+    var lock = OSC7ProbeLock()
+}
+
+/// Serialises OSC 7 probes per tty (concurrent probes on one tty clobber each other's pwd) and
+/// coalesces concurrent requests for the same tty into one probe. In-process via `inFlight`;
+/// across processes (the hook's detached probe) via `OSC7ProbeLock`.
 public actor OSC7ProbeCoordinator {
     private var inFlight: [String: Task<Result<String?, AppleScriptError>, Never>] = [:]
+    private let io: OSC7ProbeIO
 
-    public init() {}
+    public init() { self.init(io: OSC7ProbeIO()) }
+
+    /// `lockDirectory` overrides the hook-state directory that holds the shared probe locks.
+    public init(lockDirectory: URL) { self.init(io: OSC7ProbeIO(lock: OSC7ProbeLock(directory: lockDirectory))) }
+
+    init(io: OSC7ProbeIO) { self.io = io }
+
+    static let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Focus")
 
     /// Returns the Ghostty terminal id hosting `tty`, or nil if the probe found nothing or was
-    /// skipped (invalid tty, process gone, tty not the process's controlling terminal).
+    /// skipped (invalid tty, process gone, tty not the process's controlling terminal, another
+    /// probe of this tty held the lock for too long, nonce not fully written).
     public func probe(tty: String, pid: Int32, restoreCwd: String, ghostty: GhosttyScripting)
         async throws(AppleScriptError) -> String?
     {
         if let existing = inFlight[tty] { return try await existing.value.get() }
+        let io = self.io
         let task = Task { () -> Result<String?, AppleScriptError> in
-            await Self.runProbe(tty: tty, pid: pid, restoreCwd: restoreCwd, ghostty: ghostty)
+            await Self.runProbe(tty: tty, pid: pid, restoreCwd: restoreCwd, ghostty: ghostty, io: io)
         }
         inFlight[tty] = task
         let result = await task.value
@@ -132,26 +186,54 @@ public actor OSC7ProbeCoordinator {
         return try result.get()
     }
 
-    private static func runProbe(tty: String, pid: Int32, restoreCwd: String, ghostty: GhosttyScripting)
+    static func runProbe(tty: String, pid: Int32, restoreCwd: String, ghostty: GhosttyScripting, io: OSC7ProbeIO)
         async -> Result<String?, AppleScriptError>
     {
-        guard OSC7Probe.isWritableTTYPath(tty), OSC7Probe.isControllingTTY(tty, ofPID: pid) else {
+        guard OSC7Probe.isWritableTTYPath(tty), io.isControllingTTY(tty, pid) else { return .success(nil) }
+        guard let held = await io.lock.acquire(tty: tty) else {
+            logger.notice("osc7 probe skipped: lock busy tty=\(tty, privacy: .public)")
             return .success(nil)
         }
-        let host = OSC7Probe.hostName()
+        defer { held.release() }
+        // Re-check after a possible wait: the session may have exited meanwhile.
+        guard io.isControllingTTY(tty, pid) else { return .success(nil) }
+
+        let host = io.hostName()
         let nonce = OSC7Probe.makeNonce(pid: pid)
-        guard OSC7Probe.write(OSC7Probe.probeSequence(host: host, nonce: nonce), toTTY: tty) else {
-            return .success(nil)
-        }
+        let probe = Array(OSC7Probe.probeSequence(host: host, nonce: nonce).utf8)
+        let sent = io.write(probe, tty)
+        guard sent > 0 else { return .success(nil) }  // nothing went out: nothing to undo
         defer {
             let cwd = restoreCwd.isEmpty ? NSHomeDirectory() : restoreCwd
-            _ = OSC7Probe.write(OSC7Probe.restoreSequence(host: host, cwd: cwd), toTTY: tty)
+            restore(tty: tty, host: host, cwd: cwd, nonceTerminated: sent == probe.count, io: io)
         }
+        guard sent == probe.count else { return .success(nil) }
         do throws(AppleScriptError) {
             let ids = try await ghostty.terminalIDs(withNonceWorkingDirectory: nonce)
             return .success(ids.count == 1 ? ids[0] : nil)
         } catch {
             return .failure(error)
         }
+    }
+
+    /// Terminates a partially written nonce sequence with BEL, then writes the real cwd back
+    /// (again BEL-terminated if it only partly went out). Logs and returns false on failure.
+    @discardableResult
+    static func restore(tty: String, host: String, cwd: String, nonceTerminated: Bool, io: OSC7ProbeIO) -> Bool {
+        let bel: [UInt8] = [0x07]
+        if !nonceTerminated, io.write(bel, tty) != 1 {
+            logger.error("osc7 probe: couldn't terminate partial nonce tty=\(tty, privacy: .public)")
+        }
+        let restore = Array(OSC7Probe.restoreSequence(host: host, cwd: cwd).utf8)
+        let written = io.write(restore, tty)
+        guard written == restore.count else {
+            if written > 0 { _ = io.write(bel, tty) }
+            logger.error("""
+                osc7 probe: cwd restore failed tty=\(tty, privacy: .public) \
+                wrote=\(written)/\(restore.count)
+                """)
+            return false
+        }
+        return true
     }
 }

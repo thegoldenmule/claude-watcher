@@ -1,3 +1,5 @@
+<img src="docs/icon.png" width="128" height="128" alt="ClaudeWatcher icon">
+
 # ClaudeWatcher
 
 A macOS auto-hiding left-edge sidebar that lists your running [Claude Code](https://claude.com/claude-code)

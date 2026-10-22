@@ -15,12 +15,14 @@ run: app
 test:
 	swift test
 
-# Regenerates Resources/AppIcon.icns from scripts/make-icon.swift (the .icns is committed).
+# Regenerates Resources/AppIcon.icns (and the README's docs/icon.png) from
+# scripts/make-icon.swift. Both are committed, so builds don't need this.
 icon:
 	@set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	swift scripts/make-icon.swift "$$tmp"; \
 	iconutil -c icns "$$tmp/AppIcon.iconset" -o Resources/AppIcon.icns; \
-	echo "wrote Resources/AppIcon.icns"
+	mkdir -p docs; cp "$$tmp/AppIcon.iconset/icon_128x128@2x.png" docs/icon.png; \
+	echo "wrote Resources/AppIcon.icns, docs/icon.png"
 
 clean:
 	swift package clean

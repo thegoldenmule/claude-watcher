@@ -10,7 +10,7 @@ import Foundation
 /// the diff is limited to our entries (see `OrderedJSON` for the small caveats).
 public enum HookInstaller {
     public enum InstallStatus: Sendable, Equatable {
-        /// Script present and every event has exactly our expected entry.
+        /// Script present and every event has exactly our expected entry, in a match-all group.
         case installed
         /// No entries of ours in settings.
         case notInstalled
@@ -281,6 +281,9 @@ public enum HookInstaller {
         return result
     }
 
+    /// `.installed` only if every registered event has exactly our desired handler, in a
+    /// match-all group (the same rule `mergeEntries` uses). A handler of ours under a restricting
+    /// matcher counts as found but makes the result `.outdated`: it would not fire for every event.
     static func entriesStatus(root: OrderedJSON, command: String) -> InstallStatus {
         guard case let .object(eventPairs)? = root["hooks"] else { return .notInstalled }
         var foundAny = false
@@ -288,9 +291,11 @@ public enum HookInstaller {
         for event in events {
             var ours: [OrderedJSON] = []
             for group in eventPairs.first(where: { $0.0 == event })?.1.arrayValue ?? [] {
-                ours += (group["hooks"]?.arrayValue ?? []).filter(isOurs)
+                let mine = (group["hooks"]?.arrayValue ?? []).filter(isOurs)
+                guard !mine.isEmpty else { continue }
+                foundAny = true
+                if isMatchAll(group) { ours += mine } else { allExact = false }
             }
-            foundAny = foundAny || !ours.isEmpty
             if ours != [desiredHandler(event: event, command: command)] { allExact = false }
         }
         // Stray entries of ours under events we no longer register.

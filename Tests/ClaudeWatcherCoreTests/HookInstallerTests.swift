@@ -419,6 +419,70 @@ import Testing
         #expect(box.status() == .installed)
     }
 
+    /// Installs into the fixture, then replaces the Notification array with `groups(desired)`.
+    static func withNotificationGroups(
+        _ box: Sandbox, _ groups: (OrderedJSON) -> [OrderedJSON]
+    ) throws {
+        _ = try box.install()
+        let command = HookInstaller.hookCommand(
+            scriptPath: HookInstaller.installedScriptURL(installDirectory: box.installDir).path)
+        let desired = HookInstaller.desiredHandler(event: "Notification", command: command)
+        var root = try OrderedJSON.parse(Data(contentsOf: box.settings))
+        var hooks = try #require(root["hooks"])
+        hooks.set("Notification", .array(groups(desired)))
+        root.set("hooks", hooks)
+        try Data(root.serialized().utf8).write(to: box.settings)
+    }
+
+    static let notifier = OrderedJSON.object([("type", .string("command")), ("command", .string("notifier.sh"))])
+
+    @Test func statusOutdatedWhenOnlyHandlerIsInRestrictingGroup() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        try Self.withNotificationGroups(box) { desired in
+            [.object([("matcher", .string("idle_prompt")), ("hooks", .array([Self.notifier, desired]))])]
+        }
+        // Exactly our handler, but it would fire only on idle_prompt.
+        #expect(box.status() == .outdated)
+        #expect(try box.install() != nil)
+        #expect(box.status() == .installed)
+        let json = try box.json()
+        let groups = try #require((json["hooks"] as? [String: Any])?["Notification"] as? [[String: Any]])
+        #expect(groups.count == 2)
+        #expect(groups.first?["matcher"] as? String == "idle_prompt")
+        #expect((groups.first?["hooks"] as? [[String: Any]])?.count == 1)
+        #expect(groups.last?["matcher"] == nil)
+    }
+
+    @Test func statusOutdatedWhenExtraHandlerIsInRestrictingGroup() throws {
+        let box = try Sandbox(settings: Self.fixture)
+        defer { box.cleanup() }
+        try Self.withNotificationGroups(box) { desired in
+            [
+                .object([("matcher", .string("idle_prompt")), ("hooks", .array([desired]))]),
+                .object([("hooks", .array([desired]))]),
+            ]
+        }
+        #expect(box.status() == .outdated)
+        #expect(try box.install() != nil)
+        #expect(box.status() == .installed)
+    }
+
+    @Test func statusInstalledWithMatchAllMatchers() throws {
+        for matcher in ["", "*"] {
+            let box = try Sandbox(settings: Self.fixture)
+            defer { box.cleanup() }
+            try Self.withNotificationGroups(box) { desired in
+                [
+                    .object([("matcher", .string("idle_prompt")), ("hooks", .array([Self.notifier]))]),
+                    .object([("matcher", .string(matcher)), ("hooks", .array([Self.notifier, desired]))]),
+                ]
+            }
+            #expect(box.status() == .installed, "matcher \(matcher)")
+            #expect(try box.install() == nil, "matcher \(matcher)")
+        }
+    }
+
     @Test func refusesNonObjectSettingsWithoutWriting() throws {
         let box = try Sandbox(settings: "[1, 2]\n")
         defer { box.cleanup() }

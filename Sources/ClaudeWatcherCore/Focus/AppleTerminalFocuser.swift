@@ -2,9 +2,10 @@ import AppKit
 
 /// Focuses the Terminal.app tab whose `tty` equals `session.tty`. Never launches Terminal.
 ///
-/// The script selects the tab, raises its window (`index 1`), un-minimises it and sends
-/// `activate`. Returns `.focused`, `.appActivatedOnly` (no tty / no matching tab: Terminal is
-/// just raised) or `.failed` (not running, permission, timeout).
+/// The script un-minimises the window, selects the tab, activates Terminal, then raises the
+/// window (`index 1`, `frontmost true`), which also switches to its Space. Returns `.focused`,
+/// `.appActivatedOnly` (no tty / no matching tab: Terminal is just raised) or `.failed`
+/// (not running, permission, timeout).
 public struct AppleTerminalFocuser: SessionFocuser {
     public let runner: any AppleScriptExecuting
     static let app = "Terminal"
@@ -21,18 +22,30 @@ public struct AppleTerminalFocuser: SessionFocuser {
     }
 
     /// Returns the matched window's id (its CGWindowID) as text, or "notfound".
+    /// The window is re-resolved by id before changing it: `repeat with w in windows` yields
+    /// index-based references, and `set index of w to 1` would make later uses of `w` point at
+    /// a different window.
+    ///
+    /// Space switching: `activate` must come *before* raising, and `set frontmost … to true`
+    /// is what switches to the window's Space (verified, macOS 26, "switch to a Space with open
+    /// windows" off). `set index … to 1` alone is a no-op for the window already at index 1,
+    /// and raising before `activate` never switches Spaces.
     public static func focusScript(tty: String) -> String {
         """
         with timeout of 3 seconds
           tell application id "\(AppActivation.appleTerminalBundleID)"
             repeat with w in windows
-              repeat with t in tabs of w
-                if tty of t is \(AppleScriptSource.quoted(normalizeTTY(tty))) then
-                  if miniaturized of w then set miniaturized of w to false
-                  set selected tab of w to t
-                  set index of w to 1
+              set tabTTYs to tty of tabs of w
+              repeat with i from 1 to count of tabTTYs
+                if item i of tabTTYs is \(AppleScriptSource.quoted(normalizeTTY(tty))) then
+                  set wid to id of w
+                  set tw to window id wid
+                  if miniaturized of tw then set miniaturized of tw to false
+                  set selected tab of tw to tab i of tw
                   activate
-                  return (id of w) as text
+                  set index of tw to 1
+                  set frontmost of tw to true
+                  return wid as text
                 end if
               end repeat
             end repeat

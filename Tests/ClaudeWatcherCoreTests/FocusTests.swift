@@ -426,32 +426,57 @@ private func nonceRunner(_ id: String) -> FakeRunner {
 }
 
 /// A FIFO whose buffer is full stands in for a flow-controlled (XOFF) tty.
-@Test func osc7WriteAllRetriesUntilDrainedAndIsBounded() async throws {
+///
+/// Deterministic under parallel load: the pipe is filled to the last byte (so even a 5-byte write
+/// gets EAGAIN; macOS writes of <= PIPE_BUF are all-or-nothing), and the drainer is a dedicated
+/// thread, not a Task: `writeAll` blocks its thread in poll(), and with the cooperative pool busy
+/// with other tests a detached Task could start only after the deadline. The success case uses a
+/// generous timeout, since it returns as soon as the drain makes room.
+@Test func osc7WriteAllRetriesUntilDrainedAndIsBounded() throws {
     let path = tempDir().appendingPathComponent("fifo").path
     #expect(mkfifo(path, 0o600) == 0)
     let rfd = open(path, O_RDONLY | O_NONBLOCK)
     let wfd = open(path, O_WRONLY | O_NONBLOCK)
-    #expect(rfd >= 0 && wfd >= 0)
+    try #require(rfd >= 0 && wfd >= 0)
     defer { close(rfd); close(wfd) }
+
+    // Fill completely: big chunks, then single bytes until no byte fits.
     let chunk = [UInt8](repeating: 0x41, count: 4096)
-    while chunk.withUnsafeBytes({ Darwin.write(wfd, $0.baseAddress, $0.count) }) > 0 {}
+    var filled = 0
+    while case let n = chunk.withUnsafeBytes({ Darwin.write(wfd, $0.baseAddress, $0.count) }), n > 0 { filled += n }
+    var one: UInt8 = 0x41
+    while Darwin.write(wfd, &one, 1) == 1 { filled += 1 }
+    try #require(errno == EAGAIN && filled > 0)
 
     // Full and nobody reading: gives up after the timeout instead of hanging.
     let start = ContinuousClock.now
     #expect(OSC7Probe.writeAll(Array("hello".utf8), to: wfd, timeout: .milliseconds(50)) == 0)
     let elapsed = ContinuousClock.now - start
-    #expect(elapsed >= .milliseconds(40) && elapsed < .milliseconds(500))
+    #expect(elapsed >= .milliseconds(40) && elapsed < .seconds(2))
 
-    // A reader drains it shortly after: the whole payload goes out.
-    let drainFD = rfd
-    let drainer = Task.detached {
-        try? await Task.sleep(for: .milliseconds(30))
-        var buf = [UInt8](repeating: 0, count: 65536)
-        _ = buf.withUnsafeMutableBytes { read(drainFD, $0.baseAddress, $0.count) }
-    }
+    // A reader drains it shortly after the write starts waiting: the whole payload goes out.
     let payload = Array(OSC7Probe.restoreSequence(host: "mac.local", cwd: "/Users/me/p").utf8)
-    #expect(OSC7Probe.writeAll(payload, to: wfd, timeout: .milliseconds(200)) == payload.count)
-    await drainer.value
+    try #require(payload.count <= Int(PIPE_BUF))
+    let drained = DispatchSemaphore(value: 0)
+    let drainFD = rfd, fillCount = filled
+    Thread.detachNewThread {
+        usleep(30_000)
+        // Read exactly the filler, so the payload stays in the pipe for the check below.
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var left = fillCount
+        while left > 0 {
+            let n = buf.withUnsafeMutableBytes { read(drainFD, $0.baseAddress, min($0.count, left)) }
+            if n > 0 { left -= n } else if n == 0 || errno != EAGAIN && errno != EINTR { break } else { usleep(1000) }
+        }
+        drained.signal()
+    }
+    #expect(OSC7Probe.writeAll(payload, to: wfd, timeout: .seconds(10)) == payload.count)
+    drained.wait()
+
+    // Exactly the payload follows the filler in the pipe.
+    var back = [UInt8](repeating: 0, count: 4096)
+    let n = back.withUnsafeMutableBytes { read(rfd, $0.baseAddress, $0.count) }
+    #expect(n == payload.count && Array(back.prefix(max(n, 0))) == payload)
 }
 
 @Test func osc7WriteRejectsNonTTYPaths() {

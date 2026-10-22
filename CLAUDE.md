@@ -13,20 +13,26 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `SessionDiscovery` (actor): registry + transcripts + liveness, joined with hook state.
 - `Sources/ClaudeWatcherCore/Hook/`: `HookState`/`HookStateStore`/`HookStateCache` (reads the
   hook's output, `<sid>.json` + `<sid>.ghostty` sidecar), `HookInstaller` (edits
-  `settings.json` under `$CLAUDE_CONFIG_DIR` else `~/.claude`, order-preserving, updates our
-  entries in place, retries on a concurrent-write conflict; uninstall leaves a no-op stub script).
+  `settings.json` under the resolved Claude home, order-preserving, updates our entries in place,
+  retries on a concurrent-write conflict; uninstall leaves a no-op stub script; status counts only
+  handlers in match-all groups, `.outdated` if one of ours sits under a restricting matcher).
 - `Sources/ClaudeWatcherCore/Focus/`: `RoutingFocuser` -> `GhosttyFocuser` (resolver chain) /
   `AppleTerminalFocuser` / activate-hosting-app fallback. `AppleScriptRunner` runs scripts.
   `OSC7Probe` (`GhosttyOSC7Probe.swift`) + `OSC7ProbeLock` (cross-process lock shared with the hook).
 - `Sources/ClaudeWatcherCore/Theme/`: `GhosttyColor`, `GhosttyConfigParser` (+ `GhosttyThemeSpec`,
-  incl. `light:A,dark:B`), `GhosttyTheme`, `GhosttyThemeLoader` (Ghostty's config search paths,
-  `config-file` includes, user then bundled themes; config colors override the theme's).
+  incl. `light:A,dark:B`), `GhosttyTheme`, `GhosttyThemeLoader` (Ghostty's config search paths;
+  `config-file` includes load breadth-first after all top-level files, like Ghostty's
+  `loadRecursiveFiles`; user then bundled themes; config colors override the theme's; every
+  theme candidate path is watched, even missing ones, so a newly created theme file is seen).
 - `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
-  `EdgeController`, `MenuModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`.
+  `EdgeController`, `MenuModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`. Nothing may
+  resolve `SessionDiscovery.defaultClaudeHome` on main at launch: `AppDelegate.init` prewarms it,
+  the store is created once it resolves off-main, and `MenuModel` computes statuses off-main.
 - `Sources/ClaudeWatcher/UI/`: `EdgeController` (panel show/hide, focus + result banner, owns
-  `ThemeStore`), `SidebarView`, `SidebarPanel`, `TerminalStyle` (SwiftUI colors/font/metrics from a
-  `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
+  `ThemeStore`), `SidebarView` (its `TimelineView`s pause while the panel is hidden, via
+  `\.panelVisible`: they keep firing after `orderOut`), `SidebarPanel`, `TerminalStyle` (SwiftUI
+  colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `Tests/ClaudeWatcherCoreTests/`: Swift Testing (`import Testing`). Keep logic in Core so it is testable.
@@ -69,10 +75,17 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   session, directory mtime unchanged), so a directory vnode source never sees status flips:
   `SessionStore` keeps one vnode source per live registry file, plus directory sources and a
   2 s poll as safety net.
-- Discovery honors `$CLAUDE_CONFIG_DIR`. A registry pid is live only if it runs Claude Code:
+- Claude home (`ClaudeHome`, `SessionDiscovery.defaultClaudeHome`): `CLAUDE_CONFIG_DIR` from our
+  env, else `launchctl getenv`, else `$SHELL -lic` (value read after a marker, since rc files may
+  print anything); 2 s timeout per probe, `~` expanded, `~/.claude` if unset or not a directory.
+  Resolved once and cached (up to ~4 s cold); `prewarmDefaultClaudeHome()` starts it off-main.
+- A registry pid is live only if it runs Claude Code:
   `ProcessRules.isClaudeExecutable` accepts a binary named `claude`, the native installer's
   `…/claude/versions/<ver>`, Homebrew's `Caskroom/claude-code/`, or `node` running the npm
-  package (argv read via `KERN_PROCARGS2`, only for `node`). Mirrors the hook's `find_claude`.
+  package (argv read via `KERN_PROCARGS2`, only for `node`): argv[1] basename `claude` (npm's
+  `bin/claude` symlink), argv[0] `claude` (`process.title`), an absolute argv[1] whose realpath
+  is in `@anthropic-ai/claude-code`, or any argument naming that package. Mirrors the hook's
+  `find_claude`.
 - Hook state dir `~/Library/Application Support/ClaudeWatcher/hook-state/` (layout documented at
   the top of `hooks/claude-watcher-hook.sh`; keep both sides in sync):
   - `<sid>.json`: replaced wholesale (temp + rename) by every event, no lock, no Ghostty id.
@@ -83,9 +96,13 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
     Only exists for sessions that started after the hook was installed.
   - `<sid>.ended`: SessionEnd tombstone (renamed `<sid>.json`) so late async hooks can't
     resurrect the session; GC'd after ~1 h. The old per-session `.lock-<sid>` is gone.
-  - `.probe-<ttyname>.lock/owner` (`<pid> <token>`): per-tty probe lock shared by the hook and
-    Swift `OSC7ProbeLock` (same protocol both sides): mkdir to acquire, ~1 s bounded wait then
-    skip, stale after 10 s (break by renaming aside), release only if `owner` holds our token.
+  - `.probe-<ttyname>.lock/owner` (`<pid> <token>`): per-tty probe lock, protocol v2, shared by
+    the hook and Swift `OSC7ProbeLock` (keep both in sync): mkdir to acquire, ~1 s bounded wait
+    then skip. Stale if the owner pid is dead (`kill(pid,0)` fails other than EPERM), or the owner
+    is missing/unparseable and the dir mtime > 10 s, or the owner is alive but mtime > 120 s
+    (pid-reuse cap). The Swift holder heartbeats (`utimes`) every 2 s; the hook holds it only
+    seconds. Break is verified: rename aside, re-read owner, delete only if unchanged, else
+    restore without clobbering (`RENAME_EXCL`). Release only if `owner` holds our token.
 - `NSAppleScript` must run on the main thread: off-main, Ghostty's replies to element
   queries (`every terminal`) never arrive and the script hangs past its `with timeout`.
   `AppleScriptRunner` hops to the MainActor; every generated script carries

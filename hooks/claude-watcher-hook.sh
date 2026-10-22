@@ -489,14 +489,18 @@ find_claude() {
 # ~/.local/share/claude/versions/<ver> (ucomm is the version string, argv0 is "claude"),
 # Homebrew's cask runs Caskroom/claude-code/…/claude. npm installs run node on the package:
 # argv is "node /opt/homebrew/bin/claude …", where bin/claude is a symlink to
-# …/@anthropic-ai/claude-code/cli.js, so for node look at the script (first non-option arg).
+# …/@anthropic-ai/claude-code/cli.js, so for node look at the script (first non-option arg,
+# or the one right after `--`, like Swift's ProcessRules.nodeScript).
 is_claude_process() {
-  local ucomm=$1 args=$2 a
+  local ucomm=$1 args=$2 a dashdash=0
   [[ $ucomm == claude || $ucomm == <->.<->.<->* || ${${args%% *}:t} == claude \
      || $args == */claude/versions/* || $args == *@anthropic-ai/claude-code* ]] && return 0
   [[ $ucomm == node || ${${args%% *}:t} == node ]] || return 1
   for a in ${${(z)args}[2,-1]}; do
-    [[ $a == -* ]] && continue
+    if (( ! dashdash )); then
+      [[ $a == -- ]] && { dashdash=1; continue }
+      [[ $a == -* ]] && continue
+    fi
     [[ ${a:t} == claude || ${a:A} == *@anthropic-ai/claude-code* ]]
     return
   done

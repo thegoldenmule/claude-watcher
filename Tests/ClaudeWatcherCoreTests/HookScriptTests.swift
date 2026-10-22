@@ -236,6 +236,7 @@ import Testing
             try fm.createDirectory(at: root.appendingPathComponent("bin"), withIntermediateDirectories: true)
             try Data().write(to: pkg.appendingPathComponent("cli.js"))
             try Data().write(to: root.appendingPathComponent("other.js"))
+            try Data().write(to: root.appendingPathComponent("--x"))   // `tail -f -- --x …` follows it
             try fm.createSymbolicLink(atPath: root.appendingPathComponent("node").path, withDestinationPath: "/usr/bin/tail")
             for name in ["claude", "cc"] {
                 try fm.createSymbolicLink(atPath: root.appendingPathComponent("bin/\(name)").path,
@@ -246,10 +247,11 @@ import Testing
             for p in procs where p.isRunning { p.terminate() }
             try? FileManager.default.removeItem(at: root)
         }
-        /// Runs `node <args…>` (tail -f, so it stays up); returns its pid.
+        /// Runs `node <args…>` (tail -f, so it stays up) in `root`; returns its pid.
         func spawn(_ args: [String]) throws -> Int32 {
             let p = Process()
             p.executableURL = root.appendingPathComponent("node")
+            p.currentDirectoryURL = root
             p.arguments = args.map { $0.replacingOccurrences(of: "$ROOT", with: root.path) }
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
@@ -265,15 +267,21 @@ import Testing
         let viaBin = try node.spawn(["-f", "$ROOT/bin/claude"])   // argv[1] basename "claude"
         let viaLink = try node.spawn(["-f", "$ROOT/bin/cc"])      // resolves into the package
         let other = try node.spawn(["-f", "$ROOT/other.js"])
+        // `--` ends the options: the script is the next argument, even one starting with `-`.
+        let afterDashDash = try node.spawn(["-f", "--", "$ROOT/bin/cc"])
+        let dashScript = try node.spawn(["-f", "--", "--x", "$ROOT/bin/claude"])
         try await Task.sleep(for: .seconds(0.2))
-        for (sid, pid) in [("npm-bin", viaBin), ("npm-link", viaLink), ("other", other)] {
+        for (sid, pid) in [("npm-bin", viaBin), ("npm-link", viaLink), ("other", other),
+                           ("dashdash", afterDashDash), ("dash-script", dashScript)] {
             try await env.run(Self.input(sid, "SessionStart"),
                         extraEnv: ["CLAUDE_WATCHER_CLAUDE_PID": "", "CLAUDE_WATCHER_WALK_FROM": String(pid)])
         }
         #expect(try env.state("npm-bin")?.claudePID == viaBin)
         #expect(try env.state("npm-link")?.claudePID == viaLink)
+        #expect(try env.state("dashdash")?.claudePID == afterDashDash)
         // Not claude: the walk goes on past it (to whatever claude runs these tests, if any).
         #expect(try env.state("other")?.claudePID != other)
+        #expect(try env.state("dash-script")?.claudePID != dashScript)
 
         // GC keeps state of live npm claudes and drops that of a live node running something else.
         for (sid, pid) in [("gc-bin", viaBin), ("gc-link", viaLink), ("gc-other", other)] {

@@ -15,6 +15,8 @@ struct SidebarView: View {
     let onSelect: (ClaudeSession) -> Void
     var onDismissNotice: () -> Void = {}
     var onOpenAutomationSettings: () -> Void = {}
+    /// The pointer entered (true) or left (false) a session's row.
+    var onHoverChange: (_ sessionID: String, _ inside: Bool) -> Void = { _, _ in }
 
     @Environment(\.terminalStyle) private var style
 
@@ -47,7 +49,10 @@ struct SidebarView: View {
                 ScrollView(.vertical) {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(ordered) { session in
-                            SessionRow(session: session, isPending: session.id == pendingSessionID) {
+                            SessionRow(
+                                session: session, isPending: session.id == pendingSessionID,
+                                onHover: { onHoverChange(session.id, $0) }
+                            ) {
                                 onSelect(session)
                             }
                         }
@@ -182,6 +187,7 @@ private struct EmptyStateView: View {
 private struct SessionRow: View {
     let session: ClaudeSession
     var isPending = false
+    var onHover: (Bool) -> Void = { _ in }
     let action: () -> Void
 
     @Environment(\.terminalStyle) private var style
@@ -250,7 +256,10 @@ private struct SessionRow: View {
             .contentShape(.rect)
         }
         .buttonStyle(RowButtonStyle())
-        .onHover { hoverState = $0 }
+        .onHover { inside in
+            hoverState = inside
+            onHover(inside)
+        }
         .help(session.cwd)
     }
 

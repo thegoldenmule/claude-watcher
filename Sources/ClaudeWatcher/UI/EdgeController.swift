@@ -15,6 +15,10 @@ import SwiftUI
 /// The `sessions` closure is evaluated inside SwiftUI's `body`, so reading an `@Observable`
 /// property there (like `SessionStore.sessions`) re-renders the list whenever it changes.
 /// `isPinned` keeps the panel visible (no auto-hide); bind it to a menu toggle.
+///
+/// With a `TerminalHighlighter` (nil in demo mode), resting the pointer on a row for
+/// `hoverDwell` tints that session's Ghostty pane, and a successful focus pulses it. Hiding the
+/// panel resets every tint.
 @MainActor
 @Observable
 final class EdgeController {
@@ -41,6 +45,19 @@ final class EdgeController {
     /// Outcome of the last focus attempt that didn't fully succeed; holds the panel open.
     private(set) var notice: FocusNotice?
 
+    /// Tint the hovered row's Ghostty pane (persisted; default on).
+    var highlightOnHover: Bool = EdgeController.storedFlag(Keys.highlightOnHover) {
+        didSet {
+            UserDefaults.standard.set(highlightOnHover, forKey: Keys.highlightOnHover)
+            if !highlightOnHover { cancelHoverTint() }
+        }
+    }
+
+    /// Briefly pulse a pane after it's focused from the panel (persisted; default on).
+    var pulseOnFocus: Bool = EdgeController.storedFlag(Keys.pulseOnFocus) {
+        didSet { UserDefaults.standard.set(pulseOnFocus, forKey: Keys.pulseOnFocus) }
+    }
+
     private var pinned = false
 
     @ObservationIgnored private let sessionsSource: @MainActor () -> [ClaudeSession]
@@ -53,15 +70,30 @@ final class EdgeController {
     @ObservationIgnored private var targetFrame: NSRect?
     @ObservationIgnored private var transitionGeneration = 0
 
+    /// How long the pointer must rest on one row before its pane is tinted.
+    static let hoverDwell: Duration = .milliseconds(150)
+    /// The Core drops a hover tint 3 s after the last `beginHover` (a safety cap against a stalled
+    /// UI), so a row that stays hovered re-sends it this often; a repeat writes nothing.
+    static let hoverKeepAlive: Duration = .seconds(2)
+    @ObservationIgnored private let highlighter: TerminalHighlighter?
+    /// Row under the pointer, per the rows' `onHover` (ids only: data updates don't re-tint).
+    @ObservationIgnored private var hoveredID: String?
+    /// Row whose pane `beginHover` was called for (so `endHover` is only sent when needed).
+    @ObservationIgnored private var tintedID: String?
+    /// Dwell, then keep-alive, for the hovered row's tint.
+    @ObservationIgnored private var dwellTask: Task<Void, Never>?
+
     @ObservationIgnored private let logger = Logger(
         subsystem: "com.thegoldenmule.ClaudeWatcher", category: "EdgeController")
 
     init(
         sessions: @escaping @MainActor () -> [ClaudeSession],
-        onSelect: @escaping @MainActor (ClaudeSession) async -> FocusResult
+        onSelect: @escaping @MainActor (ClaudeSession) async -> FocusResult,
+        highlighter: TerminalHighlighter? = nil
     ) {
         self.sessionsSource = sessions
         self.selectHandler = onSelect
+        self.highlighter = highlighter
     }
 
     // MARK: - Lifecycle
@@ -111,7 +143,7 @@ final class EdgeController {
         themeStore.stop()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
-        hide(animated: false)
+        hide(animated: false, resetHighlights: false)  // the app resets synchronously at exit
         panel = nil
     }
 
@@ -123,11 +155,17 @@ final class EdgeController {
         guard pendingSessionID == nil else { return }  // one focus at a time
         clearNotice()
         pendingSessionID = session.id
+        // No tint starting mid-focus, and no keep-alive: the result ends the tint.
+        dwellTask?.cancel()
+        dwellTask = nil
         Task {
             let result = await selectHandler(session)
             pendingSessionID = nil
+            endHoverTint()
             if result == .focused {
-                if !pinned { hide(animated: true) }
+                if pulseOnFocus { highlighter?.pulse(session, tint: highlightTint) }
+                // Keep the pulse: this hide must not reset it.
+                if !pinned { hide(animated: true, resetHighlights: false) }
             } else {
                 post(FocusNotice(session: session, result: result))
             }
@@ -144,6 +182,15 @@ final class EdgeController {
         dismissNotice()
     }
 
+    fileprivate func rowHoverChanged(_ sessionID: String, inside: Bool) {
+        // Enter/exit of adjacent rows may arrive in either order: an exit only clears its own row.
+        if inside {
+            setHovered(sessionID)
+        } else if hoveredID == sessionID {
+            setHovered(nil)
+        }
+    }
+
     private func post(_ notice: FocusNotice) {
         noticeTask?.cancel()
         self.notice = notice
@@ -158,6 +205,50 @@ final class EdgeController {
         noticeTask?.cancel()
         noticeTask = nil
         notice = nil
+    }
+
+    // MARK: - Terminal highlight
+
+    private var highlightTint: GhosttyColor { themeStore.style.theme.highlightTint() }
+
+    /// A new row (or none) is under the pointer: drop the current tint at once, then start the
+    /// new row's dwell.
+    private func setHovered(_ id: String?) {
+        guard id != hoveredID else { return }
+        hoveredID = id
+        cancelHoverTint()
+        guard let id, highlighter != nil, highlightOnHover, isVisible, pendingSessionID != id else { return }
+        dwellTask = Task { [weak self] in
+            var delay = Self.hoverDwell
+            while true {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled, self?.beginHoverTint(id) == true else { return }
+                delay = Self.hoverKeepAlive
+            }
+        }
+    }
+
+    /// Tints (or keeps tinting) `id`'s pane if it's still the hovered row; false stops the loop.
+    private func beginHoverTint(_ id: String) -> Bool {
+        guard let highlighter, highlightOnHover, isVisible, hoveredID == id, pendingSessionID != id,
+              let session = currentSessions().first(where: { $0.id == id })
+        else { return false }
+        highlighter.beginHover(session, tint: highlightTint)
+        tintedID = id
+        return true
+    }
+
+    /// Stops any pending dwell and clears the current hover tint (the row stays hovered).
+    private func cancelHoverTint() {
+        dwellTask?.cancel()
+        dwellTask = nil
+        endHoverTint()
+    }
+
+    private func endHoverTint() {
+        guard tintedID != nil else { return }
+        tintedID = nil
+        highlighter?.endHover()
     }
 
     // MARK: - Pointer tracking
@@ -278,9 +369,14 @@ final class EdgeController {
         }
     }
 
-    private func hide(animated: Bool) {
+    /// `resetHighlights` also resets every terminal tint (auto-hide, screen change, unpin); a
+    /// hide after a successful focus passes false so the focus pulse plays out.
+    private func hide(animated: Bool, resetHighlights: Bool = true) {
         policy.reset()
+        hoveredID = nil  // rows may not see a hover exit once the panel is ordered out
+        cancelHoverTint()
         guard let panel, isVisible || panel.isVisible else { return }
+        if resetHighlights { highlighter?.resetAll() }
         isVisible = false
         transitionGeneration += 1
         let generation = transitionGeneration
@@ -310,6 +406,15 @@ final class EdgeController {
                 panel.alphaValue = 1
             }
         })
+    }
+
+    private enum Keys {
+        static let highlightOnHover = "highlightTerminalOnHover"
+        static let pulseOnFocus = "pulseTerminalOnFocus"
+    }
+
+    private static func storedFlag(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? true
     }
 }
 
@@ -346,7 +451,8 @@ private struct SidebarRoot: View {
             notice: controller.notice,
             onSelect: { controller.select($0) },
             onDismissNotice: { controller.dismissNotice() },
-            onOpenAutomationSettings: { controller.openAutomationSettings() }
+            onOpenAutomationSettings: { controller.openAutomationSettings() },
+            onHoverChange: { controller.rowHoverChanged($0, inside: $1) }
         )
         .environment(\.terminalStyle, controller.themeStore.style)
         .environment(\.panelVisible, controller.isVisible)

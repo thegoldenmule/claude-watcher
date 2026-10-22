@@ -11,6 +11,14 @@ struct ClaudeWatcherApp: App {
                 get: { appDelegate.edge.isPinned },
                 set: { appDelegate.edge.isPinned = $0 }
             ))
+            Toggle("Highlight Terminal on Hover", isOn: Binding(
+                get: { appDelegate.edge.highlightOnHover },
+                set: { appDelegate.edge.highlightOnHover = $0 }
+            ))
+            Toggle("Pulse Terminal on Focus", isOn: Binding(
+                get: { appDelegate.edge.pulseOnFocus },
+                set: { appDelegate.edge.pulseOnFocus = $0 }
+            ))
             if appDelegate.isDemo {
                 Text("Demo mode")
             }

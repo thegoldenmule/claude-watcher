@@ -40,7 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             edge = EdgeController(
                 sessions: { [slot] in slot.store?.sessions ?? [] },
-                onSelect: Self.focusHandler(focuser))
+                onSelect: Self.focusHandler(focuser),
+                // Never in demo mode: demo sessions have fake ttys.
+                highlighter: .shared)
         }
         super.init()
     }
@@ -51,6 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isDemo {
             edge.isPinned = true
         } else {
+            // Recover a pane left tinted by a crash.
+            TerminalHighlighter.shared.resetAll()
             Task { await startStore() }
         }
         edge.start()
@@ -60,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminating = true
         edge.stop()
         store?.stop()
+        if !isDemo { TerminalHighlighter.shared.resetAllSync() }
     }
 
     /// Creates and starts the store once the config dir is resolved (off the main thread).

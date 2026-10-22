@@ -481,7 +481,7 @@ private func nonceRunner(_ id: String) -> FakeRunner {
 
 @Test func osc7WriteRejectsNonTTYPaths() {
     #expect(OSC7Probe.write(Array("x".utf8), toTTY: "/tmp/ttys001") == 0)
-    #expect(!OSC7Probe.write("x", toTTY: "/dev/console"))
+    #expect(OSC7Probe.write(Array("x".utf8), toTTY: "/dev/console") == 0)
 }
 
 // MARK: - Cross-process probe lock
@@ -524,22 +524,129 @@ private func nonceRunner(_ id: String) -> FakeRunner {
     await releaser.value
 }
 
-@Test func probeLockBreaksStaleLockByRename() async throws {
+/// A pid that is certainly not running (reaped child).
+private func deadPID() throws -> pid_t {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+    try p.run()
+    p.waitUntilExit()
+    let pid = p.processIdentifier
+    #expect(!OSC7ProbeLock.isAlive(pid))
+    return pid
+}
+
+/// Creates a foreign lock dir at `path` with `owner` (nil: no owner file), mtime `age` s ago.
+private func plantLock(_ path: String, owner: String?, age: TimeInterval) throws {
+    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+    if let owner { try owner.write(toFile: path + "/owner", atomically: false, encoding: .utf8) }
+    try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -age)], ofItemAtPath: path)
+}
+
+private func onlyLockLeft(_ dir: URL) throws -> Bool {
+    try FileManager.default.contentsOfDirectory(atPath: dir.path) == [".probe-ttys001.lock"]
+}
+
+@Test func probeLockKeepsAliveOwnerEvenWhenOld() async throws {
     let dir = tempDir()
     let lock = OSC7ProbeLock(directory: dir, maxWait: .zero)
     let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
-    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
-    try "999 deadbeef\n".write(toFile: path + "/owner", atomically: false, encoding: .utf8)
+    // pid 1 (launchd): kill(1, 0) fails with EPERM, which still means alive.
+    try plantLock(path, owner: "1 deadbeef\n", age: 60)
+    #expect(await lock.acquire(tty: "/dev/ttys001") == nil)
+    #expect(OSC7ProbeLock.readOwner(path) == "1 deadbeef\n")
+    #expect(try onlyLockLeft(dir))
+}
 
-    // Fresh lock held by someone else: busy.
+@Test func probeLockBreaksDeadOwnerLock() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir, maxWait: .zero)
+    let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
+    try plantLock(path, owner: "\(try deadPID()) deadbeef\n", age: 0)  // fresh mtime, dead owner
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    #expect(held.path == path)
+    #expect(try onlyLockLeft(dir))  // the renamed-aside stale lock was removed
+    #expect(held.release())
+}
+
+@Test func probeLockOwnerlessLockStaleOnlyWhenOld() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir, maxWait: .zero)
+    let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
+    try plantLock(path, owner: nil, age: 2)  // mid-acquire by someone else: busy
     #expect(await lock.acquire(tty: "/dev/ttys001") == nil)
 
     try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -20)], ofItemAtPath: path)
     let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
-    #expect(held.path == path)
-    let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
-    #expect(names == [".probe-ttys001.lock"])  // the renamed-aside stale lock was removed
+    #expect(try onlyLockLeft(dir))
     #expect(held.release())
+}
+
+@Test func probeLockBreaksAliveOwnerPastHardCap() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir, maxWait: .zero)
+    let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
+    try plantLock(path, owner: "1 deadbeef\n", age: 130)  // pid reuse cap: 120 s
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    #expect(try onlyLockLeft(dir))
+    #expect(held.release())
+}
+
+@Test func probeLockStalenessRule() {
+    let lock = OSC7ProbeLock(directory: tempDir())
+    #expect(!lock.isStale(owner: nil, age: 9))
+    #expect(lock.isStale(owner: nil, age: 11))
+    #expect(lock.isStale(owner: "garbage", age: 11))
+    #expect(!lock.isStale(owner: "0 tok", age: 9))  // pid 0 is never probed with kill
+    #expect(!lock.isStale(owner: "\(getpid()) tok", age: 119))
+    #expect(lock.isStale(owner: "\(getpid()) tok", age: 121))
+    #expect(OSC7ProbeLock.ownerPID("42 tok\n") == 42)
+    #expect(OSC7ProbeLock.ownerPID("-1 tok") == nil)
+}
+
+@Test func probeLockRestoresMistakenlyRenamedFreshLock() throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir)
+    let path = try #require(lock.lockPath(forTTY: "/dev/ttys001"))
+    try plantLock(path, owner: "\(try deadPID()) deadbeef\n", age: 0)
+    let fresh = "1 0123456789abcdef\n"
+
+    // Between judging it stale and renaming it, someone else broke it and took a fresh lock.
+    #expect(!lock.breakIfStale(path, beforeRename: {
+        try? fresh.write(toFile: path + "/owner", atomically: false, encoding: .utf8)
+    }))
+    #expect(OSC7ProbeLock.readOwner(path) == fresh)  // renamed back
+    #expect(try onlyLockLeft(dir))
+    guard case .busy = lock.tryAcquire(tty: "/dev/ttys001") else { Issue.record("expected busy"); return }
+
+    // Same, but a third locker took the path while it was aside: the aside copy is dropped.
+    let newest = "1 fedcba9876543210\n"
+    try FileManager.default.removeItem(atPath: path)
+    try plantLock(path, owner: "\(try deadPID()) deadbeef\n", age: 0)
+    #expect(!lock.breakIfStale(path, beforeRename: {
+        try? fresh.write(toFile: path + "/owner", atomically: false, encoding: .utf8)
+    }, afterRename: {
+        try? plantLock(path, owner: newest, age: 0)
+    }))
+    #expect(OSC7ProbeLock.readOwner(path) == newest)
+    #expect(try onlyLockLeft(dir))
+}
+
+@Test func probeLockHeartbeatRefreshesMtimeWhileHeld() async throws {
+    let dir = tempDir()
+    let lock = OSC7ProbeLock(directory: dir, heartbeatInterval: .milliseconds(20))
+    let held = try #require(await lock.acquire(tty: "/dev/ttys001"))
+    let old = Date(timeIntervalSinceNow: -60)
+    try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: held.path)
+    func mtime() throws -> Date {
+        try #require(FileManager.default.attributesOfItem(atPath: held.path)[.modificationDate] as? Date)
+    }
+    let deadline = ContinuousClock.now + .seconds(2)
+    while try mtime() < Date(timeIntervalSinceNow: -5), ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(try mtime() > Date(timeIntervalSinceNow: -5))
+    #expect(held.release())
+    await held.heartbeat.value  // stopped on release
 }
 
 @Test func probeLockReleaseRequiresOurToken() async throws {
@@ -677,8 +784,9 @@ func liveNonceLookup() async throws {
     let env = ProcessInfo.processInfo.environment
     let tty = try #require(env["CW_LIVE_NONCE_TTY"]), want = try #require(env["CW_LIVE_NONCE_ID"])
     let host = OSC7Probe.hostName(), nonce = OSC7Probe.makeNonce(pid: getpid())
-    #expect(OSC7Probe.write(OSC7Probe.probeSequence(host: host, nonce: nonce), toTTY: tty))
-    defer { _ = OSC7Probe.write(OSC7Probe.restoreSequence(host: host, cwd: NSHomeDirectory()), toTTY: tty) }
+    let probe = Array(OSC7Probe.probeSequence(host: host, nonce: nonce).utf8)
+    #expect(OSC7Probe.write(probe, toTTY: tty) == probe.count)
+    defer { _ = OSC7Probe.write(Array(OSC7Probe.restoreSequence(host: host, cwd: NSHomeDirectory()).utf8), toTTY: tty) }
     let start = ContinuousClock.now
     let ids = try await GhosttyScripting().terminalIDs(withNonceWorkingDirectory: nonce)
     print("liveNonceLookup: \(ids) in \(ContinuousClock.now - start)")

@@ -54,12 +54,6 @@ public enum OSC7Probe {
     /// Bound on how long one sequence write waits for a flow-controlled tty to drain.
     static let writeTimeout: Duration = .milliseconds(200)
 
-    /// Writes `string` to `tty`; true if every byte went out (see `write(_:toTTY:)`).
-    static func write(_ string: String, toTTY tty: String) -> Bool {
-        let bytes = Array(string.utf8)
-        return write(bytes, toTTY: tty) == bytes.count
-    }
-
     /// Writes `bytes` to `tty` without making it our controlling terminal and without blocking
     /// indefinitely (a flow-controlled tty returns EAGAIN instead of hanging; we then wait up to
     /// `writeTimeout` for it to drain). Returns how many bytes were written.

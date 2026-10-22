@@ -69,18 +69,43 @@ public enum HookStateStore {
     /// All readable state files, keyed by session id. Unreadable/partial files are skipped.
     /// Does not check whether `claudePID` is still alive; callers join against live sessions.
     public static func loadAll(directory: URL = defaultDirectory) -> [String: HookState] {
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return [:] }
-        let decoder = JSONDecoder()
-        var result: [String: HookState] = [:]
-        for name in names where name.hasSuffix(".json") && !name.hasPrefix(".") {
-            let url = directory.appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: url),
-                  let state = try? decoder.decode(HookState.self, from: data) else { continue }
-            if let existing = result[state.sessionID], existing.updatedAtMillis > state.updatedAtMillis { continue }
-            result[state.sessionID] = state
+        var cache = HookStateCache()
+        return cache.load(directory: directory)
+    }
+
+    /// State files are `<session_id>.json`; dot-files are temp files / stamps.
+    static func isStateFileName(_ name: String) -> Bool {
+        name.hasSuffix(".json") && !name.hasPrefix(".")
+    }
+
+    /// Keeps the newer of two states for the same session id.
+    static func insertNewest(_ state: HookState, into result: inout [String: HookState]) {
+        if let existing = result[state.sessionID], existing.updatedAtMillis > state.updatedAtMillis { return }
+        result[state.sessionID] = state
+    }
+
+    /// The hook state describing a live session, or nil.
+    ///
+    /// Looks up `sessionID` first, then the newest state for `pid` (covers a registry entry
+    /// whose session id lags a `/clear` or `/resume` in the same process). Either candidate must
+    /// belong to `pid`, agree on the tty when both are known, and have been written after the
+    /// process started (so a dead process's state can't attach to a reused pid).
+    public static func match(
+        sessionID: String,
+        pid: Int32,
+        tty: String?,
+        processStart: Date,
+        states: [String: HookState],
+        byPID: [Int32: HookState]
+    ) -> HookState? {
+        func plausible(_ s: HookState) -> Bool {
+            guard s.claudePID == pid else { return false }
+            if let a = s.tty, let b = tty, a != b { return false }
+            return s.updatedAt >= processStart.addingTimeInterval(-ProcessRules.startTolerance)
         }
-        return result
+        if let s = states[sessionID], plausible(s) { return s }
+        if let s = byPID[pid], plausible(s) { return s }
+        return nil
     }
 
     /// Convenience: the newest state per claude PID (a PID can host several session ids over
@@ -92,5 +117,51 @@ public enum HookStateStore {
             byPID[state.claudePID] = state
         }
         return byPID
+    }
+}
+
+/// Incremental reader for the hook-state directory: only files whose size or modification
+/// time changed since the last `load` are re-read and decoded. The hook writes atomically
+/// (temp file + rename), so a changed file is always a new inode with a fresh mtime.
+public struct HookStateCache: Sendable {
+    private struct Entry: Sendable {
+        var mtime: Date
+        var size: Int
+        var state: HookState?
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    public init() {}
+
+    /// All readable state files in `directory`, keyed by session id (newest wins).
+    public mutating func load(directory: URL) -> [String: HookState] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else {
+            entries = [:]
+            return [:]
+        }
+        let decoder = JSONDecoder()
+        var result: [String: HookState] = [:]
+        var next: [String: Entry] = [:]
+        for name in names where HookStateStore.isStateFileName(name) {
+            let path = directory.appendingPathComponent(name).path
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let mtime = attrs[.modificationDate] as? Date,
+                  let size = (attrs[.size] as? NSNumber)?.intValue
+            else { continue }
+            let entry: Entry
+            if let cached = entries[name], cached.mtime == mtime, cached.size == size {
+                entry = cached
+            } else {
+                let state = (try? Data(contentsOf: URL(fileURLWithPath: path)))
+                    .flatMap { try? decoder.decode(HookState.self, from: $0) }
+                entry = Entry(mtime: mtime, size: size, state: state)
+            }
+            next[name] = entry
+            if let state = entry.state { HookStateStore.insertNewest(state, into: &result) }
+        }
+        entries = next
+        return result
     }
 }

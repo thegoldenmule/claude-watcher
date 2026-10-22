@@ -415,7 +415,8 @@ private let transcriptSample = """
 
 @Test(.enabled(if: ProcessInfo.processInfo.environment["CW_LIVE"] == "1"))
 func liveDiscovery() async {
-    let discovery = SessionDiscovery(claudeHome: SessionDiscovery.defaultClaudeHome)
+    let discovery = SessionDiscovery(
+        claudeHome: SessionDiscovery.defaultClaudeHome, hookStateDirectory: HookStateStore.defaultDirectory)
     let start = Date()
     let sessions = await discovery.scan()
     let firstMs = Date().timeIntervalSince(start) * 1000
@@ -428,10 +429,101 @@ func liveDiscovery() async {
         LIVE: pid=\(s.pid) id=\(s.id)
               title=\(s.title.debugDescription) branch=\(s.branch ?? "nil") status=\(s.status) \
         waitingFor=\(s.waitingFor ?? "nil")
-              tty=\(s.tty ?? "nil") terminal=\(s.terminal) cwd=\(s.cwd)
+              tty=\(s.tty ?? "nil") terminal=\(s.terminal) ghosttyTerminalID=\(s.ghosttyTerminalID ?? "nil") cwd=\(s.cwd)
               startedAt=\(s.startedAt) updatedAt=\(s.updatedAt)
               lastPrompt=\((s.lastPrompt ?? "nil").prefix(80).debugDescription)
         """)
     }
     #expect(!sessions.isEmpty)
+}
+
+// MARK: - Hook state join
+
+private func hookStateJSON(
+    sessionID: String, pid: Int32, tty: String?, ghosttyID: String?, updatedAt: Date
+) -> String {
+    let ttyJSON = tty.map { "\"\($0)\"" } ?? "null"
+    let idJSON = ghosttyID.map { "\"\($0)\"" } ?? "null"
+    return """
+    {"session_id":"\(sessionID)","claude_pid":\(pid),"tty":\(ttyJSON),"term_program":"ghostty",\
+    "cwd":"/x","transcript_path":null,"last_event":"Stop","ghostty_terminal_id":\(idJSON),\
+    "updated_at":\(Int64(updatedAt.timeIntervalSince1970 * 1000))}
+    """
+}
+
+@Test func hookStateMatchRules() {
+    let start = Date(timeIntervalSince1970: 1_000_000)
+    let later = start.addingTimeInterval(60)
+    func state(_ id: String, pid: Int32 = 10, tty: String? = "/dev/ttys001", at: Date = later) -> HookState {
+        HookState(sessionID: id, claudePID: pid, tty: tty, lastEvent: "Stop", ghosttyTerminalID: "G-\(id)",
+                  updatedAtMillis: Int64(at.timeIntervalSince1970 * 1000))
+    }
+    func match(_ states: [HookState], id: String = "s", pid: Int32 = 10, tty: String? = "/dev/ttys001") -> String? {
+        let byID = Dictionary(states.map { ($0.sessionID, $0) }, uniquingKeysWith: { a, _ in a })
+        return HookStateStore.match(
+            sessionID: id, pid: pid, tty: tty, processStart: start,
+            states: byID, byPID: HookStateStore.latestByPID(byID))?.sessionID
+    }
+
+    #expect(match([state("s")]) == "s")                                   // by session id
+    #expect(match([state("other")]) == "other")                           // pid fallback (/clear lag)
+    #expect(match([state("s", tty: "/dev/ttys009")]) == nil)              // tty disagrees
+    #expect(match([state("s", tty: nil)]) == "s")                         // unknown tty is fine
+    #expect(match([state("s")], tty: nil) == "s")
+    #expect(match([state("s", pid: 11)]) == nil)                          // same id, other process (resumed elsewhere)
+    #expect(match([state("s", at: start.addingTimeInterval(-3600))]) == nil)  // dead process with a reused pid
+    // Session id match wins over a newer state for the same pid.
+    #expect(match([state("s"), state("newer", at: later.addingTimeInterval(5))]) == "s")
+}
+
+@Test func hookStateCacheRereadsOnlyChangedFiles() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("hookcache-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let t = Date(timeIntervalSince1970: 1_000_000)
+    var cache = HookStateCache()
+    #expect(cache.load(directory: dir).isEmpty)
+
+    try Data(hookStateJSON(sessionID: "a", pid: 1, tty: nil, ghosttyID: nil, updatedAt: t).utf8)
+        .write(to: dir.appendingPathComponent("a.json"), options: .atomic)
+    #expect(cache.load(directory: dir)["a"]?.ghosttyTerminalID == nil)
+
+    // The probe patches the id in (temp + rename, like the hook).
+    try Data(hookStateJSON(sessionID: "a", pid: 1, tty: nil, ghosttyID: "GID-1", updatedAt: t).utf8)
+        .write(to: dir.appendingPathComponent("a.json"), options: .atomic)
+    #expect(cache.load(directory: dir)["a"]?.ghosttyTerminalID == "GID-1")
+
+    try FileManager.default.moveItem(at: dir.appendingPathComponent("a.json"), to: dir.appendingPathComponent("a.ended"))
+    #expect(cache.load(directory: dir).isEmpty)
+}
+
+@Test func discoveryJoinsHookTerminalIDs() async throws {
+    let home = try TempHome()
+    let hookDir = home.url.appendingPathComponent("hook-state", isDirectory: true)
+    let t0 = Date(timeIntervalSince1970: 1792681136)
+    try home.write("sessions/100.json", recordJSON(
+        pid: 100, sessionId: "s-100", cwd: "/x", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0)))
+    try home.write("sessions/200.json", recordJSON(
+        pid: 200, sessionId: "s-200", cwd: "/y", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0)))
+    try home.write("hook-state/s-100.json", hookStateJSON(
+        sessionID: "s-100", pid: 100, tty: "/dev/ttys001", ghosttyID: "GID-100", updatedAt: t0.addingTimeInterval(5)))
+    // Terminal.app session: a Ghostty id must never be attached.
+    try home.write("hook-state/s-200.json", hookStateJSON(
+        sessionID: "s-200", pid: 200, tty: "/dev/ttys004", ghosttyID: "GID-200", updatedAt: t0.addingTimeInterval(5)))
+    let inspector = FakeInspector(table: [
+        100: ProcessSnapshot(pid: 100, ppid: 103, startTime: t0, tty: "/dev/ttys001", executablePath: claudeBinary),
+        103: ProcessSnapshot(pid: 103, ppid: 1, startTime: t0, executablePath: ghosttyBinary),
+        200: ProcessSnapshot(pid: 200, ppid: 202, startTime: t0, tty: "/dev/ttys004", executablePath: claudeBinary),
+        202: ProcessSnapshot(pid: 202, ppid: 1, startTime: t0, executablePath: terminalBinary),
+    ])
+    let discovery = SessionDiscovery(claudeHome: home.url, hookStateDirectory: hookDir, inspector: inspector)
+    let sessions = await discovery.scan()
+    #expect(sessions.first { $0.id == "s-100" }?.ghosttyTerminalID == "GID-100")
+    #expect(sessions.first { $0.id == "s-200" }?.ghosttyTerminalID == nil)
+
+    // Without a hook directory the join is off.
+    let plain = SessionDiscovery(claudeHome: home.url, inspector: inspector)
+    #expect(await plain.scan().allSatisfy { $0.ghosttyTerminalID == nil })
 }

@@ -5,6 +5,9 @@ import Foundation
 /// All file/process IO happens on this actor, off the main thread.
 public actor SessionDiscovery {
     public nonisolated let claudeHome: URL
+    /// ClaudeWatcher hook output (`HookStateStore.defaultDirectory`), joined in for
+    /// `ghosttyTerminalID`. nil disables the join (tests, or the hook isn't wanted).
+    public nonisolated let hookStateDirectory: URL?
     private let inspector: any ProcessInspecting
     private let transcripts = TranscriptReader()
     private let history = HistoryIndex()
@@ -19,9 +22,15 @@ public actor SessionDiscovery {
     private var lastGlob: [String: Date] = [:]
     /// cwd -> (branch, fetched at).
     private var gitBranchCache: [String: (String?, Date)] = [:]
+    private var hookStates = HookStateCache()
 
-    public init(claudeHome: URL, inspector: any ProcessInspecting = SystemProcessInspector()) {
+    public init(
+        claudeHome: URL,
+        hookStateDirectory: URL? = nil,
+        inspector: any ProcessInspecting = SystemProcessInspector()
+    ) {
         self.claudeHome = claudeHome
+        self.hookStateDirectory = hookStateDirectory
         self.inspector = inspector
     }
 
@@ -70,6 +79,9 @@ public actor SessionDiscovery {
         }
         lastGoodRecords = lastGoodRecords.filter { seenFiles.contains($0.key) }
 
+        let states = hookStateDirectory.map { hookStates.load(directory: $0) } ?? [:]
+        let statesByPID = HookStateStore.latestByPID(states)
+
         var sessions: [ClaudeSession] = []
         var liveTranscriptPaths: Set<String> = []
         var liveTerminalKeys: Set<String> = []
@@ -102,6 +114,9 @@ public actor SessionDiscovery {
                 ?? history.lastPrompt(sessionId: record.sessionId, historyURL: historyFile)
             let startedAt = record.startedAtDate ?? process.startTime
             let waitingFor = record.sessionStatus == .waiting ? SessionTitle.nonEmpty(record.waitingFor) : nil
+            let hook = HookStateStore.match(
+                sessionID: record.sessionId, pid: record.pid, tty: process.tty,
+                processStart: process.startTime, states: states, byPID: statesByPID)
 
             sessions.append(ClaudeSession(
                 id: record.sessionId,
@@ -114,7 +129,7 @@ public actor SessionDiscovery {
                 waitingFor: waitingFor,
                 tty: process.tty,
                 terminal: terminal,
-                ghosttyTerminalID: nil,
+                ghosttyTerminalID: terminal == .ghostty ? SessionTitle.nonEmpty(hook?.ghosttyTerminalID) : nil,
                 startedAt: startedAt,
                 updatedAt: record.updatedAtDate ?? startedAt))
         }

@@ -3,8 +3,10 @@ import Observation
 
 /// Owns the live list of Claude Code sessions.
 ///
-/// Watches `~/.claude/sessions` (vnode events on the directory) and polls every
-/// `pollInterval` as a safety net, since status changes may rewrite files in place.
+/// Change notification:
+/// - vnode sources on `~/.claude/sessions` and the hook-state directory catch files being
+///   created, deleted or atomically replaced (the hook writes temp + rename);
+/// - a `pollInterval` poll is the safety net (process exit, transcripts, missing directories).
 /// Discovery runs off the main actor; `sessions` is only assigned when it changes.
 @MainActor
 @Observable
@@ -14,21 +16,27 @@ public final class SessionStore {
     @ObservationIgnored public let discovery: SessionDiscovery
     @ObservationIgnored private let pollInterval: Duration
     @ObservationIgnored private var pollTask: Task<Void, Never>?
-    @ObservationIgnored private var dirSource: (any DispatchSourceFileSystemObject)?
+    /// path -> source, for the watched directories and registry files.
+    @ObservationIgnored private var sources: [String: any DispatchSourceFileSystemObject] = [:]
     @ObservationIgnored private var scanning = false
     @ObservationIgnored private var rescanPending = false
     @ObservationIgnored private var running = false
 
+    /// The real store: `~/.claude` plus the ClaudeWatcher hook-state directory.
     public convenience init() {
-        self.init(claudeHome: SessionDiscovery.defaultClaudeHome)
+        self.init(
+            claudeHome: SessionDiscovery.defaultClaudeHome,
+            hookStateDirectory: HookStateStore.defaultDirectory)
     }
 
     public init(
         claudeHome: URL,
+        hookStateDirectory: URL? = nil,
         inspector: any ProcessInspecting = SystemProcessInspector(),
         pollInterval: Duration = .seconds(2)
     ) {
-        self.discovery = SessionDiscovery(claudeHome: claudeHome, inspector: inspector)
+        self.discovery = SessionDiscovery(
+            claudeHome: claudeHome, hookStateDirectory: hookStateDirectory, inspector: inspector)
         self.pollInterval = pollInterval
     }
 
@@ -39,13 +47,13 @@ public final class SessionStore {
     public func start() {
         guard !running else { return }
         running = true
-        installWatcher()
+        installDirectoryWatchers()
         refresh()
         pollTask = Task { [weak self, pollInterval] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: pollInterval)
                 guard !Task.isCancelled, let self else { return }
-                self.installWatcher()  // no-op if already watching; retries if dir was missing
+                self.installDirectoryWatchers()  // no-op if already watching; retries if a dir was missing
                 self.refresh()
             }
         }
@@ -55,8 +63,8 @@ public final class SessionStore {
         running = false
         pollTask?.cancel()
         pollTask = nil
-        dirSource?.cancel()
-        dirSource = nil
+        for source in sources.values { source.cancel() }
+        sources = [:]
     }
 
     /// Requests a discovery pass; coalesces with one already in flight.
@@ -87,27 +95,37 @@ public final class SessionStore {
         if result != sessions { sessions = result }
     }
 
-    private func installWatcher() {
-        guard running, dirSource == nil else { return }
-        let path = discovery.sessionsDirectory.path
+    // MARK: - Watchers
+
+    private var watchedDirectories: [URL] {
+        [discovery.sessionsDirectory] + (discovery.hookStateDirectory.map { [$0] } ?? [])
+    }
+
+    private func installDirectoryWatchers() {
+        for dir in watchedDirectories { watch(path: dir.path, events: [.write, .delete, .rename, .extend, .attrib]) }
+    }
+
+    /// Installs a vnode source on `path` (file or directory) that triggers `refresh()`. If the
+    /// node is deleted or renamed away the source is dropped; the next poll / scan re-adds it.
+    private func watch(path: String, events: DispatchSource.FileSystemEvent) {
+        guard running, sources[path] == nil else { return }
         let fd = open(path, O_EVTONLY)
-        guard fd >= 0 else { return }  // missing dir / no permission: polling will retry
+        guard fd >= 0 else { return }  // missing / no permission: polling will retry
         let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd, eventMask: [.write, .delete, .rename, .extend, .attrib], queue: .main)
-        source.setEventHandler { [weak self] in
+            fileDescriptor: fd, eventMask: events, queue: .main)
+        source.setEventHandler { [weak self, weak source] in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, let source else { return }
                 let flags = source.data
                 if flags.contains(.delete) || flags.contains(.rename) {
-                    // Directory replaced: drop this watcher; the poll re-installs it.
-                    self.dirSource?.cancel()
-                    self.dirSource = nil
+                    source.cancel()
+                    if self.sources[path] === source { self.sources[path] = nil }
                 }
                 self.refresh()
             }
         }
         source.setCancelHandler { close(fd) }
-        dirSource = source
+        sources[path] = source
         source.resume()
     }
 }

@@ -134,7 +134,8 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   resolver queue) instead of touching `defaultClaudeHome`, which blocks until resolved.
 - A registry pid is live only if it runs Claude Code:
   `ProcessRules.isClaudeExecutable` accepts a binary named `claude`, the native installer's
-  `…/claude/versions/<ver>`, Homebrew's `Caskroom/claude-code/`, or `node` running the npm
+  `…/claude/versions/<ver>`, Homebrew's `Caskroom/claude-code/`, any path inside the npm package
+  (newer npm installs exec a native `…/@anthropic-ai/claude-code/bin/claude.exe`), or `node` running the npm
   package (argv read via `KERN_PROCARGS2`, only for `node`): argv[0] `claude` (`process.title`),
   any argument literally naming `@anthropic-ai/claude-code` (`node …/cli.js`), or the script
   (`ProcessRules.nodeScript`: skip leading `-` options; at `--`, the next argument) with basename

@@ -284,6 +284,10 @@ private let transcriptSample = """
     #expect(live("/opt/homebrew/Caskroom/claude-code/2.1.306/claude"))
     // Any binary named claude (e.g. a symlinked or self-built install).
     #expect(live("/usr/local/bin/claude"))
+    // npm, newer versions: a native binary inside the package (`bin/claude` -> `bin/claude.exe`).
+    #expect(live("/Users/me/.nvm/versions/node/v24.13.0/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"))
+    #expect(live("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code-darwin-arm64/claude"))
+    #expect(!live("/opt/homebrew/lib/node_modules/@anthropic-ai/sdk/bin/tool"))
     // npm: node running the claude-code package.
     #expect(live("/opt/homebrew/Cellar/node/24.1.0/bin/node", argv: npmArgv))
     #expect(live("/Users/me/.nvm/versions/node/v22.0.0/bin/node",

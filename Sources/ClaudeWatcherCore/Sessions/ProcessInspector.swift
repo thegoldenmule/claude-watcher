@@ -156,6 +156,9 @@ public enum ProcessRules {
     ) -> Bool {
         guard let path = executablePath, !path.isEmpty else { return false }
         if path.contains("/claude/versions/") || path.contains("Caskroom/claude-code/") { return true }
+        // Newer npm installs ship a native binary, `…/@anthropic-ai/claude-code/bin/claude.exe`
+        // (also covers platform packages like `@anthropic-ai/claude-code-darwin-arm64/`).
+        if path.contains("/\(npmPackage)") { return true }
         let name = (path as NSString).lastPathComponent
         if name == "claude" { return true }
         guard name == "node", let argv = arguments() else { return false }

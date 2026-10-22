@@ -487,7 +487,9 @@ find_claude() {
 # True if a process with ucomm $1 and command line $2 (ps args) runs Claude Code (mirrors
 # Swift's ProcessRules.isClaudeExecutable). Native installs exec
 # ~/.local/share/claude/versions/<ver> (ucomm is the version string, argv0 is "claude"),
-# Homebrew's cask runs Caskroom/claude-code/…/claude. npm installs run node on the package:
+# Homebrew's cask runs Caskroom/claude-code/…/claude. Newer npm installs exec a native
+# …/@anthropic-ai/claude-code/bin/claude.exe (ucomm "claude.exe", argv0 "claude").
+# Older npm installs run node on the package:
 # argv is "node /opt/homebrew/bin/claude …", where bin/claude is a symlink to
 # …/@anthropic-ai/claude-code/cli.js, so for node look at the script (first non-option arg,
 # or the one right after `--`, like Swift's ProcessRules.nodeScript): named claude or, if

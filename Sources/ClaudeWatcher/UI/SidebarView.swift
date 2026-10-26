@@ -13,6 +13,8 @@ struct SidebarView: View {
     /// Banner for the last focus attempt that didn't fully succeed.
     var notice: FocusNotice? = nil
     let onSelect: (ClaudeSession) -> Void
+    /// The header's `[pin]`/`[pinned]` control was clicked.
+    var onTogglePin: () -> Void = {}
     var onDismissNotice: () -> Void = {}
     var onOpenAutomationSettings: () -> Void = {}
     /// The pointer entered (true) or left (false) a session's row.
@@ -42,7 +44,7 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SidebarHeader(sessions: sessions, isPinned: isPinned)
+            SidebarHeader(sessions: sessions, isPinned: isPinned, onTogglePin: onTogglePin)
                 .padding(.horizontal, style.paddingX)
                 .padding(.top, style.paddingY)
                 .padding(.bottom, style.lineHeight * 0.5)
@@ -132,10 +134,12 @@ private struct PaneBackground: View {
 
 // MARK: - Header
 
-/// `❯ claude sessions` plus a line of colored counts, like a prompt and its output.
+/// `❯ claude sessions` plus a line of colored counts, like a prompt and its output. The
+/// `[pin]`/`[pinned]` control toggles pinning.
 private struct SidebarHeader: View {
     let sessions: [ClaudeSession]
     let isPinned: Bool
+    let onTogglePin: () -> Void
 
     @Environment(\.terminalStyle) private var style
 
@@ -149,9 +153,8 @@ private struct SidebarHeader: View {
                 Text(.span("❯ ", style.success, font: style.boldFont)
                     + .span("claude", font: style.boldFont) + .span(" sessions"))
                 Spacer(minLength: style.cellWidth)
-                if isPinned {
-                    Text("[pinned] ").foregroundStyle(style.faint).help("Pinned")
-                }
+                PinToggle(isPinned: isPinned, action: onTogglePin)
+                Text(" ")
                 if !sessions.isEmpty {
                     Text("\(sessions.count)").foregroundStyle(style.faint)
                 }
@@ -474,6 +477,29 @@ private struct TerminalButton: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+    }
+}
+
+/// The header's `[pin]` / `[pinned]` control, styled like `TerminalButton` (inverse video on
+/// hover) but in the header's regular font and faint color.
+private struct PinToggle: View {
+    let isPinned: Bool
+    let action: () -> Void
+
+    @Environment(\.terminalStyle) private var style
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(isPinned ? "[pinned]" : "[pin]")
+                .foregroundStyle(hovering ? style.background : style.faint)
+                .background(hovering ? style.faint : .clear)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(isPinned ? "Unpin sidebar" : "Pin sidebar")
+        .accessibilityLabel(isPinned ? "Unpin sidebar" : "Pin sidebar")
     }
 }
 

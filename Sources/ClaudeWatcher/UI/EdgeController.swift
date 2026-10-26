@@ -27,7 +27,8 @@ final class EdgeController {
     /// The user's Ghostty look; the panel's width follows its font.
     let themeStore = ThemeStore()
 
-    /// When true the panel stays visible on the primary screen and never auto-hides.
+    /// When true the panel stays visible and never auto-hides (shown on the screen it's already
+    /// on, else the primary one). Toggled from the menu or the panel's header.
     var isPinned: Bool {
         get { pinned }
         set {
@@ -462,7 +463,9 @@ final class EdgeController {
         if pinned {
             showPinned()
         } else {
-            tick()  // starts the exit timer if the pointer is already away
+            // Starts the exit timer if the pointer is already away; unpinned from the header, the
+            // pointer is inside the panel, so it stays up until the pointer leaves.
+            tick()
         }
     }
 
@@ -488,8 +491,13 @@ final class EdgeController {
 
     // MARK: - Showing / hiding
 
+    /// Stays on the screen an auto-shown panel is on (pinning from its header must not jump it
+    /// to the primary screen); a hidden panel goes to the primary screen.
     private func showPinned() {
-        guard let screen = NSScreen.screens.first else { return }
+        let screens = NSScreen.screens
+        let current = isVisible
+            ? targetFrame.flatMap { frame in screens.first { $0.frame.intersects(frame) } } : nil
+        guard let screen = current ?? screens.first else { return }
         show(on: screen, animated: !isVisible)
     }
 
@@ -631,6 +639,7 @@ private struct SidebarRoot: View {
             pendingSessionID: controller.pendingSessionID,
             notice: controller.notice,
             onSelect: { controller.select($0) },
+            onTogglePin: { controller.isPinned.toggle() },
             onDismissNotice: { controller.dismissNotice() },
             onOpenAutomationSettings: { controller.openAutomationSettings() },
             onHoverChange: { controller.rowHoverChanged($0, inside: $1) },

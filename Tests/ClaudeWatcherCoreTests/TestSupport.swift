@@ -95,3 +95,31 @@ func onDedicatedThread<T: Sendable>(_ body: @escaping @Sendable () throws -> T) 
         Thread.detachNewThread { continuation.resume(with: Result { try body() }) }
     }
 }
+
+/// A throwaway Claude home (`sessions/`, `projects/`) in the temp directory, removed on deinit.
+final class TempHome {
+    let url: URL
+    init() throws {
+        url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cw-sessions-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: url.appendingPathComponent("sessions"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: url.appendingPathComponent("projects"), withIntermediateDirectories: true)
+    }
+    deinit { try? FileManager.default.removeItem(at: url) }
+
+    func write(_ relative: String, _ text: String) throws {
+        let file = url.appendingPathComponent(relative)
+        try FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: file)
+    }
+
+    func append(_ relative: String, _ text: String) throws {
+        let handle = try FileHandle(forWritingTo: url.appendingPathComponent(relative))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(text.utf8))
+        try handle.close()
+    }
+}

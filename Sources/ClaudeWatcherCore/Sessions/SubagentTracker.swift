@@ -14,6 +14,17 @@ struct SubagentMeta: Decodable, Equatable {
     var isBackground: Bool { requestShape == "background" }
 }
 
+/// A `<task-notification>` for an agent: when it was enqueued, and whether the agent stopped
+/// "with background work of its own still running" (parked: it's still alive and resumes when
+/// that work reports; Claude Code notifies again then).
+struct SubagentNotice: Equatable {
+    var at: Date
+    var parked = false
+
+    /// The later of two notices for the same agent.
+    static func latest(_ a: SubagentNotice, _ b: SubagentNotice) -> SubagentNotice { b.at > a.at ? b : a }
+}
+
 /// What an agent's jsonl tail says, "last wins" across reads.
 struct AgentTail: Equatable {
     var lastRecordAt: Date?
@@ -25,8 +36,10 @@ struct AgentTail: Equatable {
     /// agent writes it just after its notification is enqueued.
     var interrupted = false
     var activity: String?
-    /// task-id -> enqueue time, from `queued_command` attachments: finished children of this agent.
-    var notifications: [String: Date] = [:]
+    /// Label of the last tool call it ran with `run_in_background` (what a parked agent waits on).
+    var backgroundLaunch: String?
+    /// task-id -> notice, from `queued_command` attachments: finished children of this agent.
+    var notifications: [String: SubagentNotice] = [:]
 
     /// Applies the complete JSONL lines in `data`, in file order. Malformed lines are skipped.
     static func apply(_ data: Data, to tail: inout AgentTail) {
@@ -45,6 +58,11 @@ struct AgentTail: Equatable {
                    let label = blocks.lazy.reversed().compactMap(SubagentActivity.label(block:)).first {
                     tail.activity = label
                 }
+                for block in message?["content"] as? [[String: Any]] ?? []
+                where block["type"] as? String == "tool_use"
+                    && (block["input"] as? [String: Any])?["run_in_background"] as? Bool == true {
+                    tail.backgroundLaunch = SubagentActivity.label(block: block)
+                }
             case "user":
                 tail.userAfterLastAssistant = true
                 let content = (obj["message"] as? [String: Any])?["content"]
@@ -56,7 +74,8 @@ struct AgentTail: Equatable {
                       let id = SubagentRules.finishedTaskID(in: text),
                       let at = at ?? (attachment["timestamp"] as? String).flatMap(SubagentRules.date)
                 else { break }
-                tail.notifications[id] = max(tail.notifications[id] ?? at, at)
+                let notice = SubagentNotice(at: at, parked: SubagentRules.isParked(text))
+                tail.notifications[id] = tail.notifications[id].map { .latest($0, notice) } ?? notice
             default:
                 break
             }
@@ -127,7 +146,9 @@ enum SubagentRules {
     /// Whether an agent is done. Any of:
     /// 1. the user stopped it (meta rewritten with `stoppedByUser`);
     /// 2. a "finished" notification at or after its last record (a SendMessage resume writes
-    ///    new records after the notification);
+    ///    new records after the notification), unless it says the agent is parked: then it's
+    ///    running (waiting on its own background work) until `parkedStaleAfter` without activity
+    ///    while the session isn't busy, and rules 3-5 don't apply;
     /// 3. its last assistant message ended the turn and no user record (resume) followed, or its
     ///    last record is an interruption (written just after a "failed" notification);
     /// 4. a foreground root agent while the session is idle (a foreground agent blocks its
@@ -135,15 +156,17 @@ enum SubagentRules {
     ///    Nested foreground agents are decided by their parent agent (`SubagentTracker`);
     /// 5. stale: no activity for `staleAfter` while the session isn't busy (killed with the
     ///    process before it could write anything final).
-    /// With an empty `tail` this checks only 1, 4 and 5 on `lastWrite`; true there implies true
-    /// with the real tail (its last record is never later than the file's mtime).
     static func isFinished(
-        meta: SubagentMeta?, tail: AgentTail, lastWrite: Date, notifiedAt: Date?,
-        parentStatus: SessionStatus, now: Date, staleAfter: TimeInterval
+        meta: SubagentMeta?, tail: AgentTail, lastWrite: Date, notifiedAt: Date?, parked: Bool = false,
+        parentStatus: SessionStatus, now: Date, staleAfter: TimeInterval,
+        parkedStaleAfter: TimeInterval = defaultParkedStaleAfter
     ) -> Bool {
         if meta?.stoppedByUser == true { return true }
         let lastActivity = tail.lastRecordAt ?? lastWrite
-        if let notifiedAt, notifiedAt >= lastActivity { return true }
+        if let notifiedAt, notifiedAt >= lastActivity {
+            guard parked else { return true }
+            return parentStatus != .busy && now.timeIntervalSince(lastActivity) > parkedStaleAfter
+        }
         if let stop = tail.lastAssistantStop, terminalStops.contains(stop), !tail.userAfterLastAssistant {
             return true
         }
@@ -154,10 +177,28 @@ enum SubagentRules {
         return false
     }
 
+    /// A parked agent may wait hours on CI or a training run, and ends only with a later
+    /// notification or its session's exit; this is just a backstop.
+    static let defaultParkedStaleAfter: TimeInterval = 24 * 60 * 60
+
+    /// Whether an agent is done, from rules that need no file contents: stopped by the user, or
+    /// no write for `parkedStaleAfter` while the session isn't busy. True here implies
+    /// `isFinished` with any tail and notice (a last record is never later than the mtime).
+    static func isFinishedUnread(meta: SubagentMeta?, lastWrite: Date, parentStatus: SessionStatus,
+                                 now: Date, parkedStaleAfter: TimeInterval) -> Bool {
+        meta?.stoppedByUser == true
+            || (parentStatus != .busy && now.timeIntervalSince(lastWrite) > parkedStaleAfter)
+    }
+
+    /// The notification says the agent stopped with background work of its own still running.
+    static func isParked(_ text: String) -> Bool {
+        text.contains("background work of its own still running")
+    }
+
     /// A parent-transcript line `{"type":"queue-operation","operation":"enqueue",…}` whose
     /// content is a `<task-notification>` with a `<status>`: (task id = agent id, enqueue time).
     /// dequeue/remove lines, agent hand-back messages and status-less (Monitor) events: nil.
-    static func parseNotification(_ line: Data) -> (taskID: String, at: Date)? {
+    static func parseNotification(_ line: Data) -> (taskID: String, at: Date, parked: Bool)? {
         guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
               obj["type"] as? String == "queue-operation",
               obj["operation"] as? String == "enqueue",
@@ -165,7 +206,7 @@ enum SubagentRules {
               let id = finishedTaskID(in: content),
               let at = (obj["timestamp"] as? String).flatMap(date)
         else { return nil }
-        return (id, at)
+        return (id, at, isParked(content))
     }
 
     /// The `<task-id>` of a `<task-notification>` that carries a `<status>`, else nil.
@@ -204,7 +245,7 @@ enum SubagentRules {
 /// and an agent's jsonl is read only when its stat changes (just the appended lines, or a
 /// fresh `tailBytes` tail). Files last written before the session's process started are never
 /// opened (long or resumed sessions keep hundreds of old agents). The parent transcript's
-/// notifications are indexed only once some agent can't be decided without them.
+/// notifications are indexed only once some agent was written recently enough to be running.
 /// Not thread-safe; owned by `SessionDiscovery`.
 final class SubagentTracker {
     private struct FileStat: Equatable {
@@ -229,7 +270,7 @@ final class SubagentTracker {
     private struct NotificationIndex {
         var inode: UInt64
         var consumed: UInt64
-        var times: [String: Date]
+        var times: [String: SubagentNotice]
     }
 
     private struct State {
@@ -241,13 +282,16 @@ final class SubagentTracker {
 
     let tailBytes: UInt64
     let staleAfter: TimeInterval
+    let parkedStaleAfter: TimeInterval
     /// Chunk size for indexing the parent transcript.
     let chunkBytes: Int
     private var states: [String: State] = [:]
 
-    init(tailBytes: UInt64 = 64 * 1024, staleAfter: TimeInterval = 10 * 60, chunkBytes: Int = 1024 * 1024) {
+    init(tailBytes: UInt64 = 64 * 1024, staleAfter: TimeInterval = 10 * 60,
+         parkedStaleAfter: TimeInterval = SubagentRules.defaultParkedStaleAfter, chunkBytes: Int = 1024 * 1024) {
         self.tailBytes = tailBytes
         self.staleAfter = staleAfter
+        self.parkedStaleAfter = parkedStaleAfter
         self.chunkBytes = chunkBytes
     }
 
@@ -297,11 +341,12 @@ final class SubagentTracker {
             agents[id] = agent
         }
 
-        func finished(_ id: String, tail: AgentTail, notifiedAt: Date? = nil) -> Bool {
+        func finished(_ id: String, notice: SubagentNotice?) -> Bool {
             let a = agents[id]!
             return SubagentRules.isFinished(
-                meta: a.meta, tail: tail, lastWrite: a.stat.mtime, notifiedAt: notifiedAt,
-                parentStatus: parentStatus, now: now, staleAfter: staleAfter)
+                meta: a.meta, tail: a.tail, lastWrite: a.stat.mtime, notifiedAt: notice?.at,
+                parked: notice?.parked ?? false, parentStatus: parentStatus, now: now,
+                staleAfter: staleAfter, parkedStaleAfter: parkedStaleAfter)
         }
         func refreshTail(_ id: String) {
             guard var a = agents[id] else { return }
@@ -310,23 +355,24 @@ final class SubagentTracker {
         }
 
         // 1. Rules that need no file contents.
-        var undecided = agents.keys.filter { !finished($0, tail: AgentTail()) }
+        var undecided = agents.keys.filter { id in
+            !SubagentRules.isFinishedUnread(meta: agents[id]!.meta, lastWrite: agents[id]!.stat.mtime,
+                                            parentStatus: parentStatus, now: now,
+                                            parkedStaleAfter: parkedStaleAfter)
+        }
         // 2. The tails (and the parent agents' tails, whose queued_commands notify children).
         for id in undecided { refreshTail(id) }
         for id in undecided { if let p = agents[id]?.meta?.parentAgentId, agents[p] != nil { refreshTail(p) } }
-        var harvested: [String: Date] = [:]
+        var notices: [String: SubagentNotice] = [:]
         for a in agents.values where a.tailStat != nil {
-            harvested.merge(a.tail.notifications) { max($0, $1) }
+            notices.merge(a.tail.notifications, uniquingKeysWith: SubagentNotice.latest)
         }
-        undecided = undecided.filter { !finished($0, tail: agents[$0]!.tail, notifiedAt: harvested[$0]) }
-        // 3. The parent transcript's notifications.
+        // 3. The parent transcript's notifications. Needed even for a tail that ended its turn:
+        // a parked notice there keeps it running.
         if !undecided.isEmpty {
             updateIndex(&state, transcript: transcript.path)
-            let indexed = state.index?.times ?? [:]
-            undecided = undecided.filter { id in
-                let notifiedAt = [harvested[id], indexed[id]].compactMap { $0 }.max()
-                return !finished(id, tail: agents[id]!.tail, notifiedAt: notifiedAt)
-            }
+            notices.merge(state.index?.times ?? [:], uniquingKeysWith: SubagentNotice.latest)
+            undecided = undecided.filter { !finished($0, notice: notices[$0]) }
         }
         state.agents = agents
 
@@ -346,12 +392,16 @@ final class SubagentTracker {
         return Self.tree(running.map { id in
             let a = agents[id]!
             let type = SessionTitle.nonEmpty(a.meta?.agentType) ?? "agent"
+            // Running past its own "finished" notice: parked on its background work.
+            let parked = notices[id].map { $0.parked && $0.at >= (a.tail.lastRecordAt ?? a.stat.mtime) } ?? false
             return SubagentInfo(
                 id: id,
                 parentID: SessionTitle.nonEmpty(a.meta?.parentAgentId),
                 agentType: type,
                 label: SessionTitle.nonEmpty(a.meta?.description) ?? SessionTitle.nonEmpty(a.meta?.name) ?? type,
-                activity: a.tail.activity,
+                activity: parked
+                    ? SubagentActivity.clip("waiting on " + (a.tail.backgroundLaunch ?? "background work"))
+                    : a.tail.activity,
                 isBackground: a.meta?.isBackground ?? true,
                 startedAt: a.startedAt,
                 lastActivityAt: Self.floor(a.tail.lastRecordAt ?? a.stat.mtime))
@@ -478,8 +528,9 @@ final class SubagentTracker {
             let end = buffer.index(after: lastNL)
             Self.forEachLine(in: buffer[buffer.startIndex..<end], containing: queueMarker) { line in
                 guard line.range(of: taskIDMarker) != nil,
-                      let (id, at) = SubagentRules.parseNotification(Data(line)) else { return }
-                index.times[id] = max(index.times[id] ?? at, at)
+                      let (id, at, parked) = SubagentRules.parseNotification(Data(line)) else { return }
+                let notice = SubagentNotice(at: at, parked: parked)
+                index.times[id] = index.times[id].map { .latest($0, notice) } ?? notice
             }
             index.consumed += UInt64(end - buffer.startIndex)
             carry = buffer.subdata(in: end..<buffer.endIndex)

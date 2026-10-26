@@ -181,16 +181,24 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   running, end_turn/stop_sequence/max_tokens at the end. Finished notifications (agentId =
   `<task-id>`, `<status>` required, `enqueue` only, dequeue/remove ignored): the parent
   transcript's `queue-operation` lines, and for nested agents a `queued_command` attachment in
-  the parent agent's jsonl. An agent is finished if: stopped by the user; notified at or after
-  its last record (a SendMessage resume appends records, and a later notification); its last
+  the parent agent's jsonl. Parked: a "completed" notification whose `<note>` says the agent
+  "stopped with background work of its own still running" (e.g. its own `run_in_background`
+  CI wait). It's still alive, Claude Code shows it as running, and it resumes and notifies
+  again when that work reports; the registry meanwhile goes idle, so discovery reports an idle
+  session with running agents as `.busy` (`SessionDiscovery.status`). A parked agent is running
+  ("waiting on <its last background launch>") until a later notification, or a 24 h backstop
+  while the session isn't busy; the end-of-turn and 10 min stale rules don't apply to it. An
+  agent is finished if: stopped by the user; notified (not parked) at or after its last record
+  (a SendMessage resume appends records, and a later notification); its last
   assistant record ended the turn with no user record after it, or its last record is
   "[Request interrupted by user…]" (a failed agent writes it ~ms after its notification); a
   foreground root agent while the session is `.idle` (not `.waiting`: that may be its
   permission prompt); a nested foreground agent whose parent agent isn't running; stale (no
   record for 10 min while the session isn't busy). Agent files last written before the
-  session's process started are never opened (long-lived sessions keep hundreds). Reads are
-  incremental (stat-keyed, 64 KB tails); the parent transcript (can be 15 MB+) is indexed once,
-  lazily, then only appended lines. Poll-only (no watchers): running agents append many times
+  session's process started (or over 24 h ago while it isn't busy) are never opened
+  (long-lived sessions keep hundreds). Reads are incremental (stat-keyed, 64 KB tails); the
+  parent transcript (can be 15 MB+) is indexed once, lazily, then only appended lines; it is
+  always consulted for agents still in play, since a parked notice overrides their end_turn. Poll-only (no watchers): running agents append many times
   a second, and the 2 s poll lag is fine.
 - Claude home (`ClaudeHome`, `SessionDiscovery.defaultClaudeHome`): `CLAUDE_CONFIG_DIR` from our
   env, else `launchctl getenv`, else `$SHELL -lic` (value read after a marker, since rc files may

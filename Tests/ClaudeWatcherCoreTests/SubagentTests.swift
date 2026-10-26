@@ -52,14 +52,17 @@ private func toolUse(_ name: String, _ input: [String: Any]) -> [String: Any] {
     ["type": "tool_use", "name": name, "input": input]
 }
 
-private func notificationXML(_ id: String, status: String? = "completed") -> String {
+private func notificationXML(_ id: String, status: String? = "completed", parked: Bool = false) -> String {
     "<task-notification>\n<task-id>\(id)</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n"
-        + (status.map { "<status>\($0)</status>\n" } ?? "") + "<summary>done</summary>\n</task-notification>"
+        + (status.map { "<status>\($0)</status>\n" } ?? "") + "<summary>done</summary>\n"
+        + (parked ? "<note>This agent stopped with background work of its own still running. It may resume on its own when that work completes or reports, and the same task-id notifies again if it does; the result below may be interim.</note>\n" : "")
+        + "</task-notification>"
 }
 
-private func queueLine(_ id: String, at: Date, operation: String = "enqueue", status: String? = "completed") -> String {
+private func queueLine(_ id: String, at: Date, operation: String = "enqueue", status: String? = "completed",
+                       parked: Bool = false) -> String {
     var obj: [String: Any] = ["type": "queue-operation", "operation": operation, "timestamp": iso(at), "sessionId": "s"]
-    if operation == "enqueue" { obj["content"] = notificationXML(id, status: status) }
+    if operation == "enqueue" { obj["content"] = notificationXML(id, status: status, parked: parked) }
     return json(obj) + "\n"
 }
 
@@ -199,6 +202,49 @@ private final class AgentFixture {
     let resumed = f.running(tracker)
     #expect(resumed.map(\.id) == ["a1"])
     #expect(resumed.first?.activity == "Grep TODO")
+}
+
+@Test func parsesParkedNotifications() throws {
+    let t = Date(timeIntervalSince1970: 1_800_000_000)
+    #expect(try #require(SubagentRules.parseNotification(Data(queueLine("a1", at: t).utf8))).parked == false)
+    #expect(try #require(SubagentRules.parseNotification(Data(queueLine("a1", at: t, parked: true).utf8))).parked)
+    let early = SubagentNotice(at: t, parked: true), late = SubagentNotice(at: t.addingTimeInterval(1))
+    #expect(SubagentNotice.latest(early, late) == late)
+    #expect(SubagentNotice.latest(late, early) == late)
+}
+
+@Test func parkedAgentRunsUntilItsBackgroundWorkReports() throws {
+    let f = try AgentFixture()
+    let tracker = SubagentTracker()
+    // Ends its turn while its own background CI wait runs; Claude Code notifies "completed" + parked.
+    try f.write("a1", meta: metaJSON(description: "Land the PR"), userLine(f.at(0)),
+                assistantLine(f.at(1), stop: nil, block: toolUse("Bash", ["command": "ghx ci wait 1",
+                    "description": "Wait for CI", "run_in_background": true])),
+                userLine(f.at(2), "Command running in background with ID: b1."),
+                assistantLine(f.at(3), stop: "end_turn", block: ["type": "text", "text": "Waiting for CI."]))
+    try f.home.append("projects/p/s.jsonl", queueLine("a1", at: f.at(4), parked: true))
+    let parked = f.running(tracker, .idle)
+    #expect(parked.map(\.id) == ["a1"])
+    #expect(parked.first?.activity == "waiting on Bash Wait for CI")
+    // Not stale after the usual 10 minutes while the session is idle, only after the parked backstop.
+    #expect(f.running(tracker, .idle, now: Date().addingTimeInterval(5 * 3600)).map(\.id) == ["a1"])
+    #expect(f.running(tracker, .idle, now: Date().addingTimeInterval(25 * 3600)).isEmpty)
+    #expect(f.running(tracker, .busy, now: Date().addingTimeInterval(25 * 3600)).map(\.id) == ["a1"])
+    // The background work reports: it resumes, then finishes for real.
+    try f.append("a1", userLine(f.at(10), "<task-notification>b1 done</task-notification>"),
+                 assistantLine(f.at(11), stop: nil, block: toolUse("Bash", ["command": "ghx pr merge 1"])))
+    #expect(f.running(tracker, .idle).first?.activity == "Bash ghx pr merge 1")
+    try f.append("a1", assistantLine(f.at(12), stop: "end_turn", block: ["type": "text", "text": "Merged."]))
+    try f.home.append("projects/p/s.jsonl", queueLine("a1", at: f.at(13)))
+    #expect(f.running(tracker, .idle).isEmpty)
+}
+
+@Test func idleSessionWithRunningAgentsIsBusy() {
+    #expect(SessionDiscovery.status(.idle, runningAgents: 1) == .busy)
+    #expect(SessionDiscovery.status(.idle, runningAgents: 0) == .idle)
+    #expect(SessionDiscovery.status(.waiting, runningAgents: 2) == .waiting)
+    #expect(SessionDiscovery.status(.unknown, runningAgents: 2) == .unknown)
+    #expect(SessionDiscovery.status(.busy, runningAgents: 0) == .busy)
 }
 
 @Test func trackerSkipsAgentsWrittenBeforeProcessStart() throws {

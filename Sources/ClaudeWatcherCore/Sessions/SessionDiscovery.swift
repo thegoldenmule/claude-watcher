@@ -172,7 +172,7 @@ public actor SessionDiscovery {
                 title: title,
                 branch: branch,
                 lastPrompt: lastPrompt,
-                status: record.sessionStatus,
+                status: Self.status(record.sessionStatus, runningAgents: agents.count),
                 waitingFor: waitingFor,
                 tty: process.tty,
                 terminal: terminal,
@@ -192,6 +192,13 @@ public actor SessionDiscovery {
         gitBranchCache = gitBranchCache.filter { liveCwds.contains($0.key) }
 
         return Self.finalize(sessions)
+    }
+
+    /// The registry's status, except that an idle session with running subagents is busy: the
+    /// registry goes idle once the main turn ends even while an agent that stopped with background
+    /// work of its own (e.g. a CI wait) is still alive.
+    public static func status(_ registry: SessionStatus, runningAgents: Int) -> SessionStatus {
+        registry == .idle && runningAgents > 0 ? .busy : registry
     }
 
     /// Stable order (startedAt, then pid) and unique ids: if two processes report the

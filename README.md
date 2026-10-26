@@ -17,7 +17,9 @@ sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/deskt
 - Drag the sidebar's right edge to resize it (double-click to reset); the width is kept.
 - Pin the sidebar from its header (`[pin]` / `[pinned]`) or the menu; the pin is kept across relaunches.
 - Menu bar: Pin Sidebar, Reset Sidebar Width, Pause Edge Reveal (15 min / 1 h / 4 h / until
-  resumed; the icon turns to a moon while paused), Claude Code Hook (install / update / uninstall), Launch at Login, Quit.
+  resumed; the icon turns to a moon while paused), Claude Code Hook (install / update / uninstall), Launch at Login,
+  the app's version and whether a newer release is out (checked against GitHub releases at launch
+  and twice a day; "Update Available" opens the release page, nothing is downloaded), Quit.
 - Demo mode: `open build/ClaudeWatcher.app --args --demo`.
 
 ## Install

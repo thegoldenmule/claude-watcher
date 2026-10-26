@@ -38,8 +38,23 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   pop up without pointer movement. `PanelWidth`: clamps the
   user's panel width (UserDefaults `sidebarPanelWidth`, both modes) to 200 pt...half the visible
   screen; `EdgeController.frame(on:)` applies it without writing the clamp back.
+- `Sources/ClaudeWatcherCore/Update/`: `SemanticVersion` (semver precedence, `v` prefix),
+  `AppVersionInfo` (Info.plist version + build), `ReleaseInfo` (decodes GitHub's
+  `releases/latest`; drafts/pre-releases rejected), `UpdateChecker` (unauthenticated GET, no
+  `gh`/token, injectable `Fetch`; `If-None-Match` from the cached ETag only with a cached
+  release; ephemeral session, no URLCache, so a 304 reaches us; 429, or 403 with
+  `x-ratelimit-remaining: 0`, is a rate limit with a retry time), `UpdateSchedule` (launch: unless
+  checked < 1 h ago; then 12 h after a success, 30 min after a failure or the rate-limit reset),
+  `UpdateMenuState` (derived at display time from running version + cached release: a newer
+  release wins over a later failure; a build >= latest is up to date; no version = no claim).
+  Outgoing HTTPS needs no entitlement: the app is unsandboxed (`network.client` is a sandbox
+  entitlement) and the hardened runtime doesn't gate network access.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
-  `EdgeController`, `MenuModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`. Nothing may
+  `EdgeController`, `MenuModel`, `UpdateModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`.
+  `UpdateModel`: version line + update status + "Check for Updates" at the bottom of the menu;
+  first check 10 s after launch, a 15 min wall-clock tick and every menu open check when due;
+  the answer is cached in UserDefaults `updateCheckCache` (JSON `UpdateCache`). Links to the
+  release page only, never downloads. Demo mode never hits the network or the cache. Nothing may
   resolve `SessionDiscovery.defaultClaudeHome` on main at launch: `AppDelegate.init` prewarms it,
   the store is created once it resolves off-main, and `MenuModel` computes statuses off-main.
 - `Sources/ClaudeWatcher/UI/`: `EdgeController` (panel show/hide, focus + result banner, owns
@@ -90,10 +105,13 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
   show the info banner. Screenshot helpers (demo only): `CW_DEMO_NOTICE=error|info`,
   `CW_DEMO_HOVER=<id>`, `CW_DEMO_PENDING=<id>`, `CW_DEMO_EXPANDED=<id>` (open that row's agent
-  tree; demo-1 has a nested one, demo-3 one agent), `CW_DEMO_EMPTY=1`.
+  tree; demo-1 has a nested one, demo-3 one agent), `CW_DEMO_EMPTY=1`,
+  `CW_DEMO_UPDATE=X.Y.Z|fail|checking` (menu update line; default "Up to Date").
 - Theme overrides: `CW_GHOSTTY_CONFIG=<path>` (read only that config),
   `CW_GHOSTTY_THEME=<name or light:A,dark:B>` (preview a theme, ignoring config colors).
-- Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery`.
+- Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery`. Live update check against
+  GitHub (repo's Info.plist version vs `releases/latest`, plus an ETag revalidation):
+  `CW_LIVE=1 swift test --filter liveUpdateCheck`.
 - Logs: `/usr/bin/log stream --predicate 'subsystem == "com.thegoldenmule.ClaudeWatcher"'`
   (in zsh, bare `log` is a builtin). Focus lines show the resolver and the hook id.
 - Signing (dev): `$CODESIGN_IDENTITY`, else first "Apple Development" identity, else ad-hoc

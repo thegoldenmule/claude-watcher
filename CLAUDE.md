@@ -44,8 +44,12 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `\.panelVisible`: they keep firing after `orderOut`), `SidebarPanel`, `TerminalStyle` (SwiftUI
   colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
-  `PanelResizeHandle`: AppKit strip on the pane's right edge, shown only while pinned (not in demo):
-  drag resizes, double-click (or the menu's "Reset Sidebar Width") goes back to the theme width.
+  `PanelResizeHandle`: 8 pt AppKit strip on the pane's right edge, pinned or auto-shown (not in
+  demo): drag resizes, double-click (or the menu's "Reset Sidebar Width") goes back to the theme
+  width. It reports hover/drag to `EdgeController`'s `ResizeEdge`, which draws a 2 pt line inside
+  the border; `tick()` ignores the drag (`isResizing`) and runs once it ends. The header's
+  `[pin]`/`[pinned]` toggles `isPinned` (persisted as `sidebarPinned`, not in demo); pinning an
+  auto-shown panel keeps it on its screen.
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `Tests/ClaudeWatcherCoreTests/`: Swift Testing (`import Testing`). Keep logic in Core so it is testable.
   Tests run in parallel on the shared cooperative pool and must never block it (`waitUntilExit`,
@@ -246,5 +250,12 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
 - Automation denial surfaces as `FocusResult.failed` whose reason contains
   `AppleScriptError.notPermittedMarker`; the panel banner then offers
   `x-apple.systempreferences:com.apple.preference.security?Privacy_Automation`.
+- Cursor from the background: the app is never active (accessory app, non-activating panel), so
+  the window server ignores its `NSCursor.set()` unless the private CGS connection property
+  `SetsCursorInBackground` is on. `BackgroundCursor.enable()` (`PanelResizeHandle.swift`, from
+  `EdgeController.start()`, not in demo) sets it once via `dlsym` (default handle; Swift can't
+  import `RTLD_DEFAULT`) of `CGSMainConnectionID` + `CGSSetConnectionProperty`, skipping if
+  missing. A set cursor then persists, so the arrow is restored whenever the strip leaves the
+  pointer without a `mouseExited` (`hide()`, `\.panelVisible` false, view removed).
 - Don't name a Core type `RGBColor`: it clashes with QuickDraw's `RGBColor` in AppKit targets
   (hence `GhosttyColor`).

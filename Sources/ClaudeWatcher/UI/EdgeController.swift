@@ -229,8 +229,8 @@ final class EdgeController {
 
     // MARK: - Panel width
 
-    /// Whether the panel's right edge can be dragged (while pinned). Off in demo mode, which
-    /// neither reads nor writes the stored width.
+    /// Whether the panel's right edge can be dragged (pinned or auto-shown). Off in demo mode,
+    /// which neither reads nor writes the stored width.
     @ObservationIgnored let isResizable = !DemoMode.isEnabled
     /// The user's width (persisted), applied in pinned and auto-hide modes alike; nil follows the
     /// theme. `frame(on:)` clamps it per screen without writing the clamp back, so a width that
@@ -252,7 +252,7 @@ final class EdgeController {
     }
 
     fileprivate func panelResizeBegan(at screenX: CGFloat) {
-        guard isResizable, pinned, isVisible, let frame = targetFrame else { return }
+        guard isResizable, isVisible, let frame = targetFrame else { return }
         dragGrabOffset = frame.maxX - screenX
         isResizing = true
         didResize = false
@@ -277,9 +277,16 @@ final class EdgeController {
 
     fileprivate func panelResizeEnded() {
         guard isResizing else { return }
+        finishResize()
+        // `tick()` ignored the drag: start the exit timer if the pointer ended up away (auto-shown).
+        tick()
+    }
+
+    /// Ends a drag, storing the width if it changed (the panel already shows it). No tick.
+    private func finishResize() {
         isResizing = false
+        defer { didResize = false }
         guard didResize, let width = panelWidthOverride else { return }
-        didResize = false
         UserDefaults.standard.set(Double(width), forKey: Keys.panelWidth)
         hasCustomPanelWidth = true
     }
@@ -433,8 +440,9 @@ final class EdgeController {
     // MARK: - Pointer tracking
 
     private func tick() {
-        // A visible notice holds the panel open until it expires or is dismissed.
-        guard panel != nil, !pinned, notice == nil, pendingSessionID == nil else { return }
+        // A visible notice holds the panel open until it expires or is dismissed; a resize drag
+        // (whose `.leftMouseDragged` events land here) until it ends, even past the exit margin.
+        guard panel != nil, !pinned, !isResizing, notice == nil, pendingSessionID == nil else { return }
         let screens = NSScreen.screens
         policy.suspendedUntil = revealPausedUntil
         let decision = policy.evaluate(
@@ -562,6 +570,7 @@ final class EdgeController {
     /// hide after a successful focus passes false so the focus pulse plays out.
     private func hide(animated: Bool, resetHighlights: Bool = true) {
         policy.reset()
+        if isResizing { finishResize() }  // e.g. a screen change mid-drag; later drag events no-op
         hoveredID = nil  // rows may not see a hover exit once the panel is ordered out
         cancelHoverTint()
         guard let panel, isVisible || panel.isVisible else { return }
@@ -652,7 +661,7 @@ private struct SidebarRoot: View {
         .overlay(alignment: .trailing) {
             // The pane fills the panel, so its visible edge is the panel's: the strip sits just
             // inside it, clear of the rounded corners.
-            if controller.isPinned && controller.isResizable {
+            if controller.isResizable {
                 PanelResizeHandle(
                     onBegan: { controller.panelResizeBegan(at: $0) },
                     onChanged: { controller.panelResizeChanged(to: $0) },

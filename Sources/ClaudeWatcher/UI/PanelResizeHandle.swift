@@ -76,7 +76,7 @@ struct PanelResizeHandle: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            // Removed mid-drag (e.g. unpinned): finish the resize so the width still persists.
+            // Removed mid-drag (panel torn down): finish the resize so the width still persists.
             if window == nil, isDragging {
                 isDragging = false
                 onEnded()

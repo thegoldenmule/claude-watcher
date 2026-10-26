@@ -105,6 +105,7 @@ private let terminalBinary = "/System/Applications/Utilities/Terminal.app/Conten
     }
     #expect(status("busy") == .busy)
     #expect(status("idle") == .idle)
+    #expect(status("shell") == .idle)
     #expect(status("waiting") == .waiting)
     #expect(status("weird") == .unknown)
     #expect(status(nil) == .unknown)

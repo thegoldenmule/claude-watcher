@@ -17,7 +17,8 @@ public struct SessionRecord: Decodable, Sendable, Equatable {
     public var name: String?
     /// derived | auto | user | collision
     public var nameSource: String?
-    /// busy | idle | waiting
+    /// busy | idle | shell | waiting. `shell` is an idle variant (Claude Code 2.1.280+ writes it
+    /// for a session idle at its prompt), so it maps to `.idle`.
     public var status: String?
     public var waitingFor: String?
     /// Epoch milliseconds.
@@ -69,7 +70,7 @@ public struct SessionRecord: Decodable, Sendable, Equatable {
     public var sessionStatus: SessionStatus {
         switch status {
         case "busy": .busy
-        case "idle": .idle
+        case "idle", "shell": .idle
         case "waiting": .waiting
         default: .unknown
         }

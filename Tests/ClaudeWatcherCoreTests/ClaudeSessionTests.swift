@@ -21,3 +21,16 @@ import Testing
     #expect(session.terminal == .ghostty)
     #expect(session.lastPrompt == nil)
 }
+
+@Test func contextUsageLevels() {
+    #expect(ContextUsage.fraction(250_000) == 0.25)
+    #expect(ContextUsage.fraction(2_000_000) == 1)
+    #expect(ContextUsage.fraction(-5) == 0)
+    #expect(ContextUsage.level(0.49) == .normal)
+    #expect(ContextUsage.level(0.5) == .warning)
+    #expect(ContextUsage.level(0.749) == .warning)
+    #expect(ContextUsage.level(0.75) == .critical)
+    #expect(ContextUsage.shortTokens(850) == "850")
+    #expect(ContextUsage.shortTokens(245_123) == "245k")
+    #expect(ContextUsage.shortTokens(1_000_000) == "1.0M")
+}

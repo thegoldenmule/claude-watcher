@@ -33,4 +33,13 @@ import Testing
     #expect(ContextUsage.shortTokens(850) == "850")
     #expect(ContextUsage.shortTokens(245_123) == "245k")
     #expect(ContextUsage.shortTokens(1_000_000) == "1.0M")
+    #expect(ContextUsage.percent(290_000) == 29)
+    #expect(ContextUsage.percent(749_999) == 74)
+    #expect(ContextUsage.percent(750_000) == 75)
+    #expect(ContextUsage.percent(3_000_000) == 100)
+    #expect(ContextUsage.percent(-1) == 0)
+    #expect(ContextUsage.percent(1, window: 0) == 0)
+    #expect(ContextUsage.label(245_123) == "245k / 1M · 24%")
+    #expect(ContextUsage.label(1_000_000) == "1.0M / 1M · 100%")
+    #expect(ContextUsage.label(100_000, window: 200_000) == "100k / 200k · 50%")
 }

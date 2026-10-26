@@ -28,4 +28,17 @@ public enum ContextUsage {
         if tokens >= 1_000 { return "\(tokens / 1_000)k" }
         return "\(max(0, tokens))"
     }
+
+    /// Whole percent used, 0...100, rounded down (in integers, so 290k is 29%) so it agrees
+    /// with `level`: 749,999 tokens read 74%, still a warning.
+    public static func percent(_ tokens: Int, window: Int = window) -> Int {
+        guard window > 0 else { return 0 }
+        return min(100, max(0, tokens) * 100 / window)
+    }
+
+    /// "245k / 1M · 25%". A round window drops the decimal ("1M", not "1.0M").
+    public static func label(_ tokens: Int, window: Int = window) -> String {
+        let size = window > 0 && window % 1_000_000 == 0 ? "\(window / 1_000_000)M" : shortTokens(window)
+        return "\(shortTokens(tokens)) / \(size) · \(percent(tokens, window: window))%"
+    }
 }

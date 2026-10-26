@@ -65,7 +65,11 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   block and only the toggle doesn't focus; trees start expanded, the toggle collapses one into
   `EdgeController.collapsedSessionIDs`, not the lazily recycled row, unpersisted and kept while
   the session has no agents; the header
-  adds `⑂ N agents`), `SidebarPanel`, `TerminalStyle` (SwiftUI
+  adds `⑂ N agents`; a session with `contextTokens` ends in a `ContextMeter` line: a drawn bar,
+  not `█░` glyphs (seams, font fallback), green/yellow/red per `ContextUsage.level`, its fill
+  keeping that color under the selection, and `245k / 1M · 25%` right-aligned in a fixed
+  16-cell reserve so every row's bar is as long; narrow panes fall back to `25%`, then the bar
+  alone), `SidebarPanel`, `TerminalStyle` (SwiftUI
   colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
   `PanelResizeHandle`: 8 pt AppKit strip on the pane's right edge, pinned or auto-shown (not in

@@ -343,6 +343,10 @@ private struct SessionRow: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
+
+                if let tokens = session.contextTokens {
+                    ContextMeter(tokens: tokens, textColor: ink(style.faint, faint: true))
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -424,6 +428,63 @@ private struct SessionRow: View {
                 Rectangle().fill(style.waiting).frame(width: 3)
             }
         }
+    }
+}
+
+/// How full the session's context window is: a bar in the level's palette color (green, then
+/// yellow from 50%, red from 75%) and `245k / 1M · 25%`. The fill keeps its color under the
+/// selection highlight, like the status glyph; the track and label follow `textColor`.
+private struct ContextMeter: View {
+    let tokens: Int
+    let textColor: Color
+
+    @Environment(\.terminalStyle) private var style
+
+    private var fraction: Double { ContextUsage.fraction(tokens) }
+
+    private var fill: Color {
+        switch ContextUsage.level(fraction) {
+        case .normal: style.green
+        case .warning: style.yellow
+        case .critical: style.red
+        }
+    }
+
+    var body: some View {
+        // Narrow panes drop the token counts, then the label.
+        ViewThatFits(in: .horizontal) {
+            meter(label: ContextUsage.label(tokens), reserve: 16)
+            meter(label: "\(ContextUsage.percent(tokens))%", reserve: 4)
+            bar
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Context \(ContextUsage.percent(tokens)) percent full, "
+            + "\(ContextUsage.shortTokens(tokens)) of 1M tokens")
+    }
+
+    /// The label is right-aligned in a fixed `reserve` of cells, so every row's bar is as long.
+    private func meter(label: String, reserve: CGFloat) -> some View {
+        HStack(spacing: style.cellWidth) {
+            bar.frame(minWidth: style.cellWidth * 6)
+            Text(label)
+                .foregroundStyle(textColor)
+                .lineLimit(1)
+                .fixedSize()
+                .frame(minWidth: style.cellWidth * reserve, alignment: .trailing)
+        }
+    }
+
+    /// Drawn, not `█░` text: block glyphs show seams between cells in many fonts, fall back to
+    /// another font's widths when the configured one lacks them, and only fill in eighths of a
+    /// cell. Square ends at about a block glyph's height still read as a run of cells.
+    private var bar: some View {
+        Rectangle()
+            .fill(textColor.opacity(0.22))
+            .overlay {
+                Rectangle().fill(fill).scaleEffect(x: fraction, anchor: .leading)
+            }
+            .frame(height: (style.lineHeight * 0.45).rounded())
+            .frame(maxWidth: .infinity, minHeight: style.lineHeight)
     }
 }
 

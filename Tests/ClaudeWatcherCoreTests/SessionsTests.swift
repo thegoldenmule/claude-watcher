@@ -378,7 +378,11 @@ private let transcriptSample = """
     try home.write("sessions/100.json", recordJSON(
         pid: 100, sessionId: "s-100", cwd: cwd, startedAt: t1.timeIntervalSince1970 * 1000 + 2000,
         procStart: procStartString(t1), status: "busy"))
-    try home.write("projects/\(slug)/s-100.jsonl", transcriptSample)
+    try home.write("projects/\(slug)/s-100.jsonl", transcriptSample + """
+    {"type":"assistant","isSidechain":false,"message":{"model":"claude-opus-5-5",\
+    "usage":{"input_tokens":5,"cache_creation_input_tokens":1000,"cache_read_input_tokens":240000}}}
+
+    """)
     // 200: live, Terminal.app, started earlier, transcript in another project dir (cwd changed).
     try home.write("sessions/200.json", recordJSON(
         pid: 200, sessionId: "s-200", cwd: "/somewhere/else", startedAt: t0.timeIntervalSince1970 * 1000 + 2000,
@@ -425,6 +429,7 @@ private let transcriptSample = """
     #expect(a.tty == "/dev/ttys001")
     #expect(a.terminal == .ghostty)
     #expect(a.ghosttyTerminalID == nil)
+    #expect(a.contextTokens == 241_005)
     #expect(a.startedAt == Date(timeIntervalSince1970: t1.timeIntervalSince1970 + 2))
 
     let b = try #require(sessions.first { $0.id == "s-200" })
@@ -432,6 +437,7 @@ private let transcriptSample = """
     #expect(b.terminal == .appleTerminal)
     #expect(b.tty == "/dev/ttys004")
     #expect(b.branch == nil)
+    #expect(b.contextTokens == nil)
 
     // A registry file mid-rewrite keeps the last good copy.
     try home.write("sessions/100.json", "{\"pid\":100,")
@@ -678,6 +684,9 @@ func liveDiscovery() async throws {
     let secondMs = Date().timeIntervalSince(start2) * 1000
     print("LIVE: \(sessions.count) session(s); first scan \(Int(firstMs)) ms, cached rescan \(Int(secondMs)) ms")
     for s in sessions {
+        let context = s.contextTokens.map {
+            "\($0) (\(ContextUsage.shortTokens($0)), \(Int(ContextUsage.fraction($0) * 100))%)"
+        } ?? "nil"
         print("""
         LIVE: pid=\(s.pid) id=\(s.id)
               title=\(s.title.debugDescription) branch=\(s.branch ?? "nil") status=\(s.status) \
@@ -685,7 +694,7 @@ func liveDiscovery() async throws {
               tty=\(s.tty ?? "nil") terminal=\(s.terminal) ghosttyTerminalID=\(s.ghosttyTerminalID ?? "nil") cwd=\(s.cwd)
               startedAt=\(s.startedAt) updatedAt=\(s.updatedAt)
               lastPrompt=\((s.lastPrompt ?? "nil").prefix(80).debugDescription)
-              subagents=\(s.subagents.count)
+              subagents=\(s.subagents.count) context=\(context)
         """)
         for line in SubagentTree.lines(s.subagents) {
             let a = line.agent

@@ -179,7 +179,8 @@ public actor SessionDiscovery {
                 ghosttyTerminalID: terminal == .ghostty ? SessionTitle.nonEmpty(hook?.ghosttyTerminalID) : nil,
                 startedAt: startedAt,
                 updatedAt: record.updatedAtDate ?? startedAt,
-                subagents: agents))
+                subagents: agents,
+                contextTokens: info?.contextTokens))
         }
 
         transcripts.forget(except: liveTranscriptPaths)

@@ -11,6 +11,10 @@ struct ClaudeWatcherApp: App {
                 get: { appDelegate.edge.isPinned },
                 set: { appDelegate.edge.isPinned = $0 }
             ))
+            if !appDelegate.isDemo {
+                Button("Reset Sidebar Width") { appDelegate.edge.resetPanelWidth() }
+                    .disabled(!appDelegate.edge.hasCustomPanelWidth)
+            }
             if appDelegate.isDemo {
                 // Demo mode never tints terminals; don't expose (or write) the real prefs.
                 Text("Demo mode")

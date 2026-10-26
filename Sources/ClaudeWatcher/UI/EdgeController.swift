@@ -220,6 +220,80 @@ final class EdgeController {
         notice = nil
     }
 
+    // MARK: - Panel width
+
+    /// Whether the panel's right edge can be dragged (while pinned). Off in demo mode, which
+    /// neither reads nor writes the stored width.
+    @ObservationIgnored let isResizable = !DemoMode.isEnabled
+    /// The user's width (persisted), applied in pinned and auto-hide modes alike; nil follows the
+    /// theme. `frame(on:)` clamps it per screen without writing the clamp back, so a width that
+    /// didn't fit a small screen comes back on a bigger one.
+    @ObservationIgnored private var panelWidthOverride: CGFloat? =
+        DemoMode.isEnabled ? nil : EdgeController.storedWidth()
+    /// A width is stored (enables "Reset Sidebar Width"); updated at drag end and reset only.
+    private(set) var hasCustomPanelWidth = !DemoMode.isEnabled && EdgeController.storedWidth() != nil
+    /// Screen-x distance from the pointer to the panel's right edge when the drag began.
+    @ObservationIgnored private var dragGrabOffset: CGFloat = 0
+    @ObservationIgnored private var isResizing = false
+    @ObservationIgnored private var didResize = false
+
+    private static func storedWidth() -> CGFloat? {
+        guard let value = UserDefaults.standard.object(forKey: Keys.panelWidth) as? Double,
+              value.isFinite, value > 0
+        else { return nil }
+        return CGFloat(value)
+    }
+
+    fileprivate func panelResizeBegan(at screenX: CGFloat) {
+        guard isResizable, pinned, isVisible, let frame = targetFrame else { return }
+        dragGrabOffset = frame.maxX - screenX
+        isResizing = true
+        didResize = false
+    }
+
+    fileprivate func panelResizeChanged(to screenX: CGFloat) {
+        // The screen the panel is on, not the one under the pointer (which may be past its edge).
+        guard isResizing, let panel, let current = targetFrame,
+              let screen = NSScreen.screens.first(where: { $0.frame.intersects(current) })
+        else { return }
+        let width = PanelWidth.clamped(
+            screenX + dragGrabOffset - current.minX, visibleWidth: screen.visibleFrame.width)
+        guard width != current.width else { return }
+        panelWidthOverride = width
+        didResize = true
+        // Keep targetFrame current: `rowID(at:)` hit-tests against it.
+        let target = frame(on: screen)
+        targetFrame = target
+        panel.setFrame(target, display: true)
+        panel.invalidateShadow()
+    }
+
+    fileprivate func panelResizeEnded() {
+        guard isResizing else { return }
+        isResizing = false
+        guard didResize, let width = panelWidthOverride else { return }
+        didResize = false
+        UserDefaults.standard.set(Double(width), forKey: Keys.panelWidth)
+        hasCustomPanelWidth = true
+    }
+
+    /// Forgets the user's width and goes back to the theme's.
+    func resetPanelWidth() {
+        guard isResizable else { return }
+        isResizing = false
+        didResize = false
+        UserDefaults.standard.removeObject(forKey: Keys.panelWidth)
+        panelWidthOverride = nil
+        hasCustomPanelWidth = false
+        guard let panel, isVisible, let current = targetFrame,
+              let screen = NSScreen.screens.first(where: { $0.frame.intersects(current) })
+        else { return }
+        let target = frame(on: screen)
+        targetFrame = target
+        panel.setFrame(target, display: true)
+        panel.invalidateShadow()
+    }
+
     // MARK: - Terminal highlight
 
     private var highlightTint: GhosttyColor { themeStore.style.theme.highlightTint() }
@@ -367,7 +441,8 @@ final class EdgeController {
         return NSRect(
             x: vf.minX + edgeInset,
             y: vf.minY + edgeInset,
-            width: themeStore.style.panelWidth,
+            width: PanelWidth.resolved(
+                stored: panelWidthOverride, themeDefault: themeStore.style.panelWidth, visibleWidth: vf.width),
             height: vf.height - 2 * edgeInset
         )
     }
@@ -457,6 +532,7 @@ final class EdgeController {
     private enum Keys {
         static let highlightOnHover = "highlightTerminalOnHover"
         static let pulseOnFocus = "pulseTerminalOnFocus"
+        static let panelWidth = "sidebarPanelWidth"  // Double, points
     }
 
     private static func storedFlag(_ key: String) -> Bool {
@@ -502,6 +578,20 @@ private struct SidebarRoot: View {
             onRowFrames: { controller.rowFramesChanged($0) },
             onListViewport: { controller.listViewportChanged($0) }
         )
+        .overlay(alignment: .trailing) {
+            // The pane fills the panel, so its visible edge is the panel's: the strip sits just
+            // inside it, clear of the rounded corners.
+            if controller.isPinned && controller.isResizable {
+                PanelResizeHandle(
+                    onBegan: { controller.panelResizeBegan(at: $0) },
+                    onChanged: { controller.panelResizeChanged(to: $0) },
+                    onEnded: { controller.panelResizeEnded() },
+                    onReset: { controller.resetPanelWidth() }
+                )
+                .frame(width: 6)
+                .padding(.vertical, TerminalStyle.cornerRadius)
+            }
+        }
         .environment(\.terminalStyle, controller.themeStore.style)
         .environment(\.panelVisible, controller.isVisible)
     }

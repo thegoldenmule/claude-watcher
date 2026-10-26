@@ -153,6 +153,11 @@ private final class AgentFixture {
                      + assistantLine(t, stop: "end_turn", block: ["type": "text", "text": "done"])))
     // A SendMessage resume: a user record after the end_turn.
     #expect(!finished(assistantLine(t, stop: "end_turn", block: ["type": "text", "text": "done"]) + userLine(t)))
+    // Interrupted (stopped, or failed: written just after the notification); then resumed.
+    let interrupt = json(["type": "user", "timestamp": iso(t), "message": [
+        "role": "user", "content": [["type": "text", "text": "[Request interrupted by user]"]]]]) + "\n"
+    #expect(finished(assistantLine(t, stop: nil, block: read) + interrupt))
+    #expect(!finished(assistantLine(t, stop: nil, block: read) + interrupt + userLine(t, "go on")))
     // Attachments after the end_turn aren't a resume.
     #expect(finished(assistantLine(t, stop: "end_turn", block: ["type": "text", "text": "done"])
                      + queuedCommandLine("child", at: t)))

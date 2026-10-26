@@ -21,6 +21,9 @@ struct AgentTail: Equatable {
     var lastAssistantStop: String?
     /// A user record follows the last assistant record (a tool result, or a SendMessage resume).
     var userAfterLastAssistant = false
+    /// The last user/assistant record is "[Request interrupted by user…]": a stopped or failed
+    /// agent writes it just after its notification is enqueued.
+    var interrupted = false
     var activity: String?
     /// task-id -> enqueue time, from `queued_command` attachments: finished children of this agent.
     var notifications: [String: Date] = [:]
@@ -37,12 +40,15 @@ struct AgentTail: Equatable {
                 // Streaming blocks carry a null stop_reason; the message's last block the real one.
                 tail.lastAssistantStop = message?["stop_reason"] as? String
                 tail.userAfterLastAssistant = false
+                tail.interrupted = false
                 if let blocks = message?["content"] as? [[String: Any]],
                    let label = blocks.lazy.reversed().compactMap(SubagentActivity.label(block:)).first {
                     tail.activity = label
                 }
             case "user":
                 tail.userAfterLastAssistant = true
+                let content = (obj["message"] as? [String: Any])?["content"]
+                tail.interrupted = SubagentRules.text(content)?.hasPrefix("[Request interrupted by user") == true
             case "attachment":
                 guard let attachment = obj["attachment"] as? [String: Any],
                       attachment["type"] as? String == "queued_command",
@@ -122,7 +128,8 @@ enum SubagentRules {
     /// 1. the user stopped it (meta rewritten with `stoppedByUser`);
     /// 2. a "finished" notification at or after its last record (a SendMessage resume writes
     ///    new records after the notification);
-    /// 3. its last assistant message ended the turn and no user record (resume) followed;
+    /// 3. its last assistant message ended the turn and no user record (resume) followed, or its
+    ///    last record is an interruption (written just after a "failed" notification);
     /// 4. a foreground root agent while the session is idle (a foreground agent blocks its
     ///    session, so an idle prompt means it returned; `.waiting` may be its permission prompt).
     ///    Nested foreground agents are decided by their parent agent (`SubagentTracker`);
@@ -140,6 +147,7 @@ enum SubagentRules {
         if let stop = tail.lastAssistantStop, terminalStops.contains(stop), !tail.userAfterLastAssistant {
             return true
         }
+        if tail.interrupted { return true }
         let isBackground = meta?.isBackground ?? true
         if !isBackground, meta?.parentAgentId == nil, parentStatus == .idle { return true }
         if parentStatus != .busy, now.timeIntervalSince(lastActivity) > staleAfter { return true }

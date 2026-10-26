@@ -258,6 +258,9 @@ private struct SessionRow: View {
     private var agents: [SubagentInfo] { session.subagents }
     private var showsTree: Bool { isExpanded && !agents.isEmpty }
     private var rowPadding: CGFloat { style.lineHeight * 0.35 }
+    /// The agent tree hangs off the toggle line: its branches start under the agent count, past
+    /// the `▸ `, so the tree reads as nested inside the session.
+    private var treeIndent: CGFloat { style.cellWidth * 2 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -286,7 +289,7 @@ private struct SessionRow: View {
             if showsTree {
                 Button(action: action) {
                     agentTree
-                        .padding(.leading, style.paddingX + style.gutterWidth)
+                        .padding(.leading, style.paddingX + style.gutterWidth + treeIndent)
                         .padding(.trailing, style.paddingX)
                         .padding(.bottom, rowPadding)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -355,8 +358,8 @@ private struct SessionRow: View {
             .truncationMode(.tail)
     }
 
-    /// `├ Explore · find the hook installer        2m`, then the agent's latest action under it.
-    /// The elapsed times tick while the panel is visible.
+    /// `├── Explore · find the hook installer    2m`, then the agent's latest action under its
+    /// text. The elapsed times tick while the panel is visible.
     private var agentTree: some View {
         TimelineView(.animation(minimumInterval: 5, paused: !panelVisible)) { context in
             VStack(alignment: .leading, spacing: 0) {
@@ -381,7 +384,7 @@ private struct SessionRow: View {
                 .padding(.leading, style.cellWidth)
         }
         if let activity = line.agent.activity {
-            Text(.span(line.continuation + "  ", guide) + .span(activity, guide))
+            Text(.span(line.continuation, guide) + .span(activity, guide))
                 .lineLimit(1)
                 .truncationMode(.tail)
         }

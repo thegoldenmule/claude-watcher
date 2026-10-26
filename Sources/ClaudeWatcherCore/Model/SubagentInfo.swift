@@ -45,8 +45,10 @@ public struct SubagentTreeLine: Equatable, Sendable {
 }
 
 public enum SubagentTree {
-    /// Box-drawing prefixes for agents already in pre-order with `depth` set: "├ " / "└ " for
-    /// the agent's own position among its siblings, "│ " / "  " for each ancestor level.
+    /// Box-drawing prefixes for agents already in pre-order with `depth` set, four cells per
+    /// level like `tree(1)`: "├── " / "└── " for the agent's own position among its siblings,
+    /// "│   " / "    " for each ancestor level. `continuation` is as wide as `prefix`, so a
+    /// continuation line starts under the agent's text.
     public static func lines(_ agents: [SubagentInfo]) -> [SubagentTreeLine] {
         agents.indices.map { i in
             let depth = agents[i].depth
@@ -60,13 +62,13 @@ public enum SubagentTree {
             }
             var prefix = ""
             for level in 0..<depth {
-                prefix += hasLaterSibling(at: level) ? "│ " : "  "
+                prefix += hasLaterSibling(at: level) ? "│   " : "    "
             }
             let last = !hasLaterSibling(at: depth)
             return SubagentTreeLine(
                 agent: agents[i],
-                prefix: prefix + (last ? "└ " : "├ "),
-                continuation: prefix + (last ? "  " : "│ ")
+                prefix: prefix + (last ? "└── " : "├── "),
+                continuation: prefix + (last ? "    " : "│   ")
             )
         }
     }

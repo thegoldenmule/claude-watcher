@@ -7,15 +7,17 @@ private func agent(_ id: String, depth: Int = 0) -> SubagentInfo {
 }
 
 @Test func subagentTreePrefixes() {
-    // a
-    // ├ a1
-    // │ └ a1x
-    // └ a2
-    // b
+    // ├── a
+    // │   ├── a1
+    // │   │   └── a1x
+    // │   └── a2
+    // └── b
     let lines = SubagentTree.lines([agent("a"), agent("a1", depth: 1), agent("a1x", depth: 2), agent("a2", depth: 1), agent("b")])
-    #expect(lines.map(\.prefix) == ["├ ", "│ ├ ", "│ │ └ ", "│ └ ", "└ "])
-    #expect(lines.map(\.continuation) == ["│ ", "│ │ ", "│ │   ", "│   ", "  "])
-    #expect(SubagentTree.lines([agent("only")]).map(\.prefix) == ["└ "])
+    #expect(lines.map(\.prefix) == ["├── ", "│   ├── ", "│   │   └── ", "│   └── ", "└── "])
+    #expect(lines.map(\.continuation) == ["│   ", "│   │   ", "│   │       ", "│       ", "    "])
+    // A continuation line starts under its agent's text.
+    #expect(lines.allSatisfy { $0.prefix.count == $0.continuation.count })
+    #expect(SubagentTree.lines([agent("only")]).map(\.prefix) == ["└── "])
     #expect(SubagentTree.lines([]).isEmpty)
 }
 

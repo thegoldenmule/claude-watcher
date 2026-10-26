@@ -12,8 +12,8 @@ struct SidebarView: View {
     var pendingSessionID: String? = nil
     /// Banner for the last focus attempt that didn't fully succeed.
     var notice: FocusNotice? = nil
-    /// Sessions whose subagent tree is shown.
-    var expandedSessionIDs: Set<String> = []
+    /// Sessions whose subagent tree is hidden; the others show theirs.
+    var collapsedSessionIDs: Set<String> = []
     let onSelect: (ClaudeSession) -> Void
     /// A row's `▸ N agents` line was clicked.
     var onToggleExpanded: (_ sessionID: String) -> Void = { _ in }
@@ -65,7 +65,7 @@ struct SidebarView: View {
                         ForEach(ordered) { session in
                             SessionRow(
                                 session: session, isPending: session.id == pendingSessionID,
-                                isExpanded: expandedSessionIDs.contains(session.id),
+                                isExpanded: !collapsedSessionIDs.contains(session.id),
                                 onHover: { onHoverChange(session.id, $0) },
                                 onToggleExpanded: { onToggleExpanded(session.id) }
                             ) {
@@ -230,7 +230,7 @@ private struct EmptyStateView: View {
 private struct SessionRow: View {
     let session: ClaudeSession
     var isPending = false
-    var isExpanded = false
+    var isExpanded = true
     var onHover: (Bool) -> Void = { _ in }
     var onToggleExpanded: () -> Void = {}
     let action: () -> Void

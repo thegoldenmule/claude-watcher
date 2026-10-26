@@ -38,7 +38,7 @@ enum DemoMode {
 
     /// Screenshot helpers, demo only: `CW_DEMO_NOTICE=error|info` shows that banner at launch
     /// (and keeps it up), `CW_DEMO_HOVER=<id>` / `CW_DEMO_PENDING=<id>` draw a row hovered or
-    /// with its focus spinner, `CW_DEMO_EXPANDED=<id>` opens that row's agent tree,
+    /// with its focus spinner, `CW_DEMO_COLLAPSED=<id>[,<id>…]` collapses those rows' agent trees,
     /// `CW_DEMO_EMPTY=1` lists no sessions.
     static var previewNoticeSession: ClaudeSession? {
         guard isEnabled else { return nil }
@@ -56,8 +56,9 @@ enum DemoMode {
     static let previewPendingID: String? =
         isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_PENDING"] : nil
 
-    static let previewExpandedID: String? =
-        isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_EXPANDED"] : nil
+    static let previewCollapsedIDs: Set<String> = isEnabled
+        ? Set((ProcessInfo.processInfo.environment["CW_DEMO_COLLAPSED"] ?? "").split(separator: ",").map(String.init))
+        : []
 
     /// The menu's update line in demo mode, which never touches the network or the real cache:
     /// up to date by default; `CW_DEMO_UPDATE=X.Y.Z` previews "Update Available: vX.Y.Z" (if

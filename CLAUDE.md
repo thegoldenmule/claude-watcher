@@ -238,6 +238,16 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   `claude` (npm's `bin/claude` symlink) or, if absolute, a realpath into that package (a relative
   script is never resolved: it's relative to node's cwd). The hook's `is_claude_process` (used by
   `find_claude` and GC) applies the same rule, realpath only for absolute scripts; keep both in sync.
+- Context size (`ClaudeSession.contextTokens`, `TranscriptReader`): from the session transcript's
+  last main-conversation assistant record, `message.usage.input_tokens +
+  cache_creation_input_tokens + cache_read_input_tokens` (missing = 0; output tokens excluded).
+  Skipped: `isSidechain: true`, `model == "<synthetic>"` (API-error placeholders, all-zero
+  usage) and any all-zero usage. A `/compact` writes a `system`/`compact_boundary` record whose
+  `compactMetadata.postTokens` (~11k) becomes the value until the next reply (which reports
+  ~40k more: system prompt + tools), so a compacted session never keeps its pre-compact size.
+  Read with the transcript's tail; if the tail has none, scanned back in chunks (only lines
+  containing `"input_tokens"`/`"compact_boundary"` are decoded), once per file. The window is
+  assumed to be 1M (`ContextUsage.window`); transcripts don't record it.
 - Hook state dir `~/Library/Application Support/ClaudeWatcher/hook-state/` (layout documented at
   the top of `hooks/claude-watcher-hook.sh`; keep both sides in sync):
   - `<sid>.json`: replaced wholesale (temp + rename) by every event, no lock, no Ghostty id.

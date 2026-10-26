@@ -34,6 +34,7 @@ final class EdgeController {
         set {
             guard newValue != pinned else { return }
             pinned = newValue
+            if !DemoMode.isEnabled { UserDefaults.standard.set(newValue, forKey: Keys.isPinned) }
             pinnedDidChange()
         }
     }
@@ -62,7 +63,8 @@ final class EdgeController {
     /// Edge auto-reveal is paused until this date (persisted; `.distantFuture` = until resumed).
     private(set) var revealPausedUntil: Date? = EdgeController.storedPauseDate()
 
-    private var pinned = false
+    /// Persisted across relaunches; demo mode pins itself and neither reads nor writes it.
+    private var pinned = !DemoMode.isEnabled && UserDefaults.standard.bool(forKey: Keys.isPinned)
 
     @ObservationIgnored private let sessionsSource: @MainActor () -> [ClaudeSession]
     @ObservationIgnored private let selectHandler: @MainActor (ClaudeSession) async -> FocusResult
@@ -143,7 +145,7 @@ final class EdgeController {
         pendingSessionID = DemoMode.previewPendingID
 
         scheduleResume()  // a pause persisted across relaunch
-        if pinned { showPinned() }
+        if pinned { showPinned() }  // includes a pin persisted across relaunch
     }
 
     /// Removes monitors and hides the panel.
@@ -600,6 +602,7 @@ final class EdgeController {
         static let pulseOnFocus = "pulseTerminalOnFocus"
         static let panelWidth = "sidebarPanelWidth"  // Double, points
         static let revealPausedUntil = "edgeRevealPausedUntil"  // Date
+        static let isPinned = "sidebarPinned"  // Bool
     }
 
     private static func storedFlag(_ key: String) -> Bool {

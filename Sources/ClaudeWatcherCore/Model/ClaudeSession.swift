@@ -22,6 +22,7 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
     public var ghosttyTerminalID: String?  // Ghostty AppleScript terminal UUID, if known
     public var startedAt: Date
     public var updatedAt: Date
+    public var subagents: [SubagentInfo]  // running subagents, pre-order (children follow their parent)
 
     public init(
         id: String,
@@ -36,7 +37,8 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
         terminal: TerminalKind = .other("unknown"),
         ghosttyTerminalID: String? = nil,
         startedAt: Date,
-        updatedAt: Date
+        updatedAt: Date,
+        subagents: [SubagentInfo] = []
     ) {
         self.id = id
         self.pid = pid
@@ -51,5 +53,6 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
         self.ghosttyTerminalID = ghosttyTerminalID
         self.startedAt = startedAt
         self.updatedAt = updatedAt
+        self.subagents = subagents
     }
 }

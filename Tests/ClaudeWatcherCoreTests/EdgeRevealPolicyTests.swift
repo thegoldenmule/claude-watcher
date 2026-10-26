@@ -111,3 +111,54 @@ private extension EdgeRevealPolicy {
         #expect(p.sample(600, 500, at: 2.8, panel: panel) == .none, "not yet")
     }
 }
+
+@Suite struct EdgeRevealPolicyPauseTests {
+    let panel = CGRect(x: 6, y: 6, width: 280, height: 900)
+
+    @Test func pausedBlocksShow() {
+        var p = EdgeRevealPolicy()
+        p.suspendedUntil = at(10)
+        #expect(p.sample(0, 500, at: 0) == .none, "paused: no dwell, no recheck")
+        #expect(p.sample(0, 500, at: 1) == .none, "still paused")
+        #expect(p.dwellStart == nil)
+    }
+
+    @Test func expiryReenables() {
+        var p = EdgeRevealPolicy()
+        p.suspendedUntil = at(10)
+        #expect(p.sample(0, 500, at: 9.99) == .none, "just before expiry")
+        #expect(isRecheck(p.sample(0, 500, at: 10), 0.16), "at the until-date the dwell starts")
+        #expect(p.sample(0, 500, at: 10.16) == .show(screen: 0), "show after dwell")
+    }
+
+    @Test func dwellBeforePauseDoesNotFire() {
+        var p = EdgeRevealPolicy()
+        #expect(isRecheck(p.sample(0, 500, at: 0), 0.16), "dwell starts")
+        p.suspendedUntil = .distantFuture
+        #expect(p.sample(0, 500, at: 0.16) == .none, "paused mid-dwell: no show")
+        p.suspendedUntil = nil
+        #expect(isRecheck(p.sample(0, 500, at: 0.2), 0.16), "unpaused: a new dwell, not a show")
+    }
+
+    @Test func visiblePanelStillHides() {
+        var p = EdgeRevealPolicy()
+        p.suspendedUntil = .distantFuture
+        #expect(isRecheck(p.sample(600, 500, at: 0, panel: panel), 0.41), "exit starts")
+        #expect(p.sample(600, 500, at: 0.41, panel: panel) == .hide, "hides while paused")
+    }
+
+    @Test func resetKeepsSuspension() {
+        var p = EdgeRevealPolicy()
+        p.suspendedUntil = at(10)
+        p.reset()
+        #expect(p.suspendedUntil == at(10))
+        #expect(p.sample(0, 500, at: 0) == .none, "still paused after reset")
+    }
+
+    @Test func distantFutureNeverShows() {
+        var p = EdgeRevealPolicy()
+        p.suspendedUntil = .distantFuture
+        #expect(p.sample(0, 500, at: 0) == .none)
+        #expect(p.sample(0, 500, at: 1_000_000) == .none, "far later, still paused")
+    }
+}

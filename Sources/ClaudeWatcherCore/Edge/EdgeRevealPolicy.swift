@@ -7,6 +7,9 @@ import Foundation
 /// returned `Decision` (including scheduling the requested re-check, because a resting
 /// pointer produces no events).
 ///
+/// `suspendedUntil` pauses the reveal: until then a hidden panel is never shown (a visible
+/// one still hides as usual). The caller owns it; `reset()` leaves it alone.
+///
 /// Lives in ClaudeWatcherCore so it can be unit tested; it depends only on
 /// Foundation/CoreGraphics. Screen frames use AppKit's global coordinate space (origin at
 /// the bottom-left of the primary display, y up), i.e. `NSScreen.frame` / `NSEvent.mouseLocation`.
@@ -33,12 +36,18 @@ public struct EdgeRevealPolicy: Sendable {
     /// Extra slack added to re-check delays so the timer lands after the threshold.
     public var recheckSlack: TimeInterval = 0.01
 
+    /// Edge reveal is paused while `now < suspendedUntil`: no dwell starts and no `.show` (or
+    /// `.recheck` for one) is returned. `nil` = not paused; `.distantFuture` = until cleared.
+    /// Only affects a hidden panel: a visible one still runs its exit timer and hides.
+    public var suspendedUntil: Date?
+
     public private(set) var dwellStart: Date?
     public private(set) var dwellScreen: Int?
     public private(set) var exitStart: Date?
 
     public init() {}
 
+    /// Clears the dwell and exit timers. Leaves `suspendedUntil` as is.
     public mutating func reset() {
         dwellStart = nil
         dwellScreen = nil
@@ -76,6 +85,11 @@ public struct EdgeRevealPolicy: Sendable {
         }
 
         exitStart = nil
+        if let until = suspendedUntil, now < until {
+            dwellStart = nil
+            dwellScreen = nil
+            return .none
+        }
         guard !buttonsPressed,
               let index = Self.edgeScreenIndex(for: p, screens: screens),
               isAtEdge(p, of: screens[index])

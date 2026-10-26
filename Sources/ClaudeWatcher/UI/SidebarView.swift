@@ -12,7 +12,11 @@ struct SidebarView: View {
     var pendingSessionID: String? = nil
     /// Banner for the last focus attempt that didn't fully succeed.
     var notice: FocusNotice? = nil
+    /// Sessions whose subagent tree is shown.
+    var expandedSessionIDs: Set<String> = []
     let onSelect: (ClaudeSession) -> Void
+    /// A row's `▸ N agents` line was clicked.
+    var onToggleExpanded: (_ sessionID: String) -> Void = { _ in }
     /// The header's `[pin]`/`[pinned]` control was clicked.
     var onTogglePin: () -> Void = {}
     var onDismissNotice: () -> Void = {}
@@ -61,10 +65,14 @@ struct SidebarView: View {
                         ForEach(ordered) { session in
                             SessionRow(
                                 session: session, isPending: session.id == pendingSessionID,
-                                onHover: { onHoverChange(session.id, $0) }
+                                isExpanded: expandedSessionIDs.contains(session.id),
+                                onHover: { onHoverChange(session.id, $0) },
+                                onToggleExpanded: { onToggleExpanded(session.id) }
                             ) {
                                 onSelect(session)
                             }
+                            // Spans the whole block, agent tree included: hit-testing and the
+                            // hover tint map it to the session.
                             .background(GeometryReader { geometry in
                                 Color.clear.preference(
                                     key: RowFramesKey.self,
@@ -180,6 +188,8 @@ private struct SidebarHeader: View {
         if busy > 0 { parts.append(part("✳ \(busy) working", style.busy)) }
         if idle > 0 { parts.append(part("○ \(idle) idle", style.idle)) }
         if unknown > 0 { parts.append(part("? \(unknown) unknown", style.faint)) }
+        let agents = sessions.reduce(0) { $0 + $1.subagents.count }
+        if agents > 0 { parts.append(part("⑂ \(agents) agent\(agents == 1 ? "" : "s")", style.cyan)) }
         return Text(parts.dropFirst().reduce(parts.first ?? "") { $0 + .span("  ") + $1 })
     }
 }
@@ -213,13 +223,20 @@ private struct EmptyStateView: View {
 
 // MARK: - Row
 
+/// One session's block: its lines, then (with running subagents) a `▸ N agents running` line
+/// that toggles the agent tree below it. These are sibling buttons, never nested: the session's
+/// lines and the tree focus the session, the toggle line only expands/collapses. Hover, the
+/// selection highlight and the pane tint cover the whole block.
 private struct SessionRow: View {
     let session: ClaudeSession
     var isPending = false
+    var isExpanded = false
     var onHover: (Bool) -> Void = { _ in }
+    var onToggleExpanded: () -> Void = {}
     let action: () -> Void
 
     @Environment(\.terminalStyle) private var style
+    @Environment(\.panelVisible) private var panelVisible
     @State private var hoverState = false
     private var hovering: Bool { hoverState || DemoMode.previewHoverID == session.id }
 
@@ -238,58 +255,136 @@ private struct SessionRow: View {
         return name.isEmpty ? session.cwd : name
     }
 
+    private var agents: [SubagentInfo] { session.subagents }
+    private var showsTree: Bool { isExpanded && !agents.isEmpty }
+    private var rowPadding: CGFloat { style.lineHeight * 0.35 }
+
     var body: some View {
-        Button(action: action) {
-            HStack(alignment: .top, spacing: 0) {
-                StatusGlyph(status: session.status, dimColor: isSelected ? style.selectionText : nil)
-                    .frame(width: style.gutterWidth, height: style.lineHeight, alignment: .leading)
-
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 0) {
-                        Text(session.title)
-                            .font(style.boldFont)
-                            .foregroundStyle(ink(style.foreground))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        if isPending {
-                            BrailleSpinner().padding(.leading, style.cellWidth)
-                        }
-                    }
-
-                    if isWaiting {
-                        Text(waitingTag + .span(" ")
-                            + .span(session.waitingFor ?? "needs your input", ink(style.waiting)))
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    locationLine
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-
-                    if let prompt = session.lastPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !prompt.isEmpty {
-                        Text("> \(prompt.replacingOccurrences(of: "\n", with: " "))")
-                            .foregroundStyle(ink(style.faint, faint: true))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: action) {
+                sessionLines
+                    .padding(.horizontal, style.paddingX)
+                    .padding(.top, rowPadding)
+                    .padding(.bottom, agents.isEmpty ? rowPadding : 0)
+                    .contentShape(.rect)
             }
-            .padding(.leading, style.paddingX)
-            .padding(.trailing, style.paddingX)
-            .padding(.vertical, style.lineHeight * 0.35)
-            .background(background)
-            .contentShape(.rect)
+            .buttonStyle(RowButtonStyle())
+
+            if !agents.isEmpty {
+                Button(action: onToggleExpanded) {
+                    agentsToggle
+                        .padding(.leading, style.paddingX + style.gutterWidth)
+                        .padding(.trailing, style.paddingX)
+                        .padding(.bottom, showsTree ? 0 : rowPadding)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(RowButtonStyle())
+                .accessibilityLabel("\(isExpanded ? "Hide" : "Show") \(agentCount)")
+            }
+
+            if showsTree {
+                Button(action: action) {
+                    agentTree
+                        .padding(.leading, style.paddingX + style.gutterWidth)
+                        .padding(.trailing, style.paddingX)
+                        .padding(.bottom, rowPadding)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(.rect)
+                }
+                .buttonStyle(RowButtonStyle())
+            }
         }
-        .buttonStyle(RowButtonStyle())
+        .background(background)
+        .contentShape(.rect)
         .onHover { inside in
             hoverState = inside
             onHover(inside)
         }
         .help(session.cwd)
+    }
+
+    private var sessionLines: some View {
+        HStack(alignment: .top, spacing: 0) {
+            StatusGlyph(status: session.status, dimColor: isSelected ? style.selectionText : nil)
+                .frame(width: style.gutterWidth, height: style.lineHeight, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 0) {
+                    Text(session.title)
+                        .font(style.boldFont)
+                        .foregroundStyle(ink(style.foreground))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if isPending {
+                        BrailleSpinner().padding(.leading, style.cellWidth)
+                    }
+                }
+
+                if isWaiting {
+                    Text(waitingTag + .span(" ")
+                        + .span(session.waitingFor ?? "needs your input", ink(style.waiting)))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                locationLine
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if let prompt = session.lastPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !prompt.isEmpty {
+                    Text("> \(prompt.replacingOccurrences(of: "\n", with: " "))")
+                        .foregroundStyle(ink(style.faint, faint: true))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var agentCount: String { "\(agents.count) agent\(agents.count == 1 ? "" : "s")" }
+
+    /// `▸ 2 agents running`, `▾` while the tree is open.
+    private var agentsToggle: some View {
+        Text(.span(isExpanded ? "▾ " : "▸ ", ink(style.foreground))
+            + .span(agentCount, ink(style.cyan)) + .span(" running", ink(style.faint, faint: true)))
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
+    /// `├ Explore · find the hook installer        2m`, then the agent's latest action under it.
+    /// The elapsed times tick while the panel is visible.
+    private var agentTree: some View {
+        TimelineView(.animation(minimumInterval: 5, paused: !panelVisible)) { context in
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(SubagentTree.lines(agents), id: \.agent.id) { line in
+                    agentLines(line, now: context.date)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func agentLines(_ line: SubagentTreeLine, now: Date) -> some View {
+        let guide = ink(style.faint, faint: true)
+        HStack(spacing: 0) {
+            Text(.span(line.prefix, guide) + .span(line.agent.agentType, ink(style.cyan))
+                + .span(" · ", guide) + .span(line.agent.label, ink(style.foreground)))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(ElapsedFormat.short(now.timeIntervalSince(line.agent.startedAt)))
+                .foregroundStyle(guide)
+                .fixedSize()
+                .padding(.leading, style.cellWidth)
+        }
+        if let activity = line.agent.activity {
+            Text(.span(line.continuation + "  ", guide) + .span(activity, guide))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
     }
 
     /// Inverse-video ` waiting ` tag, as a terminal would draw it with SGR 7.

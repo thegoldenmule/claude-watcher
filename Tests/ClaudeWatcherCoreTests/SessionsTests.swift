@@ -445,6 +445,29 @@ private let transcriptSample = """
     #expect(await discovery2.scan().map(\.id) == ["s-200"])
 }
 
+@Test func discoveryAttachesRunningSubagents() async throws {
+    let home = try TempHome()
+    let t0 = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 3600).rounded(.down))
+    let slug = SessionDiscovery.projectSlug(for: "/x")
+    try home.write("sessions/100.json", recordJSON(
+        pid: 100, sessionId: "s-100", cwd: "/x", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0), status: "busy"))
+    try home.write("projects/\(slug)/s-100.jsonl", transcriptSample)
+    try home.write("projects/\(slug)/s-100/subagents/agent-a1.meta.json",
+                   "{\"agentType\":\"Explore\",\"description\":\"Look around\",\"requestShape\":\"background\"}")
+    try home.write("projects/\(slug)/s-100/subagents/agent-a1.jsonl", """
+    {"type":"user","isSidechain":true,"agentId":"a1","timestamp":"\(Date().addingTimeInterval(-5).formatted(.iso8601))","message":{"role":"user","content":"go"}}
+
+    """)
+    let inspector = FakeInspector(table: [
+        100: ProcessSnapshot(pid: 100, ppid: 1, startTime: t0, executablePath: claudeBinary),
+    ])
+    let session = try #require(await SessionDiscovery(claudeHome: home.url, inspector: inspector).scan().first)
+    #expect(session.subagents.map(\.id) == ["a1"])
+    #expect(session.subagents.first?.label == "Look around")
+    #expect(session.status == .busy)
+}
+
 @Test func discoversCaskAndNpmInstalls() async throws {
     let home = try TempHome()
     let t0 = Date(timeIntervalSince1970: 1792681136)
@@ -662,7 +685,33 @@ func liveDiscovery() async throws {
               tty=\(s.tty ?? "nil") terminal=\(s.terminal) ghosttyTerminalID=\(s.ghosttyTerminalID ?? "nil") cwd=\(s.cwd)
               startedAt=\(s.startedAt) updatedAt=\(s.updatedAt)
               lastPrompt=\((s.lastPrompt ?? "nil").prefix(80).debugDescription)
+              subagents=\(s.subagents.count)
         """)
+        for line in SubagentTree.lines(s.subagents) {
+            let a = line.agent
+            print("LIVE:   \(line.prefix)\(a.id) \(a.agentType) · \(a.label) "
+                  + "[\(a.isBackground ? "bg" : "fg"), \(ElapsedFormat.short(Date().timeIntervalSince(a.startedAt)))]"
+                  + (a.activity.map { "\n" + "LIVE:   \(line.continuation)  \($0)" } ?? ""))
+        }
+    }
+    // The tracker on its own, per session with a subagents dir: cold, then cached.
+    let inspector = SystemProcessInspector()
+    for s in sessions {
+        let url = claudeHome.appendingPathComponent("projects/\(SessionDiscovery.projectSlug(for: s.cwd))/\(s.id).jsonl")
+        let dir = url.deletingPathExtension().appendingPathComponent("subagents").path
+        guard FileManager.default.fileExists(atPath: dir),
+              let start = inspector.snapshot(pid: s.pid)?.startTime else { continue }
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".jsonl") }
+        let transcriptBytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        let tracker = SubagentTracker()
+        let t1 = Date()
+        let cold = tracker.running(transcript: url, processStart: start, parentStatus: s.status)
+        let coldMs = Date().timeIntervalSince(t1) * 1000
+        let t2 = Date()
+        _ = tracker.running(transcript: url, processStart: start, parentStatus: s.status)
+        let warmMs = Date().timeIntervalSince(t2) * 1000
+        print(String(format: "LIVE: tracker %@: %d agent files, transcript %.1f MB -> %d running; first %.1f ms, second %.1f ms",
+                     s.id, files.count, Double(transcriptBytes) / 1_000_000, cold.count, coldMs, warmMs))
     }
     #expect(!sessions.isEmpty)
 }

@@ -9,7 +9,9 @@ import Observation
 /// - one vnode source per live session's `<pid>.json` catches in-place rewrites: Claude Code
 ///   rewrites the registry file in place on every status change (same inode since the session
 ///   started; the directory's mtime doesn't move), which a directory source never sees;
-/// - a `pollInterval` poll is the safety net (process exit, transcripts, missing directories).
+/// - a `pollInterval` poll is the safety net (process exit, transcripts, missing directories),
+///   and the only source for subagents: running agents append to their jsonl many times a
+///   second, so watching them would rescan constantly; a poll's lag is fine for that list.
 /// Discovery runs off the main actor; `sessions` is only assigned when it changes.
 @MainActor
 @Observable

@@ -10,6 +10,7 @@ public actor SessionDiscovery {
     public nonisolated let hookStateDirectory: URL?
     private let inspector: any ProcessInspecting
     private let transcripts = TranscriptReader()
+    private let subagents = SubagentTracker()
     private let history = HistoryIndex()
 
     /// Last successfully parsed record per registry file, used when a file is mid-rewrite.
@@ -123,6 +124,7 @@ public actor SessionDiscovery {
 
         var sessions: [ClaudeSession] = []
         var liveTranscriptPaths: Set<String> = []
+        var liveSubagentPaths: Set<String> = []
         var liveTerminalKeys: Set<String> = []
         for record in records where record.isInteractive {
             let process = inspector.snapshot(pid: record.pid)
@@ -142,9 +144,13 @@ public actor SessionDiscovery {
             }
 
             var info: TranscriptInfo?
+            var agents: [SubagentInfo] = []
             if let url = transcriptURL(for: record) {
                 info = transcripts.info(at: url)
                 if info != nil { liveTranscriptPaths.insert(url.path) }
+                agents = subagents.running(
+                    transcript: url, processStart: process.startTime, parentStatus: record.sessionStatus)
+                liveSubagentPaths.insert(url.path)
             }
 
             let title = SessionTitle.resolve(
@@ -172,10 +178,12 @@ public actor SessionDiscovery {
                 terminal: terminal,
                 ghosttyTerminalID: terminal == .ghostty ? SessionTitle.nonEmpty(hook?.ghosttyTerminalID) : nil,
                 startedAt: startedAt,
-                updatedAt: record.updatedAtDate ?? startedAt))
+                updatedAt: record.updatedAtDate ?? startedAt,
+                subagents: agents))
         }
 
         transcripts.forget(except: liveTranscriptPaths)
+        subagents.forget(except: liveSubagentPaths)
         terminalCache = terminalCache.filter { liveTerminalKeys.contains($0.key) }
         let liveIDs = Set(sessions.map(\.id))
         transcriptURLs = transcriptURLs.filter { liveIDs.contains($0.key) }

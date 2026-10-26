@@ -2,7 +2,7 @@ import Foundation
 
 /// What the last successful update check learned, persisted between launches (the app stores
 /// it as JSON in UserDefaults) so the menu has a state right away, and so the next request can
-/// be conditional (`If-None-Match`; GitHub doesn't count a 304 against the rate limit).
+/// be conditional (`If-None-Match`: an unchanged release costs GitHub a body-less 304).
 public struct UpdateCache: Sendable, Equatable, Codable {
     /// GitHub's ETag for `latest` (sent back verbatim; GitHub's are weak, `W/"…"`).
     public var etag: String?
@@ -141,6 +141,16 @@ public enum UpdateSchedule {
 
     public static func isDue(cache: UpdateCache, lastFailure: UpdateCheckFailure?, now: Date) -> Bool {
         now >= nextCheck(cache: cache, lastFailure: lastFailure)
+    }
+
+    /// At launch, check (after a short delay) unless the cached answer is under an
+    /// hour old, so frequent relaunches (`make run`) don't each hit GitHub.
+    public static let launchMinimumAge: TimeInterval = 60 * 60
+
+    public static func isDueAtLaunch(cache: UpdateCache, now: Date) -> Bool {
+        guard let checkedAt = cache.checkedAt else { return true }
+        // A check "in the future" means the clock moved back: don't trust it.
+        return checkedAt > now || now.timeIntervalSince(checkedAt) >= launchMinimumAge
     }
 }
 

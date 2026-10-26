@@ -216,6 +216,14 @@ private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
     #expect(UpdateSchedule.nextCheck(cache: UpdateCache(), lastFailure: soon) == t0.addingTimeInterval(1800))
 }
 
+@Test func launchChecksUnlessTheCacheIsFresh() {
+    #expect(UpdateSchedule.isDueAtLaunch(cache: UpdateCache(), now: t0))
+    let checked = UpdateCache(checkedAt: t0)
+    #expect(!UpdateSchedule.isDueAtLaunch(cache: checked, now: t0.addingTimeInterval(59 * 60)))
+    #expect(UpdateSchedule.isDueAtLaunch(cache: checked, now: t0.addingTimeInterval(61 * 60)))
+    #expect(UpdateSchedule.isDueAtLaunch(cache: checked, now: t0.addingTimeInterval(-60)))
+}
+
 // MARK: - Menu state
 
 @Test func menuStateComparesRunningVersionWithLatestRelease() throws {

@@ -14,7 +14,8 @@ sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/deskt
   sessions waiting for input float to the top.
 - Click a row to focus its exact Ghostty or Terminal.app tab, switching Spaces if needed.
   Other terminals: the hosting app is brought to the front.
-- Menu bar: Pin Sidebar, Claude Code Hook (install / update / uninstall), Launch at Login, Quit.
+- Pinned, drag the sidebar's right edge to resize it (double-click to reset); the width is kept.
+- Menu bar: Pin Sidebar, Reset Sidebar Width, Claude Code Hook (install / update / uninstall), Launch at Login, Quit.
 - Demo mode: `open build/ClaudeWatcher.app --args --demo`.
 
 ## Install

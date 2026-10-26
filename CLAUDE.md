@@ -27,7 +27,9 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `loadRecursiveFiles`; user then bundled themes; config colors override the theme's; every
   theme candidate path is watched, even missing ones, so a newly created theme file is seen).
   `GhosttyTheme.highlightTint(strength:)` (`GhosttyTheme+Highlight.swift`): the pane tint color.
-- `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic.
+- `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic. `PanelWidth`: clamps the
+  user's panel width (UserDefaults `sidebarPanelWidth`, both modes) to 200 pt...half the visible
+  screen; `EdgeController.frame(on:)` applies it without writing the clamp back.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
   `EdgeController`, `MenuModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`. Nothing may
   resolve `SessionDiscovery.defaultClaudeHome` on main at launch: `AppDelegate.init` prewarms it,
@@ -37,6 +39,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `\.panelVisible`: they keep firing after `orderOut`), `SidebarPanel`, `TerminalStyle` (SwiftUI
   colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
+  `PanelResizeHandle`: AppKit strip on the pane's right edge, shown only while pinned (not in demo):
+  drag resizes, double-click (or the menu's "Reset Sidebar Width") goes back to the theme width.
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `Tests/ClaudeWatcherCoreTests/`: Swift Testing (`import Testing`). Keep logic in Core so it is testable.
   Tests run in parallel on the shared cooperative pool and must never block it (`waitUntilExit`,

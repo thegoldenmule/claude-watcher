@@ -27,7 +27,12 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `loadRecursiveFiles`; user then bundled themes; config colors override the theme's; every
   theme candidate path is watched, even missing ones, so a newly created theme file is seen).
   `GhosttyTheme.highlightTint(strength:)` (`GhosttyTheme+Highlight.swift`): the pane tint color.
-- `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic. `PanelWidth`: clamps the
+- `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic; `suspendedUntil`
+  pauses the reveal (a hidden panel never shows; a visible one still hides; `reset()` keeps it).
+  Menu "Pause Edge Reveal" (`EdgeController.pauseReveal(until:)`/`resumeReveal()`, not in demo):
+  persisted (UserDefaults `edgeRevealPausedUntil`, re-armed at launch; demo ignores it), menu-bar
+  icon `moon.zzz` while paused. The expiry task only clears it, never ticks, so the panel can't
+  pop up without pointer movement. `PanelWidth`: clamps the
   user's panel width (UserDefaults `sidebarPanelWidth`, both modes) to 200 pt...half the visible
   screen; `EdgeController.frame(on:)` applies it without writing the clamp back.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,

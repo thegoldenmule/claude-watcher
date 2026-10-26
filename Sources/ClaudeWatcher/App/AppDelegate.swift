@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let slot = StoreSlot()
     let edge: EdgeController
     let menu: MenuModel
+    let updates: UpdateModel
     private var terminating = false
 
     /// nil in demo mode, and until `SessionDiscovery.defaultClaudeHome` has been resolved.
@@ -28,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // worst case): start it now, off the main thread, and never wait for it on main.
         SessionDiscovery.prewarmDefaultClaudeHome()
         menu = MenuModel()
+        updates = UpdateModel(isDemo: DemoMode.isEnabled)
         if DemoMode.isEnabled {
             let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Demo")
             edge = EdgeController(
@@ -56,6 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Recover a pane left tinted by a crash.
             TerminalHighlighter.shared.resetAll()
             Task { await startStore() }
+            updates.start()
         }
         edge.start()
     }
@@ -63,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         terminating = true
         edge.stop()
+        updates.stop()
         store?.stop()
         if !isDemo { TerminalHighlighter.shared.resetAllSync() }
     }

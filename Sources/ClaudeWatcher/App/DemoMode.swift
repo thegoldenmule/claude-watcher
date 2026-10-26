@@ -59,6 +59,29 @@ enum DemoMode {
     static let previewExpandedID: String? =
         isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_EXPANDED"] : nil
 
+    /// The menu's update line in demo mode, which never touches the network or the real cache:
+    /// up to date by default; `CW_DEMO_UPDATE=X.Y.Z` previews "Update Available: vX.Y.Z" (if
+    /// newer than the running build), `=fail` a failed check, `=checking` a check in progress.
+    static func updatePreview(
+        current: SemanticVersion?
+    ) -> (cache: UpdateCache, failure: UpdateCheckFailure?, checking: Bool) {
+        let releases = URL(string: "https://github.com/thegoldenmule/claude-watcher/releases")!
+        func cache(_ version: SemanticVersion?) -> UpdateCache {
+            UpdateCache(latest: version.map { ReleaseInfo(tag: "v\($0)", version: $0, pageURL: releases) },
+                        checkedAt: .now)
+        }
+        switch ProcessInfo.processInfo.environment["CW_DEMO_UPDATE"] {
+        case "fail":
+            return (UpdateCache(), UpdateCheckFailure(reason: "demo", at: .now), false)
+        case "checking":
+            return (UpdateCache(), nil, true)
+        case let value?:
+            return (cache(SemanticVersion(value) ?? current), nil, false)
+        case nil:
+            return (cache(current), nil, false)
+        }
+    }
+
     static var sessions: [ClaudeSession] {
         ProcessInfo.processInfo.environment["CW_DEMO_EMPTY"] == "1" ? [] : allSessions
     }

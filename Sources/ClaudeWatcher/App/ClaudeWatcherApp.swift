@@ -56,6 +56,9 @@ struct ClaudeWatcherApp: App {
             }
 
             Divider()
+            updateItems
+
+            Divider()
             Button("Quit ClaudeWatcher") {
                 NSApp.terminate(nil)
             }
@@ -80,6 +83,25 @@ struct ClaudeWatcherApp: App {
                 Divider()
                 Button("Until Resumed") { edge.pauseReveal(until: .distantFuture) }
             }
+        }
+    }
+
+    /// The running version, what the last update check found, and "Check for Updates".
+    @ViewBuilder private var updateItems: some View {
+        let updates = appDelegate.updates
+        let state = updates.state
+        Text(updates.app.displayString)
+        switch state {
+        case .unversioned, .notChecked: EmptyView()
+        case .checking: Text("Checking for Updates…")
+        case .upToDate: Text("Up to Date")
+        case .available(let release):
+            Button("Update Available: \(release.tag)…") { updates.openReleasePage(release) }
+        case .failed: Text("Couldn't Check for Updates")
+        }
+        if state != .unversioned, state != .checking {
+            Button("Check for Updates") { updates.checkNow() }
+                .disabled(updates.isChecking)
         }
     }
 

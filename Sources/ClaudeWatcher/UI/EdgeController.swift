@@ -58,6 +58,9 @@ final class EdgeController {
         didSet { UserDefaults.standard.set(pulseOnFocus, forKey: Keys.pulseOnFocus) }
     }
 
+    /// Edge auto-reveal is paused until this date (persisted; `.distantFuture` = until resumed).
+    private(set) var revealPausedUntil: Date? = EdgeController.storedPauseDate()
+
     private var pinned = false
 
     @ObservationIgnored private let sessionsSource: @MainActor () -> [ClaudeSession]
@@ -138,6 +141,7 @@ final class EdgeController {
         }
         pendingSessionID = DemoMode.previewPendingID
 
+        scheduleResume()  // a pause persisted across relaunch
         if pinned { showPinned() }
     }
 
@@ -294,6 +298,59 @@ final class EdgeController {
         panel.invalidateShadow()
     }
 
+    // MARK: - Reveal pause
+
+    /// Ends the pause when its date comes.
+    @ObservationIgnored private var resumeTask: Task<Void, Never>?
+
+    var isRevealPaused: Bool {
+        guard let until = revealPausedUntil else { return false }
+        return Date() < until
+    }
+
+    /// Stops the left edge from revealing the panel until `until` (`.distantFuture`: until
+    /// `resumeReveal()`). An auto-shown panel still hides as usual; pinning is unaffected.
+    func pauseReveal(until: Date) {
+        revealPausedUntil = until
+        UserDefaults.standard.set(until, forKey: Keys.revealPausedUntil)
+        scheduleResume()
+        tick()  // drops a pending dwell; a visible auto-shown panel keeps its exit timer
+    }
+
+    /// Lets the edge reveal the panel again. No tick: it takes a pointer move to show it.
+    func resumeReveal() {
+        resumeTask?.cancel()
+        resumeTask = nil
+        revealPausedUntil = nil
+        UserDefaults.standard.removeObject(forKey: Keys.revealPausedUntil)
+    }
+
+    private func scheduleResume() {
+        resumeTask?.cancel()
+        resumeTask = nil
+        guard let until = revealPausedUntil, until != .distantFuture else { return }
+        let delay = until.timeIntervalSinceNow
+        guard delay > 0 else {
+            resumeReveal()
+            return
+        }
+        resumeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            // Never tick here: a pointer resting on the edge mustn't pop the panel unprompted.
+            guard !Task.isCancelled, let self, self.revealPausedUntil == until else { return }
+            self.resumeReveal()
+        }
+    }
+
+    /// The persisted pause, if still in force (demo mode ignores it).
+    private static func storedPauseDate() -> Date? {
+        guard !DemoMode.isEnabled,
+              let date = UserDefaults.standard.object(forKey: Keys.revealPausedUntil) as? Date,
+              date > Date()
+        else { return nil }
+        return date
+    }
+
     // MARK: - Terminal highlight
 
     private var highlightTint: GhosttyColor { themeStore.style.theme.highlightTint() }
@@ -376,6 +433,7 @@ final class EdgeController {
         // A visible notice holds the panel open until it expires or is dismissed.
         guard panel != nil, !pinned, notice == nil, pendingSessionID == nil else { return }
         let screens = NSScreen.screens
+        policy.suspendedUntil = revealPausedUntil
         let decision = policy.evaluate(
             pointer: NSEvent.mouseLocation,
             now: Date(),
@@ -533,6 +591,7 @@ final class EdgeController {
         static let highlightOnHover = "highlightTerminalOnHover"
         static let pulseOnFocus = "pulseTerminalOnFocus"
         static let panelWidth = "sidebarPanelWidth"  // Double, points
+        static let revealPausedUntil = "edgeRevealPausedUntil"  // Date
     }
 
     private static func storedFlag(_ key: String) -> Bool {

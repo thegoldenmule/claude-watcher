@@ -5,7 +5,7 @@ struct ClaudeWatcherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("ClaudeWatcher", systemImage: "sidebar.left") {
+        MenuBarExtra {
             let menu = appDelegate.menu
             Toggle("Pin Sidebar", isOn: Binding(
                 get: { appDelegate.edge.isPinned },
@@ -27,6 +27,9 @@ struct ClaudeWatcherApp: App {
                     get: { appDelegate.edge.pulseOnFocus },
                     set: { appDelegate.edge.pulseOnFocus = $0 }
                 ))
+            }
+            if !appDelegate.isDemo {
+                revealPauseItems
             }
 
             Divider()
@@ -57,6 +60,34 @@ struct ClaudeWatcherApp: App {
                 NSApp.terminate(nil)
             }
             .keyboardShortcut("q")
+        } label: {
+            Image(systemName: appDelegate.edge.isRevealPaused ? "moon.zzz" : "sidebar.left")
+                .accessibilityLabel("ClaudeWatcher")
         }
+    }
+
+    /// Pause the edge reveal for a while, or show until when it's paused and offer to resume.
+    @ViewBuilder private var revealPauseItems: some View {
+        let edge = appDelegate.edge
+        if edge.isRevealPaused, let until = edge.revealPausedUntil {
+            Text(Self.pauseStatus(until))
+            Button("Resume Edge Reveal") { edge.resumeReveal() }
+        } else {
+            Menu("Pause Edge Reveal") {
+                Button("15 Minutes") { edge.pauseReveal(until: .now.addingTimeInterval(15 * 60)) }
+                Button("1 Hour") { edge.pauseReveal(until: .now.addingTimeInterval(60 * 60)) }
+                Button("4 Hours") { edge.pauseReveal(until: .now.addingTimeInterval(4 * 60 * 60)) }
+                Divider()
+                Button("Until Resumed") { edge.pauseReveal(until: .distantFuture) }
+            }
+        }
+    }
+
+    private static func pauseStatus(_ until: Date) -> String {
+        guard until != .distantFuture else { return "Edge Reveal Paused" }
+        let time = Calendar.current.isDateInToday(until)
+            ? until.formatted(date: .omitted, time: .shortened)
+            : until.formatted(date: .abbreviated, time: .shortened)
+        return "Edge Reveal Paused Until \(time)"
     }
 }

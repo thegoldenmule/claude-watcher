@@ -136,6 +136,9 @@ final class EdgeController {
             MainActor.assumeIsolated { self?.screensDidChange() }
         }
 
+        // The resize strip's cursor: without this, an accessory app's cursor changes are ignored.
+        if isResizable { BackgroundCursor.enable() }
+
         themeStore.onChange = { [weak self] in self?.themeDidChange() }
         themeStore.start()
 
@@ -243,6 +246,8 @@ final class EdgeController {
     @ObservationIgnored private var dragGrabOffset: CGFloat = 0
     @ObservationIgnored private var isResizing = false
     @ObservationIgnored private var didResize = false
+    /// The pointer is on the resize strip (its cursor is set), per the handle.
+    @ObservationIgnored private var resizeHandleHovered = false
 
     private static func storedWidth() -> CGFloat? {
         guard let value = UserDefaults.standard.object(forKey: Keys.panelWidth) as? Double,
@@ -257,6 +262,8 @@ final class EdgeController {
         isResizing = true
         didResize = false
     }
+
+    fileprivate func resizeHandleHoverChanged(_ hovering: Bool) { resizeHandleHovered = hovering }
 
     fileprivate func panelResizeChanged(to screenX: CGFloat) {
         // The screen the panel is on, not the one under the pointer (which may be past its edge).
@@ -571,6 +578,12 @@ final class EdgeController {
     private func hide(animated: Bool, resetHighlights: Bool = true) {
         policy.reset()
         if isResizing { finishResize() }  // e.g. a screen change mid-drag; later drag events no-op
+        if resizeHandleHovered {
+            // The strip leaves the pointer without an exit event; the set cursor would persist.
+            // (The handle also drops its state once `\.panelVisible` turns false.)
+            resizeHandleHovered = false
+            NSCursor.arrow.set()
+        }
         hoveredID = nil  // rows may not see a hover exit once the panel is ordered out
         cancelHoverTint()
         guard let panel, isVisible || panel.isVisible else { return }
@@ -661,18 +674,46 @@ private struct SidebarRoot: View {
         .overlay(alignment: .trailing) {
             // The pane fills the panel, so its visible edge is the panel's: the strip sits just
             // inside it, clear of the rounded corners.
-            if controller.isResizable {
-                PanelResizeHandle(
-                    onBegan: { controller.panelResizeBegan(at: $0) },
-                    onChanged: { controller.panelResizeChanged(to: $0) },
-                    onEnded: { controller.panelResizeEnded() },
-                    onReset: { controller.resetPanelWidth() }
-                )
-                .frame(width: 6)
-                .padding(.vertical, TerminalStyle.cornerRadius)
-            }
+            if controller.isResizable { ResizeEdge(controller: controller) }
         }
         .environment(\.terminalStyle, controller.themeStore.style)
         .environment(\.panelVisible, controller.isVisible)
+    }
+}
+
+/// The resize strip on the pane's right edge, plus its visible affordance: a thin line just
+/// inside the border while the pointer is on the strip, brighter while dragging.
+private struct ResizeEdge: View {
+    let controller: EdgeController
+
+    @Environment(\.terminalStyle) private var style
+    @Environment(\.panelVisible) private var panelVisible
+    @State private var hovering = false
+    @State private var dragging = false
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Rectangle()
+                .fill(dragging ? style.foreground : style.faint)
+                .frame(width: 2)
+                .padding(.trailing, 1)  // inside the pane's 1 pt border
+                .opacity(panelVisible && (hovering || dragging) ? 1 : 0)
+                .animation(.easeOut(duration: 0.12), value: hovering || dragging)
+                .allowsHitTesting(false)
+            PanelResizeHandle(
+                isActive: panelVisible,
+                onBegan: { controller.panelResizeBegan(at: $0) },
+                onChanged: { controller.panelResizeChanged(to: $0) },
+                onEnded: { controller.panelResizeEnded() },
+                onReset: { controller.resetPanelWidth() },
+                onStateChange: { hovering, dragging in
+                    self.hovering = hovering
+                    self.dragging = dragging
+                    controller.resizeHandleHoverChanged(hovering)
+                }
+            )
+        }
+        .frame(width: 8)
+        .padding(.vertical, TerminalStyle.cornerRadius)
     }
 }

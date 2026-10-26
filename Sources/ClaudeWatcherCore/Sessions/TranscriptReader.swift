@@ -11,11 +11,16 @@ public struct TranscriptInfo: Sendable, Equatable {
     public var cwd: String?
     public var prURL: String?
     public var prNumber: Int?
+    /// Main conversation's context size at its last reply (see `TranscriptParser.contextTokens`).
+    public var contextTokens: Int?
+    /// A record that sets the context size was seen (`contextTokens` may still be nil, e.g. a
+    /// compaction without a size), so a later one can replace an older value with nil.
+    var hasContextRecord = false
 
     public init(
         aiTitle: String? = nil, customTitle: String? = nil, agentName: String? = nil,
         lastPrompt: String? = nil, gitBranch: String? = nil, cwd: String? = nil,
-        prURL: String? = nil, prNumber: Int? = nil
+        prURL: String? = nil, prNumber: Int? = nil, contextTokens: Int? = nil
     ) {
         self.aiTitle = aiTitle
         self.customTitle = customTitle
@@ -25,6 +30,8 @@ public struct TranscriptInfo: Sendable, Equatable {
         self.cwd = cwd
         self.prURL = prURL
         self.prNumber = prNumber
+        self.contextTokens = contextTokens
+        self.hasContextRecord = contextTokens != nil
     }
 
     public var hasTitle: Bool { aiTitle != nil || customTitle != nil }
@@ -38,6 +45,12 @@ public struct TranscriptInfo: Sendable, Equatable {
         if let v = newer.gitBranch { gitBranch = v }
         if let v = newer.cwd { cwd = v }
         if let v = newer.prURL { prURL = v; prNumber = newer.prNumber }
+        if newer.hasContextRecord { setContext(newer.contextTokens) }
+    }
+
+    mutating func setContext(_ tokens: Int?) {
+        contextTokens = tokens
+        hasContextRecord = true
     }
 
     /// Fills only fields we don't have yet from `older` (older = earlier in the file).
@@ -49,6 +62,7 @@ public struct TranscriptInfo: Sendable, Equatable {
         gitBranch = gitBranch ?? older.gitBranch
         cwd = cwd ?? older.cwd
         if prURL == nil { prURL = older.prURL; prNumber = older.prNumber }
+        if !hasContextRecord, older.hasContextRecord { setContext(older.contextTokens) }
     }
 }
 
@@ -82,11 +96,35 @@ public enum TranscriptParser {
                 info.prURL = v
                 info.prNumber = (obj["prNumber"] as? NSNumber)?.intValue
             }
+        case "assistant":
+            if let tokens = contextTokens(assistant: obj) { info.setContext(tokens) }
+        case "system":
+            // `/compact`: the next reply reports the smaller context; until then, use the
+            // compacted size (it omits the system prompt and tools, ~40k, so it reads low)
+            // rather than keep the pre-compaction size.
+            if obj["subtype"] as? String == "compact_boundary", obj["isSidechain"] as? Bool != true {
+                let meta = obj["compactMetadata"] as? [String: Any]
+                info.setContext((meta?["postTokens"] as? NSNumber)?.intValue)
+            }
         default:
             break
         }
         if let v = str(obj["gitBranch"]) { info.gitBranch = v }
         if let v = str(obj["cwd"]) { info.cwd = v }
+    }
+
+    /// Context size at a main-conversation reply: `input_tokens + cache_creation_input_tokens +
+    /// cache_read_input_tokens` of `message.usage` (missing fields count 0). nil for sidechain
+    /// records, `<synthetic>` ones (API-error placeholders) and all-zero usage.
+    static func contextTokens(assistant obj: [String: Any]) -> Int? {
+        guard obj["isSidechain"] as? Bool != true,
+              let message = obj["message"] as? [String: Any],
+              message["model"] as? String != "<synthetic>",
+              let usage = message["usage"] as? [String: Any]
+        else { return nil }
+        let total = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+            .reduce(0) { $0 + ((usage[$1] as? NSNumber)?.intValue ?? 0) }
+        return total > 0 ? total : nil
     }
 
     private static func str(_ any: Any?) -> String? {
@@ -97,7 +135,7 @@ public enum TranscriptParser {
 }
 
 /// Incrementally reads transcripts: the first read tails the last `tailBytes`
-/// (scanning backward for a title if the tail has none); later reads only parse
+/// (scanning backward for a title, or the context size, if the tail has none); later reads only parse
 /// bytes appended since. Unchanged files (inode, size, mtime) are not re-read.
 /// Not thread-safe; owned by `SessionDiscovery`.
 final class TranscriptReader {
@@ -178,7 +216,7 @@ final class TranscriptReader {
             guard let nl = data.firstIndex(of: 0x0A) else {
                 // Tail is one giant partial line; consume nothing yet.
                 var info = base ?? TranscriptInfo()
-                if !info.hasTitle { info.fillMissing(from: backwardScan(handle, before: start)) }
+                backfill(&info, tailHadContext: false, handle, before: start)
                 return Entry(inode: inode, size: size, mtime: mtime, consumed: size, info: info)
             }
             let cut = data.index(after: nl)
@@ -195,23 +233,44 @@ final class TranscriptReader {
             data = Data()
         }
 
+        let tail = TranscriptParser.parse(data)
         var info = base ?? TranscriptInfo()
-        info.overlay(TranscriptParser.parse(data))
-        if !info.hasTitle, lineStart > 0 {
-            info.fillMissing(from: backwardScan(handle, before: lineStart))
+        info.overlay(tail)
+        if lineStart > 0 {
+            backfill(&info, tailHadContext: tail.hasContextRecord, handle, before: lineStart)
         }
         return Entry(inode: inode, size: size, mtime: mtime, consumed: consumed, info: info)
     }
 
-    /// Scans backward from `before` (a line boundary) in chunks until a title is found,
-    /// the start of file, or `maxBackwardScan` bytes. Returns the latest values seen.
-    private func backwardScan(_ handle: FileHandle, before: UInt64) -> TranscriptInfo {
+    /// Fills in, from before the tail, a title if we have none, and the context size if the
+    /// tail held no context record. Every main-conversation reply records one, so the tail
+    /// almost always has it; scanning back is bounded by `maxBackwardScan` and happens once
+    /// per file. A context record found there is newer than any in `info` (an older read's).
+    private func backfill(_ info: inout TranscriptInfo, tailHadContext: Bool,
+                          _ handle: FileHandle, before: UInt64) {
+        let wantTitle = !info.hasTitle, wantContext = !tailHadContext
+        guard wantTitle || wantContext else { return }
+        let found = backwardScan(handle, before: before, wantTitle: wantTitle, wantContext: wantContext)
+        info.fillMissing(from: TranscriptInfo(aiTitle: found.aiTitle, customTitle: found.customTitle))
+        if found.hasContextRecord { info.setContext(found.contextTokens) }
+    }
+
+    /// Scans backward from `before` (a line boundary) in chunks until what's wanted (a title,
+    /// the context size) is found, the start of file, or `maxBackwardScan` bytes. Returns the
+    /// latest values seen.
+    private func backwardScan(_ handle: FileHandle, before: UInt64,
+                              wantTitle: Bool, wantContext: Bool) -> TranscriptInfo {
         var result = TranscriptInfo()
         var end = before
         var carry = Data()  // bytes of a line that started before the current chunk
         var scanned: UInt64 = 0
         let titleMarker = Data("-title\"".utf8)
-        while end > 0, scanned < maxBackwardScan, !result.hasTitle {
+        // Usage records and compaction boundaries; escaped (quoted) occurrences don't match.
+        let contextMarkers = [Data("\"input_tokens\"".utf8), Data("\"compact_boundary\"".utf8)]
+        while end > 0, scanned < maxBackwardScan {
+            let needTitle = wantTitle && !result.hasTitle
+            let needContext = wantContext && !result.hasContextRecord
+            guard needTitle || needContext else { break }
             let chunkStart = end > tailBytes ? end - tailBytes : 0
             guard let chunk = read(handle, offset: chunkStart, length: end - chunkStart) else { break }
             scanned += end - chunkStart
@@ -229,13 +288,18 @@ final class TranscriptReader {
             } else {
                 carry = Data()
             }
-            // Only title lines matter here, and they're tiny; skip decoding everything else.
+            // Only title and context lines matter here; skip decoding everything else.
             var chunkInfo = TranscriptInfo()
-            for line in parseable.split(separator: 0x0A) where line.range(of: titleMarker) != nil {
-                TranscriptParser.apply(line: Data(line), to: &chunkInfo)
+            for line in parseable.split(separator: 0x0A) {
+                let wanted = (needTitle && line.range(of: titleMarker) != nil)
+                    || (needContext && contextMarkers.contains { line.range(of: $0) != nil })
+                if wanted { TranscriptParser.apply(line: Data(line), to: &chunkInfo) }
             }
-            result.fillMissing(from: TranscriptInfo(
-                aiTitle: chunkInfo.aiTitle, customTitle: chunkInfo.customTitle))
+            if needTitle {
+                result.fillMissing(from: TranscriptInfo(
+                    aiTitle: chunkInfo.aiTitle, customTitle: chunkInfo.customTitle))
+            }
+            if needContext, chunkInfo.hasContextRecord { result.setContext(chunkInfo.contextTokens) }
             end = chunkStart
         }
         return result

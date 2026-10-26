@@ -41,7 +41,12 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   the store is created once it resolves off-main, and `MenuModel` computes statuses off-main.
 - `Sources/ClaudeWatcher/UI/`: `EdgeController` (panel show/hide, focus + result banner, owns
   `ThemeStore`), `SidebarView` (its `TimelineView`s pause while the panel is hidden, via
-  `\.panelVisible`: they keep firing after `orderOut`), `SidebarPanel`, `TerminalStyle` (SwiftUI
+  `\.panelVisible`: they keep firing after `orderOut`; a session with running subagents gets a
+  `▸ N agents running` line that toggles a `SubagentTree` under it: sibling buttons in one
+  `SessionRow` block, never nested, so hover/selection/tint and the row frame cover the whole
+  block and only the toggle doesn't focus; expansion lives in `EdgeController.expandedSessionIDs`,
+  not the lazily recycled row, unpersisted and kept while the session has no agents; the header
+  adds `⑂ N agents`), `SidebarPanel`, `TerminalStyle` (SwiftUI
   colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
   `PanelResizeHandle`: 8 pt AppKit strip on the pane's right edge, pinned or auto-shown (not in
@@ -81,7 +86,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - Demo data, panel pinned: `open build/ClaudeWatcher.app --args --demo` (or `CW_DEMO=1`;
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
   show the info banner. Screenshot helpers (demo only): `CW_DEMO_NOTICE=error|info`,
-  `CW_DEMO_HOVER=<id>`, `CW_DEMO_PENDING=<id>`, `CW_DEMO_EMPTY=1`.
+  `CW_DEMO_HOVER=<id>`, `CW_DEMO_PENDING=<id>`, `CW_DEMO_EXPANDED=<id>` (open that row's agent
+  tree; demo-1 has a nested one, demo-3 one agent), `CW_DEMO_EMPTY=1`.
 - Theme overrides: `CW_GHOSTTY_CONFIG=<path>` (read only that config),
   `CW_GHOSTTY_THEME=<name or light:A,dark:B>` (preview a theme, ignoring config colors).
 - Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery`.

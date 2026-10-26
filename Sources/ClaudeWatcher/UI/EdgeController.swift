@@ -50,7 +50,7 @@ final class EdgeController {
     /// Sessions whose subagent tree is expanded. Kept here, not in the row: the list is lazy and
     /// recycles rows. Not persisted; an id stays while its session has no agents, so the tree
     /// reopens when new ones start.
-    private(set) var expandedSessionIDs: Set<String> = []
+    private(set) var expandedSessionIDs: Set<String> = DemoMode.previewExpandedID.map { [$0] } ?? []
 
     /// Tint the hovered row's Ghostty pane (persisted; default on).
     var highlightOnHover: Bool = EdgeController.storedFlag(Keys.highlightOnHover) {

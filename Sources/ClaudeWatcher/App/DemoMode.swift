@@ -38,7 +38,8 @@ enum DemoMode {
 
     /// Screenshot helpers, demo only: `CW_DEMO_NOTICE=error|info` shows that banner at launch
     /// (and keeps it up), `CW_DEMO_HOVER=<id>` / `CW_DEMO_PENDING=<id>` draw a row hovered or
-    /// with its focus spinner, `CW_DEMO_EMPTY=1` lists no sessions.
+    /// with its focus spinner, `CW_DEMO_EXPANDED=<id>` opens that row's agent tree,
+    /// `CW_DEMO_EMPTY=1` lists no sessions.
     static var previewNoticeSession: ClaudeSession? {
         guard isEnabled else { return nil }
         switch ProcessInfo.processInfo.environment["CW_DEMO_NOTICE"] {
@@ -55,6 +56,9 @@ enum DemoMode {
     static let previewPendingID: String? =
         isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_PENDING"] : nil
 
+    static let previewExpandedID: String? =
+        isEnabled ? ProcessInfo.processInfo.environment["CW_DEMO_EXPANDED"] : nil
+
     static var sessions: [ClaudeSession] {
         ProcessInfo.processInfo.environment["CW_DEMO_EMPTY"] == "1" ? [] : allSessions
     }
@@ -69,7 +73,20 @@ enum DemoMode {
                 title: "Auto-hiding edge panel", branch: "main",
                 lastPrompt: "make the sidebar slide in from the left edge like the Dock",
                 status: .busy, tty: "/dev/ttys001", terminal: .ghostty,
-                startedAt: ago(42), updatedAt: ago(0.2)),
+                startedAt: ago(42), updatedAt: ago(0.2),
+                subagents: [
+                    SubagentInfo(
+                        id: "demo-1-a1", agentType: "Explore", label: "Find the edge reveal logic",
+                        activity: "Read EdgeRevealPolicy.swift",
+                        startedAt: ago(3.4), lastActivityAt: ago(0.1)),
+                    SubagentInfo(
+                        id: "demo-1-a2", agentType: "Plan", label: "Design the slide-in animation",
+                        activity: "thinking", startedAt: ago(2.1), lastActivityAt: ago(0.2)),
+                    SubagentInfo(
+                        id: "demo-1-a3", parentID: "demo-1-a2", agentType: "general-purpose",
+                        label: "Survey NSPanel animation APIs", activity: "WebSearch NSAnimationContext panel",
+                        startedAt: ago(0.75), lastActivityAt: ago(0.1), depth: 1),
+                ]),
             ClaudeSession(
                 id: "demo-2", pid: 41002, cwd: "\(home)/projects/acme/payments-api",
                 title: "Fix flaky webhook retry test", branch: "fix/webhook-retry-backoff",
@@ -82,7 +99,13 @@ enum DemoMode {
                 title: "Draft release notes for v2.4", branch: "release/2.4",
                 lastPrompt: "summarize the merged PRs since the last tag",
                 status: .busy, tty: "/dev/ttys003", terminal: .appleTerminal,
-                startedAt: ago(9), updatedAt: ago(0.1)),
+                startedAt: ago(9), updatedAt: ago(0.1),
+                subagents: [
+                    SubagentInfo(
+                        id: "demo-3-a1", agentType: "general-purpose", label: "Collect merged PRs since v2.3",
+                        activity: "Bash List merged PRs", isBackground: false,
+                        startedAt: ago(1.2), lastActivityAt: ago(0.1)),
+                ]),
             ClaudeSession(
                 id: "demo-4", pid: 41004, cwd: "\(home)/projects/infra/terraform-modules",
                 title: "Refactor VPC module outputs", branch: "refactor/vpc-outputs",

@@ -189,7 +189,10 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   the menu shows "Claude Code Hook: Needs Update"; use its "Update Hook".
 
 ## Conventions
-- Commit with one-line messages only (no body/trailers). Don't push (except to release, above).
+- Commit with one-line messages only (no body/trailers).
+- Always push: after committing finished work, `git push origin main` without asking (this repo
+  overrides the global "never push" rule). Tags, releases and history rewrites still only when
+  asked.
 - If several agents work at once: give each its own SwiftPM scratch dir
   (`swift build --scratch-path .build-<name>`; `scripts/build-app.sh` honours `SCRATCH_PATH`)
   and stage only your own paths (never `git add -A`).

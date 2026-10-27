@@ -321,7 +321,7 @@ private struct SessionRow: View {
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if isPending {
-                        BrailleSpinner().padding(.leading, style.cellWidth)
+                        BrailleSpinner(color: ink(style.foreground)).padding(.leading, style.cellWidth)
                     }
                 }
 
@@ -553,6 +553,9 @@ private struct StatusGlyph: View {
 
 /// Focus request in flight: a braille spinner, as CLI tools draw them.
 private struct BrailleSpinner: View {
+    /// The row's text color: under a `selection-background` highlight, the selection foreground.
+    let color: Color
+
     @Environment(\.terminalStyle) private var style
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.panelVisible) private var panelVisible
@@ -564,7 +567,7 @@ private struct BrailleSpinner: View {
             let tick = reduceMotion ? 0 : Int(context.date.timeIntervalSinceReferenceDate / 0.08)
             Text(Self.frames[tick % Self.frames.count])
         }
-        .foregroundStyle(style.foreground)
+        .foregroundStyle(color)
         .accessibilityLabel("Focusing")
     }
 }

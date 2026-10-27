@@ -59,7 +59,13 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   the store is created once it resolves off-main, and `MenuModel` computes statuses off-main.
 - `Sources/ClaudeWatcher/UI/`: `EdgeController` (panel show/hide, focus + result banner, owns
   `ThemeStore`), `SidebarView` (its `TimelineView`s pause while the panel is hidden, via
-  `\.panelVisible`: they keep firing after `orderOut`; a session with running subagents gets a
+  `\.panelVisible`: they keep firing after `orderOut`; `.waiting` (yellow) and `.idle` rows
+  (shown as "stopped", palette magenta via `TerminalStyle.idle`, `■` glyph; not blue, which is
+  busy, nor the context meter's green/yellow/red) get a wash (stopped slightly stronger:
+  magentas are darker), a 3 pt left bar and an inverse-video ` waiting `/` stopped ` tag line;
+  their glyphs keep their color under the selection; only waiting rows sort first (status
+  flips must not reorder rows); the header counts `● N waiting  ■ N stopped` first, bold in those
+  colors; a session with running subagents gets a
   `▸ N agents running` line that toggles a `SubagentTree` under it: sibling buttons in one
   `SessionRow` block, never nested, so hover/selection/tint and the row frame cover the whole
   block and only the toggle doesn't focus; trees start expanded, the toggle collapses one into

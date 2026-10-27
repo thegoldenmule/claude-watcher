@@ -4,7 +4,8 @@ import SwiftUI
 
 /// The sidebar's content, drawn as a Ghostty pane: the theme's background and font, a prompt
 /// header with status counts, then one block per session. Waiting sessions sort to the top and
-/// are marked in the palette's yellow, since that's when the user needs to act.
+/// are marked in the palette's yellow, since that's when the user needs to act; stopped (idle)
+/// sessions get the same treatment in magenta, so a finished turn is just as easy to spot.
 struct SidebarView: View {
     let sessions: [ClaudeSession]
     var isPinned: Bool = false
@@ -185,8 +186,8 @@ private struct SidebarHeader: View {
         }
         var parts: [AttributedString] = []
         if waiting > 0 { parts.append(part("● \(waiting) waiting", style.waiting, bold: true)) }
+        if idle > 0 { parts.append(part("■ \(idle) stopped", style.idle, bold: true)) }
         if busy > 0 { parts.append(part("✳ \(busy) working", style.busy)) }
-        if idle > 0 { parts.append(part("○ \(idle) idle", style.idle)) }
         if unknown > 0 { parts.append(part("? \(unknown) unknown", style.faint)) }
         let agents = sessions.reduce(0) { $0 + $1.subagents.count }
         if agents > 0 { parts.append(part("⑂ \(agents) agent\(agents == 1 ? "" : "s")", style.cyan)) }
@@ -241,6 +242,15 @@ private struct SessionRow: View {
     private var hovering: Bool { hoverState || DemoMode.previewHoverID == session.id }
 
     private var isWaiting: Bool { session.status == .waiting }
+    /// Waiting and stopped rows are flagged: a wash, a bar on the left edge and a tag line.
+    /// Palette magentas are darker than yellows, so the stopped wash is a little stronger.
+    private var accent: (color: Color, wash: Double)? {
+        switch session.status {
+        case .waiting: (style.waiting, 0.10)
+        case .idle: (style.idle, 0.14)
+        case .busy, .unknown: nil
+        }
+    }
     private var isSelected: Bool { hovering || isPending }
 
     /// Text color under the selection highlight: the theme's `selection-foreground`, as Ghostty
@@ -326,10 +336,15 @@ private struct SessionRow: View {
                 }
 
                 if isWaiting {
-                    Text(waitingTag + .span(" ")
+                    Text(tag("waiting", style.waiting) + .span(" ")
                         + .span(session.waitingFor ?? "needs your input", ink(style.waiting)))
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
+                } else if session.status == .idle {
+                    Text(tag("stopped", style.idle) + .span(" ")
+                        + .span("ready for your next prompt", ink(style.idle)))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
 
                 locationLine
@@ -394,9 +409,9 @@ private struct SessionRow: View {
         }
     }
 
-    /// Inverse-video ` waiting ` tag, as a terminal would draw it with SGR 7.
-    private var waitingTag: AttributedString {
-        .span(" waiting ", style.background, font: style.boldFont, background: style.waiting)
+    /// Inverse-video ` waiting ` / ` stopped ` tag, as a terminal would draw it with SGR 7.
+    private func tag(_ word: String, _ color: Color) -> AttributedString {
+        .span(" \(word) ", style.background, font: style.boldFont, background: color)
     }
 
     /// `folder (branch)`, like git's `__git_ps1` prompt.
@@ -422,10 +437,10 @@ private struct SessionRow: View {
 
     @ViewBuilder private var background: some View {
         ZStack(alignment: .leading) {
-            if isWaiting { style.waiting.opacity(0.10) }
+            if let accent { accent.color.opacity(accent.wash) }
             if isSelected { style.selection }
-            if isWaiting {
-                Rectangle().fill(style.waiting).frame(width: 3)
+            if let accent {
+                Rectangle().fill(accent.color).frame(width: 3)
             }
         }
     }
@@ -498,10 +513,10 @@ private struct RowButtonStyle: ButtonStyle {
 // MARK: - Glyphs
 
 /// One terminal cell's worth of status: Claude's own spinner while working, a yellow dot when
-/// waiting, a hollow dot when idle.
+/// waiting, a magenta stop square when stopped (idle).
 private struct StatusGlyph: View {
     let status: SessionStatus
-    /// Replaces the dim idle/unknown colors (which vanish on a selection highlight).
+    /// Replaces the dim unknown color (which vanishes on a selection highlight).
     var dimColor: Color? = nil
 
     @Environment(\.terminalStyle) private var style
@@ -524,7 +539,7 @@ private struct StatusGlyph: View {
                     }
                 }
             case .waiting: Text("●").font(style.boldFont)
-            case .idle: Text("○")
+            case .idle: Text("■").font(style.boldFont)
             case .unknown: Text("?")
             }
         }
@@ -536,7 +551,7 @@ private struct StatusGlyph: View {
         switch status {
         case .busy: style.busy
         case .waiting: style.waiting
-        case .idle: dimColor ?? style.idle
+        case .idle: style.idle
         case .unknown: dimColor ?? style.faint
         }
     }
@@ -545,7 +560,7 @@ private struct StatusGlyph: View {
         switch status {
         case .busy: "Working"
         case .waiting: "Waiting"
-        case .idle: "Idle"
+        case .idle: "Stopped"
         case .unknown: "Unknown"
         }
     }

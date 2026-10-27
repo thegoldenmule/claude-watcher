@@ -84,13 +84,12 @@ struct TerminalStyle: @unchecked Sendable {
     var blue: Color { legible(4) }
     var magenta: Color { legible(5) }
     var cyan: Color { legible(6) }
-    var brightBlack: Color {
-        theme.ansi(8).contrast(with: theme.background) >= 1.8 ? ansi(8) : faint
-    }
 
     var busy: Color { blue }
     var waiting: Color { yellow }
-    var idle: Color { brightBlack }
+    /// Stopped (idle at the prompt): as loud as waiting but its own color, since busy is blue
+    /// and the context meter takes green/yellow/red.
+    var idle: Color { magenta }
     var failure: Color { red }
     var success: Color { green }
 

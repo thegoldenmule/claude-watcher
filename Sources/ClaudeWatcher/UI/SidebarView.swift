@@ -341,8 +341,7 @@ private struct SessionRow: View {
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 } else if session.status == .idle {
-                    Text(tag("stopped", style.idle) + .span(" ")
-                        + .span("ready for your next prompt", ink(style.idle)))
+                    Text(tag("stopped", style.idle))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }

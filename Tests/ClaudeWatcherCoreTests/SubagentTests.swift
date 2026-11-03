@@ -304,7 +304,8 @@ private final class AgentFixture {
                 userLine(f.at(2)))
     try f.write("r2", meta: metaJSON("Explore", description: "other"), userLine(f.at(4)))
     let first = f.running(tracker)
-    #expect(first.map(\.id).filter { $0 != "f1" && $0 != "c1" } == ["p1", "r2"])
+    let otherIDs: [String] = first.map(\.id).filter { $0 != "f1" && $0 != "c1" }
+    #expect(otherIDs == ["p1", "r2"])
     #expect(Set(first.prefix(3).map(\.id)) == ["p1", "c1", "f1"])
     #expect(first.first { $0.id == "c1" }?.depth == 1)
     #expect(first.first { $0.id == "c1" }?.parentID == "p1")

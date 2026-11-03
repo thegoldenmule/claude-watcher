@@ -7,18 +7,78 @@ struct ClaudeWatcherApp: App {
     var body: some Scene {
         MenuBarExtra {
             let menu = appDelegate.menu
+            if appDelegate.isDemo {
+                Text("Demo mode")
+            }
             Toggle("Pin Sidebar", isOn: Binding(
                 get: { appDelegate.edge.isPinned },
                 set: { appDelegate.edge.isPinned = $0 }
             ))
             if !appDelegate.isDemo {
-                Button("Reset Sidebar Width") { appDelegate.edge.resetPanelWidth() }
-                    .disabled(!appDelegate.edge.hasCustomPanelWidth)
+                revealPauseMenu
             }
-            if appDelegate.isDemo {
+
+            // Only what needs the user's attention; everything else lives under Settings.
+            if needsAttention {
+                Divider()
+                if let title = menu.hookInstallTitle {
+                    Button("\(title == "Install Hook" ? "Install" : "Update") Claude Code Hook") { menu.installHook() }
+                }
+                if menu.launchAtLoginStatus == .requiresApproval {
+                    Button("Approve Launch at Login…") { menu.openLoginItemsSettings() }
+                }
+                if let error = menu.lastError {
+                    Text(error)
+                }
+                if case .available(let release) = appDelegate.updates.state {
+                    Button("Update Available: \(release.tag)…") { appDelegate.updates.openReleasePage(release) }
+                }
+            }
+
+            Divider()
+            settingsMenu
+            Button("Quit ClaudeWatcher") {
+                NSApp.terminate(nil)
+            }
+            .keyboardShortcut("q")
+        } label: {
+            Image(systemName: appDelegate.edge.isRevealPaused ? "moon.zzz" : "sidebar.left")
+                .accessibilityLabel("ClaudeWatcher")
+        }
+    }
+
+    /// True when the top level should show a hook, login item, error or update item.
+    private var needsAttention: Bool {
+        let menu = appDelegate.menu
+        if case .available = appDelegate.updates.state { return true }
+        return menu.hookInstallTitle != nil || menu.launchAtLoginStatus == .requiresApproval || menu.lastError != nil
+    }
+
+    /// One item either way: "Pause Edge Reveal" to pause for a while, or, while paused, its
+    /// status ("Edge Reveal Paused Until 3:00 PM") with "Resume Now" and the same durations.
+    @ViewBuilder private var revealPauseMenu: some View {
+        let edge = appDelegate.edge
+        let paused = edge.isRevealPaused
+        Menu(paused ? Self.pauseStatus(edge.revealPausedUntil ?? .distantFuture) : "Pause Edge Reveal") {
+            if paused {
+                Button("Resume Now") { edge.resumeReveal() }
+                Divider()
+            }
+            Button("15 Minutes") { edge.pauseReveal(until: .now.addingTimeInterval(15 * 60)) }
+            Button("1 Hour") { edge.pauseReveal(until: .now.addingTimeInterval(60 * 60)) }
+            Button("4 Hours") { edge.pauseReveal(until: .now.addingTimeInterval(4 * 60 * 60)) }
+            Divider()
+            Button("Until Resumed") { edge.pauseReveal(until: .distantFuture) }
+        }
+    }
+
+    /// Everything that's set once and rarely touched: terminal effects, sidebar width, login
+    /// item, the hook, and the version with its update check.
+    private var settingsMenu: some View {
+        let menu = appDelegate.menu
+        return Menu("Settings") {
+            if !appDelegate.isDemo {
                 // Demo mode never tints terminals; don't expose (or write) the real prefs.
-                Text("Demo mode")
-            } else {
                 Toggle("Highlight Terminal on Hover", isOn: Binding(
                     get: { appDelegate.edge.highlightOnHover },
                     set: { appDelegate.edge.highlightOnHover = $0 }
@@ -27,10 +87,14 @@ struct ClaudeWatcherApp: App {
                     get: { appDelegate.edge.pulseOnFocus },
                     set: { appDelegate.edge.pulseOnFocus = $0 }
                 ))
+                Button("Reset Sidebar Width") { appDelegate.edge.resetPanelWidth() }
+                    .disabled(!appDelegate.edge.hasCustomPanelWidth)
+                Divider()
             }
-            if !appDelegate.isDemo {
-                revealPauseItems
-            }
+            Toggle("Launch at Login", isOn: Binding(
+                get: { menu.launchAtLogin },
+                set: { menu.setLaunchAtLogin($0) }
+            ))
 
             Divider()
             Text(menu.hookStatusText)
@@ -42,47 +106,7 @@ struct ClaudeWatcherApp: App {
             }
 
             Divider()
-            Toggle("Launch at Login", isOn: Binding(
-                get: { menu.launchAtLogin },
-                set: { menu.setLaunchAtLogin($0) }
-            ))
-            if menu.launchAtLoginStatus == .requiresApproval {
-                Button("Approve in Login Items Settings…") { menu.openLoginItemsSettings() }
-            }
-
-            if let error = menu.lastError {
-                Divider()
-                Text(error)
-            }
-
-            Divider()
             updateItems
-
-            Divider()
-            Button("Quit ClaudeWatcher") {
-                NSApp.terminate(nil)
-            }
-            .keyboardShortcut("q")
-        } label: {
-            Image(systemName: appDelegate.edge.isRevealPaused ? "moon.zzz" : "sidebar.left")
-                .accessibilityLabel("ClaudeWatcher")
-        }
-    }
-
-    /// Pause the edge reveal for a while, or show until when it's paused and offer to resume.
-    @ViewBuilder private var revealPauseItems: some View {
-        let edge = appDelegate.edge
-        if edge.isRevealPaused, let until = edge.revealPausedUntil {
-            Text(Self.pauseStatus(until))
-            Button("Resume Edge Reveal") { edge.resumeReveal() }
-        } else {
-            Menu("Pause Edge Reveal") {
-                Button("15 Minutes") { edge.pauseReveal(until: .now.addingTimeInterval(15 * 60)) }
-                Button("1 Hour") { edge.pauseReveal(until: .now.addingTimeInterval(60 * 60)) }
-                Button("4 Hours") { edge.pauseReveal(until: .now.addingTimeInterval(4 * 60 * 60)) }
-                Divider()
-                Button("Until Resumed") { edge.pauseReveal(until: .distantFuture) }
-            }
         }
     }
 

@@ -32,7 +32,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `GhosttyTheme.highlightTint(strength:)` (`GhosttyTheme+Highlight.swift`): the pane tint color.
 - `Sources/ClaudeWatcherCore/Edge/`: `EdgeRevealPolicy`, pure auto-hide logic; `suspendedUntil`
   pauses the reveal (a hidden panel never shows; a visible one still hides; `reset()` keeps it).
-  Menu "Pause Edge Reveal" (`EdgeController.pauseReveal(until:)`/`resumeReveal()`, not in demo):
+  Menu "Pause Edge Reveal" (`EdgeController.pauseReveal(until:)`/`resumeReveal()`, not in demo;
+  one submenu either way: while paused it's titled "Edge Reveal Paused Until …" with Resume Now):
   persisted (UserDefaults `edgeRevealPausedUntil`, re-armed at launch; demo ignores it), menu-bar
   icon `moon.zzz` while paused. The expiry task only clears it, never ticks, so the panel can't
   pop up without pointer movement. `PanelWidth`: clamps the
@@ -51,7 +52,10 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   entitlement) and the hardened runtime doesn't gate network access.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
   `EdgeController`, `MenuModel`, `UpdateModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`.
-  `UpdateModel`: version line + update status + "Check for Updates" at the bottom of the menu;
+  Menu layout (`ClaudeWatcherApp`): top level is Pin Sidebar, Pause Edge Reveal, Settings, Quit,
+  plus attention items only when needed (Install/Update Claude Code Hook, Approve Launch at Login,
+  `lastError`, Update Available); everything else is in the Settings submenu.
+  `UpdateModel`: version line + update status + "Check for Updates" at the end of Settings;
   first check 10 s after launch, a 15 min wall-clock tick and every menu open check when due;
   the answer is cached in UserDefaults `updateCheckCache` (JSON `UpdateCache`). Links to the
   release page only, never downloads. Demo mode never hits the network or the cache. Nothing may
@@ -79,7 +83,7 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
   `PanelResizeHandle`: 8 pt AppKit strip on the pane's right edge, pinned or auto-shown (not in
-  demo): drag resizes, double-click (or the menu's "Reset Sidebar Width") goes back to the theme
+  demo): drag resizes, double-click (or Settings › "Reset Sidebar Width") goes back to the theme
   width. It reports hover/drag to `EdgeController`'s `ResizeEdge`, which draws a 2 pt line inside
   the border; `tick()` ignores the drag (`isResizing`) and runs once it ends. The header's
   `[pin]`/`[pinned]` toggles `isPinned` (persisted as `sidebarPinned`, not in demo); pinning an
@@ -186,7 +190,7 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
 - Afterwards: `make run` to rebuild the local dev app (Apple Development, not hardened, so TCC
   grants persist), and check `build/ClaudeWatcher.app/Contents/Resources/claude-watcher-hook.sh`
   matches `~/Library/Application Support/ClaudeWatcher/claude-watcher-hook.sh` (`cmp`); if not,
-  the menu shows "Claude Code Hook: Needs Update"; use its "Update Hook".
+  the menu shows "Update Claude Code Hook" (Settings shows "Claude Code Hook: Needs Update"); use it.
 
 ## Conventions
 - Commit with one-line messages only (no body/trailers).

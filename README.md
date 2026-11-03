@@ -16,10 +16,13 @@ sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/deskt
   Other terminals: the hosting app is brought to the front.
 - Drag the sidebar's right edge to resize it (double-click to reset); the width is kept.
 - Pin the sidebar from its header (`[pin]` / `[pinned]`) or the menu; the pin is kept across relaunches.
-- Menu bar: Pin Sidebar, Reset Sidebar Width, Pause Edge Reveal (15 min / 1 h / 4 h / until
-  resumed; the icon turns to a moon while paused), Claude Code Hook (install / update / uninstall), Launch at Login,
-  the app's version and whether a newer release is out (checked against GitHub releases at launch
-  and twice a day; "Update Available" opens the release page, nothing is downloaded), Quit.
+- Menu bar: Pin Sidebar, Pause Edge Reveal (15 min / 1 h / 4 h / until resumed; while paused
+  the item shows until when, with Resume Now, and the icon turns to a moon), Settings, Quit.
+  Settings holds the terminal highlight and pulse toggles, Reset Sidebar Width, Launch at Login,
+  the Claude Code Hook (status / install / update / uninstall), and the app's version with
+  Check for Updates (checked against GitHub releases at launch and twice a day). Items that need
+  you also appear at the top level: Install/Update Claude Code Hook, Approve Launch at Login,
+  errors, and "Update Available" (opens the release page; nothing is downloaded).
 - Demo mode: `open build/ClaudeWatcher.app --args --demo`.
 
 ## Install
@@ -57,7 +60,7 @@ Input Monitoring access is needed.
 
 ## Optional Claude Code hook
 
-**Install Hook** in the menu bar adds a hook to `~/.claude/settings.json` (with a backup) that
+**Install Claude Code Hook** in the menu bar (also under Settings) adds a hook to `~/.claude/settings.json` (with a backup) that
 records each session's terminal id and tty to `~/Library/Application Support/ClaudeWatcher/hook-state/`.
 It never blocks Claude and only affects sessions started after install. Without it, Ghostty
 tabs are still found on first click by a quick probe.

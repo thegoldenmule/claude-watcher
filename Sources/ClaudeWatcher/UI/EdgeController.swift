@@ -78,6 +78,7 @@ final class EdgeController {
     @ObservationIgnored private var policy = EdgeRevealPolicy()
     @ObservationIgnored private var monitors: [Any] = []
     @ObservationIgnored private var screenObserver: (any NSObjectProtocol)?
+    @ObservationIgnored private var spaceObserver: (any NSObjectProtocol)?
     @ObservationIgnored private var targetFrame: NSRect?
     @ObservationIgnored private var transitionGeneration = 0
 
@@ -140,6 +141,11 @@ final class EdgeController {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.screensDidChange() }
         }
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.activeSpaceDidChange() }
+        }
 
         // The resize strip's cursor: without this, an accessory app's cursor changes are ignored.
         if isResizable { BackgroundCursor.enable() }
@@ -163,6 +169,8 @@ final class EdgeController {
         themeStore.stop()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
+        if let spaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(spaceObserver) }
+        spaceObserver = nil
         hide(animated: false, resetHighlights: false)  // the app resets synchronously at exit
         panel = nil
     }
@@ -509,10 +517,37 @@ final class EdgeController {
     }
 
     private func screensDidChange() {
+        logger.info("screens changed: \(self.panelState, privacy: .public)")
         // Frames (and visibleFrame) may all have changed; never reuse a cached frame.
         policy.reset()
         hide(animated: false)
         if pinned { showPinned() }
+    }
+
+    /// The panel is meant to ride along on every Space, but it can come loose: it was seen pinned
+    /// on one desktop and missing on the others until relaunch. When it should be up but isn't on
+    /// the Space just switched to, put it back (a healthy panel never trips this).
+    private func activeSpaceDidChange() {
+        guard let panel, isVisible, let target = targetFrame,
+              !panel.isVisible || !panel.isOnActiveSpace
+        else { return }
+        logger.error("panel missing from the active Space, re-attaching: \(self.panelState, privacy: .public)")
+        panel.orderOut(nil)
+        panel.collectionBehavior = SidebarPanel.spaceBehavior
+        panel.alphaValue = 1
+        panel.setFrame(target, display: true)
+        panel.orderFrontRegardless()
+        panel.invalidateShadow()
+        logger.info("re-attached: \(self.panelState, privacy: .public)")
+    }
+
+    /// For the log: what we think vs. what the window says.
+    private var panelState: String {
+        guard let panel else { return "no panel" }
+        return "isVisible=\(isVisible) pinned=\(pinned) panel.isVisible=\(panel.isVisible) "
+            + "onActiveSpace=\(panel.isOnActiveSpace) behavior=\(panel.collectionBehavior.rawValue) "
+            + "alpha=\(panel.alphaValue) frame=\(NSStringFromRect(panel.frame)) "
+            + "target=\(targetFrame.map(NSStringFromRect) ?? "nil")"
     }
 
     // MARK: - Showing / hiding
@@ -543,6 +578,7 @@ final class EdgeController {
 
     private func show(on screen: NSScreen, animated: Bool) {
         guard let panel else { return }
+        logger.debug("show animated=\(animated): \(self.panelState, privacy: .public)")
         let target = frame(on: screen)
         let offscreen = target.offsetBy(dx: -(target.maxX - screen.frame.minX) - 2, dy: 0)
         targetFrame = target
@@ -596,6 +632,7 @@ final class EdgeController {
         hoveredID = nil  // rows may not see a hover exit once the panel is ordered out
         cancelHoverTint()
         guard let panel, isVisible || panel.isVisible else { return }
+        logger.debug("hide animated=\(animated): \(self.panelState, privacy: .public)")
         if resetHighlights { highlighter?.resetAll() }
         isVisible = false
         transitionGeneration += 1

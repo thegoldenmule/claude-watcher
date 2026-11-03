@@ -14,7 +14,7 @@ final class SidebarPanel: NSPanel {
         )
         isFloatingPanel = true
         level = .statusBar  // above .floating utility panels, below menus
-        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        collectionBehavior = Self.spaceBehavior
         becomesKeyOnlyIfNeeded = true
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
@@ -24,6 +24,9 @@ final class SidebarPanel: NSPanel {
         isOpaque = false
         hasShadow = true  // derived from the rounded pane's alpha; see invalidateShadow()
     }
+
+    static let spaceBehavior: NSWindow.CollectionBehavior =
+        [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }

@@ -337,5 +337,9 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   import `RTLD_DEFAULT`) of `CGSMainConnectionID` + `CGSSetConnectionProperty`, skipping if
   missing. A set cursor then persists, so the arrow is restored whenever the strip leaves the
   pointer without a `mouseExited` (`hide()`, `\.panelVisible` false, view removed).
+- The panel (`.canJoinAllSpaces`) was once seen pinned on one desktop and missing on the others
+  until relaunch (cause unknown). On every Space switch, `EdgeController.activeSpaceDidChange`
+  re-attaches a panel that should be up but isn't `isOnActiveSpace` (orderOut, re-set behavior,
+  orderFront), logged as an error with `panelState`; show/hide/screen changes log it too.
 - Don't name a Core type `RGBColor`: it clashes with QuickDraw's `RGBColor` in AppKit targets
   (hence `GhosttyColor`).

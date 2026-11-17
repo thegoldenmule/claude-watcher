@@ -4,6 +4,7 @@ import Foundation
 /// Resolves `$CLAUDE_CONFIG_DIR` the way the user's terminal sees it. An app launched by
 /// LaunchServices (Finder, `open`, login item) doesn't inherit the shell's environment, so
 /// after our own environment we ask `launchctl getenv`, then a login + interactive shell.
+/// The probes (`launchctlValue`, `shellValue`, `run`) are shared with `CodexHome`.
 enum ClaudeHome {
     static let variable = "CLAUDE_CONFIG_DIR"
     static let probeTimeout: TimeInterval = 2
@@ -30,7 +31,7 @@ enum ClaudeHome {
         }
     }
 
-    static func launchctlValue() -> String? {
+    static func launchctlValue(_ variable: String = variable) -> String? {
         run("/bin/launchctl", ["getenv", variable])?.trimmingCharacters(in: .newlines)
     }
 
@@ -39,7 +40,7 @@ enum ClaudeHome {
     /// `$SHELL -lic …` printing the variable after a marker. rc files (and a login shell's
     /// logout file) may print anything before or after, so only the text following the last
     /// marker, up to the end of that line, counts.
-    static func shellValue() -> String? {
+    static func shellValue(_ variable: String = variable) -> String? {
         var shell = ProcessInfo.processInfo.environment["SHELL"] ?? ""
         if !shell.hasPrefix("/") || !FileManager.default.isExecutableFile(atPath: shell) { shell = "/bin/zsh" }
         let command = "printf '\\n%s%s\\n' '\(marker)' \"$\(variable)\""
@@ -156,4 +157,42 @@ enum ClaudeHome {
         if timedOut, !acceptOnTimeout(text) { return nil }
         return text
     }
+}
+
+/// Resolves `$CODEX_HOME` (Codex CLI's home, default `~/.codex`) like `ClaudeHome`: our
+/// environment, then `launchctl getenv`, then a login + interactive shell; resolved once.
+enum CodexHome {
+    static let variable = "CODEX_HOME"
+
+    static let resolved: URL = SessionDiscovery.resolveConfigHome(
+        variable: variable, defaultName: ".codex",
+        env: ProcessInfo.processInfo.environment,
+        launchctlValue: ClaudeHome.launchctlValue(variable),
+        shellValue: ClaudeHome.shellValue(variable),
+        home: FileManager.default.homeDirectoryForCurrentUser.path)
+
+    static let queue = DispatchQueue(label: "com.thegoldenmule.ClaudeWatcher.CodexHome", qos: .userInitiated)
+
+    static func prewarm() {
+        queue.async { _ = resolved }
+    }
+
+    static func resolvedAsync() async -> URL {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: resolved) }
+        }
+    }
+}
+
+/// Public access to Codex CLI's home directory (`$CODEX_HOME`, default `~/.codex`).
+public enum CodexPaths {
+    /// Resolved once and cached; may block for seconds on first use (see `ClaudeHome`). Never
+    /// touch it on main at launch; async code awaits `resolvedHome()`.
+    public static var defaultHome: URL { CodexHome.resolved }
+
+    /// Starts resolving `defaultHome` off the main thread. Idempotent.
+    public static func prewarm() { CodexHome.prewarm() }
+
+    /// `defaultHome`, resolved on its own queue: the caller suspends instead of blocking.
+    public static func resolvedHome() async -> URL { await CodexHome.resolvedAsync() }
 }

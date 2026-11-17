@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Resolving Claude Code's config dir may spawn launchctl and a login shell (up to ~4 s
         // worst case): start it now, off the main thread, and never wait for it on main.
         SessionDiscovery.prewarmDefaultClaudeHome()
+        CodexPaths.prewarm()
         menu = MenuModel()
         updates = UpdateModel(isDemo: DemoMode.isEnabled)
         if DemoMode.isEnabled {
@@ -71,11 +72,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !isDemo { TerminalHighlighter.shared.resetAllSync() }
     }
 
-    /// Creates and starts the store once the config dir is resolved (off the main thread).
+    /// Creates and starts the store once the config dirs are resolved (off the main thread).
     private func startStore() async {
         let claudeHome = await SessionDiscovery.resolvedClaudeHome()
+        let codexHome = await CodexPaths.resolvedHome()
         guard !terminating, slot.store == nil else { return }
-        let store = SessionStore(claudeHome: claudeHome, hookStateDirectory: HookStateStore.defaultDirectory)
+        let codex = CodexDiscovery(codexHome: codexHome, hookStateDirectory: CodexHookStateStore.defaultDirectory)
+        let store = SessionStore(
+            claudeHome: claudeHome, hookStateDirectory: HookStateStore.defaultDirectory, codex: codex)
         slot.store = store
         store.start()
     }

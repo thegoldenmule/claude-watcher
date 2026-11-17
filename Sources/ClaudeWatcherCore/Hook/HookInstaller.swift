@@ -9,6 +9,30 @@ import Foundation
 /// with an order-preserving JSON model and printed in `JSON.stringify(_, null, 2)` style, so
 /// the diff is limited to our entries (see `OrderedJSON` for the small caveats).
 public enum HookInstaller {
+    /// Which agent's hook configuration an install targets. Claude Code's `settings.json` and
+    /// Codex's `hooks.json` share the `hooks` → event → matcher groups → handlers schema, so
+    /// the merge/remove/status machinery is the same; only the script, events and file differ.
+    public struct Profile: Sendable, Equatable {
+        /// Installed script name; also how our handlers are recognised (`/<name>` in the command).
+        public var scriptFileName: String
+        public var events: [String]
+        /// Events registered without `async: true`.
+        public var synchronousEvents: Set<String>
+
+        /// Claude Code: `settings.json`, `claude-watcher-hook.sh`.
+        public static let claude = Profile(
+            scriptFileName: "claude-watcher-hook.sh",
+            events: ["SessionStart", "UserPromptSubmit", "Stop", "Notification", "SessionEnd"],
+            synchronousEvents: ["SessionEnd"])
+
+        /// Codex CLI: `$CODEX_HOME/hooks.json`, `codex-watcher-hook.sh`. SessionEnd always runs
+        /// synchronously in Codex, so it is written without `async`.
+        public static let codex = Profile(
+            scriptFileName: "codex-watcher-hook.sh",
+            events: ["SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop", "Interrupt", "SessionEnd"],
+            synchronousEvents: ["SessionEnd"])
+    }
+
     public enum InstallStatus: Sendable, Equatable {
         /// Script present and every event has exactly our expected entry, in a match-all group.
         case installed
@@ -39,7 +63,7 @@ public enum HookInstaller {
         }
     }
 
-    public static let scriptFileName = "claude-watcher-hook.sh"
+    public static let scriptFileName = Profile.claude.scriptFileName
 
     /// What `uninstall` leaves at the script path (see there).
     static let noOpScript = Data("#!/bin/sh\nexit 0\n".utf8)
@@ -49,8 +73,8 @@ public enum HookInstaller {
 
     /// Events we register for. All are async (never block Claude) except SessionEnd, which
     /// runs synchronously so it completes before `claude -p` teardown kills async hooks.
-    public static let events = ["SessionStart", "UserPromptSubmit", "Stop", "Notification", "SessionEnd"]
-    static let synchronousEvents: Set<String> = ["SessionEnd"]
+    public static let events = Profile.claude.events
+    static let synchronousEvents: Set<String> = Profile.claude.synchronousEvents
 
     /// `settings.json` in Claude Code's config directory: `$CLAUDE_CONFIG_DIR` when set, else
     /// `~/.claude` (the same directory session discovery reads).
@@ -68,8 +92,10 @@ public enum HookInstaller {
             .appendingPathComponent("Library/Application Support/ClaudeWatcher", isDirectory: true)
     }
 
-    public static func installedScriptURL(installDirectory: URL = defaultInstallDirectory) -> URL {
-        installDirectory.appendingPathComponent(scriptFileName)
+    public static func installedScriptURL(
+        installDirectory: URL = defaultInstallDirectory, profile: Profile = .claude
+    ) -> URL {
+        installDirectory.appendingPathComponent(profile.scriptFileName)
     }
 
     // MARK: Public API
@@ -77,13 +103,14 @@ public enum HookInstaller {
     public static func status(
         hookScriptSource: URL? = nil,
         settingsURL: URL = defaultSettingsURL,
-        installDirectory: URL = defaultInstallDirectory
+        installDirectory: URL = defaultInstallDirectory,
+        profile: Profile = .claude
     ) -> InstallStatus {
-        let script = installedScriptURL(installDirectory: installDirectory)
+        let script = installedScriptURL(installDirectory: installDirectory, profile: profile)
         let command = hookCommand(scriptPath: script.path)
         guard let data = try? Data(contentsOf: settingsURL),
               let root = try? OrderedJSON.parse(data) else { return .notInstalled }
-        let state = entriesStatus(root: root, command: command)
+        let state = entriesStatus(root: root, command: command, profile: profile)
         guard state != .notInstalled else { return .notInstalled }
         guard FileManager.default.isExecutableFile(atPath: script.path) else { return .outdated }
         if let source = hookScriptSource {
@@ -104,11 +131,12 @@ public enum HookInstaller {
     public static func install(
         hookScriptSource: URL,
         settingsURL: URL = defaultSettingsURL,
-        installDirectory: URL = defaultInstallDirectory
+        installDirectory: URL = defaultInstallDirectory,
+        profile: Profile = .claude
     ) throws -> URL? {
         let fm = FileManager.default
         try fm.createDirectory(at: installDirectory, withIntermediateDirectories: true)
-        let script = installedScriptURL(installDirectory: installDirectory)
+        let script = installedScriptURL(installDirectory: installDirectory, profile: profile)
         let scriptData = try Data(contentsOf: hookScriptSource)
         if (try? Data(contentsOf: script)) != scriptData {
             try writeAtomically(scriptData, to: script, mode: 0o755)
@@ -118,7 +146,7 @@ public enum HookInstaller {
 
         let command = hookCommand(scriptPath: script.path)
         return try editSettings(at: settingsURL) { root in
-            try mergeEntries(into: &root, command: command)
+            try mergeEntries(into: &root, command: command, profile: profile)
         }
     }
 
@@ -134,12 +162,13 @@ public enum HookInstaller {
     @discardableResult
     public static func uninstall(
         settingsURL: URL = defaultSettingsURL,
-        installDirectory: URL = defaultInstallDirectory
+        installDirectory: URL = defaultInstallDirectory,
+        profile: Profile = .claude
     ) throws -> URL? {
         let backup = try editSettings(at: settingsURL, createIfMissing: false) { root in
-            try removeEntries(from: &root)
+            try removeEntries(from: &root, profile: profile)
         }
-        let script = installedScriptURL(installDirectory: installDirectory)
+        let script = installedScriptURL(installDirectory: installDirectory, profile: profile)
         if FileManager.default.fileExists(atPath: script.path),
            (try? Data(contentsOf: script)) != noOpScript {
             try writeAtomically(noOpScript, to: script, mode: 0o755)
@@ -154,23 +183,23 @@ public enum HookInstaller {
         "'" + scriptPath.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    static func isOurs(_ handler: OrderedJSON) -> Bool {
-        handler["command"]?.stringValue?.contains("/" + scriptFileName) ?? false
+    static func isOurs(_ handler: OrderedJSON, profile: Profile = .claude) -> Bool {
+        handler["command"]?.stringValue?.contains("/" + profile.scriptFileName) ?? false
     }
 
-    static func desiredHandler(event: String, command: String) -> OrderedJSON {
+    static func desiredHandler(event: String, command: String, profile: Profile = .claude) -> OrderedJSON {
         var pairs: [(String, OrderedJSON)] = [("type", .string("command")), ("command", .string(command))]
         // SessionEnd stays synchronous and without a `timeout`: a per-hook timeout would
         // stretch Claude's 1.5s SessionEnd budget, and the script takes ~25ms.
-        if !synchronousEvents.contains(event) {
+        if !profile.synchronousEvents.contains(event) {
             pairs.append(("async", .bool(true)))
         }
         return .object(pairs)
     }
 
-    static func desiredGroup(event: String, command: String) -> OrderedJSON {
+    static func desiredGroup(event: String, command: String, profile: Profile = .claude) -> OrderedJSON {
         // No matcher: matches all occurrences (and UserPromptSubmit/Stop ignore matchers).
-        .object([("hooks", .array([desiredHandler(event: event, command: command)]))])
+        .object([("hooks", .array([desiredHandler(event: event, command: command, profile: profile)]))])
     }
 
     /// Brings our entries up to date with minimal edits: for each registered event, the first
@@ -179,7 +208,8 @@ public enum HookInstaller {
     /// appended only for an event that has no such handler. Stray handlers of ours under events
     /// we no longer register are removed. Settings that already hold exactly our entries are
     /// left equal, so `transformedSettings` reports no change and nothing is written.
-    static func mergeEntries(into root: inout OrderedJSON, command: String) throws {
+    static func mergeEntries(into root: inout OrderedJSON, command: String, profile: Profile = .claude) throws {
+        let events = profile.events
         guard case .object = root else { throw InstallError.settingsNotAnObject }
         let hooksValue = root["hooks"] ?? .object([])
         guard case let .object(eventPairs) = hooksValue else { throw InstallError.hooksNotAnObject }
@@ -191,29 +221,29 @@ public enum HookInstaller {
             guard case let .array(groups) = value else { newPairs.append((event, value)); continue }
             guard events.contains(event) else {
                 // Stray entries of ours: drop them, and the event key if only ours were there.
-                let kept = rewritingOurs(in: groups, keep: nil)
+                let kept = rewritingOurs(in: groups, keep: nil, profile: profile)
                 if kept.isEmpty && !groups.isEmpty { continue }
                 newPairs.append((event, .array(kept)))
                 continue
             }
-            let desired = desiredHandler(event: event, command: command)
-            if let keep = keeperIndex(in: groups) {
-                newPairs.append((event, .array(rewritingOurs(in: groups, keep: (keep, desired)))))
+            let desired = desiredHandler(event: event, command: command, profile: profile)
+            if let keep = keeperIndex(in: groups, profile: profile) {
+                newPairs.append((event, .array(rewritingOurs(in: groups, keep: (keep, desired), profile: profile))))
             } else {
-                var kept = rewritingOurs(in: groups, keep: nil)
-                kept.append(desiredGroup(event: event, command: command))
+                var kept = rewritingOurs(in: groups, keep: nil, profile: profile)
+                kept.append(desiredGroup(event: event, command: command, profile: profile))
                 newPairs.append((event, .array(kept)))
             }
         }
         for event in events where !newPairs.contains(where: { $0.0 == event }) {
-            newPairs.append((event, .array([desiredGroup(event: event, command: command)])))
+            newPairs.append((event, .array([desiredGroup(event: event, command: command, profile: profile)])))
         }
         root.set("hooks", .object(newPairs))
     }
 
     /// Removes only our handlers. Groups, event arrays and the `hooks` object that this leaves
     /// empty are pruned (only when they held something of ours, never pre-existing empties).
-    static func removeEntries(from root: inout OrderedJSON) throws {
+    static func removeEntries(from root: inout OrderedJSON, profile: Profile = .claude) throws {
         guard case .object = root else { throw InstallError.settingsNotAnObject }
         guard let hooksValue = root["hooks"] else { return }
         guard case let .object(eventPairs) = hooksValue else { throw InstallError.hooksNotAnObject }
@@ -221,7 +251,7 @@ public enum HookInstaller {
         var newPairs: [(String, OrderedJSON)] = []
         for (event, value) in eventPairs {
             guard case let .array(groups) = value else { newPairs.append((event, value)); continue }
-            let kept = rewritingOurs(in: groups, keep: nil)
+            let kept = rewritingOurs(in: groups, keep: nil, profile: profile)
             if kept != groups { changed = true }
             if kept.isEmpty && !groups.isEmpty { continue } // only ours were there
             newPairs.append((event, .array(kept)))
@@ -245,9 +275,9 @@ public enum HookInstaller {
     }
 
     /// (group, handler) index of the first handler of ours that can be updated in place.
-    static func keeperIndex(in groups: [OrderedJSON]) -> (group: Int, handler: Int)? {
+    static func keeperIndex(in groups: [OrderedJSON], profile: Profile = .claude) -> (group: Int, handler: Int)? {
         for (gi, group) in groups.enumerated() where isMatchAll(group) {
-            if let hi = group["hooks"]?.arrayValue?.firstIndex(where: isOurs) { return (gi, hi) }
+            if let hi = group["hooks"]?.arrayValue?.firstIndex(where: { isOurs($0, profile: profile) }) { return (gi, hi) }
         }
         return nil
     }
@@ -257,8 +287,10 @@ public enum HookInstaller {
     /// dropped; groups without handlers of ours are returned untouched.
     static func rewritingOurs(
         in groups: [OrderedJSON],
-        keep: ((group: Int, handler: Int), OrderedJSON)?
+        keep: ((group: Int, handler: Int), OrderedJSON)?,
+        profile: Profile = .claude
     ) -> [OrderedJSON] {
+        let isOurs = { (h: OrderedJSON) in Self.isOurs(h, profile: profile) }
         var result: [OrderedJSON] = []
         for (gi, group) in groups.enumerated() {
             guard case let .array(handlers)? = group["hooks"], handlers.contains(where: isOurs) else {
@@ -284,8 +316,10 @@ public enum HookInstaller {
     /// `.installed` only if every registered event has exactly our desired handler, in a
     /// match-all group (the same rule `mergeEntries` uses). A handler of ours under a restricting
     /// matcher counts as found but makes the result `.outdated`: it would not fire for every event.
-    static func entriesStatus(root: OrderedJSON, command: String) -> InstallStatus {
+    static func entriesStatus(root: OrderedJSON, command: String, profile: Profile = .claude) -> InstallStatus {
         guard case let .object(eventPairs)? = root["hooks"] else { return .notInstalled }
+        let events = profile.events
+        let isOurs = { (h: OrderedJSON) in Self.isOurs(h, profile: profile) }
         var foundAny = false
         var allExact = true
         for event in events {
@@ -296,7 +330,7 @@ public enum HookInstaller {
                 foundAny = true
                 if isMatchAll(group) { ours += mine } else { allExact = false }
             }
-            if ours != [desiredHandler(event: event, command: command)] { allExact = false }
+            if ours != [desiredHandler(event: event, command: command, profile: profile)] { allExact = false }
         }
         // Stray entries of ours under events we no longer register.
         for (event, value) in eventPairs where !events.contains(event) {

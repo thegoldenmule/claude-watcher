@@ -1,6 +1,6 @@
 # ClaudeWatcher
 
-Auto-hiding left-edge bar (like the Dock) listing running Claude Code CLI sessions
+Auto-hiding left-edge bar (like the Dock) listing running Claude Code and Codex CLI sessions
 (title, git branch, status), styled as a Ghostty pane themed from the user's Ghostty config.
 Clicking a session focuses its terminal (Ghostty or Terminal.app), even across Spaces.
 Menu-bar-only accessory app (LSUIElement), unsandboxed. MIT licensed.
@@ -9,11 +9,17 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 ## Layout
 - `Sources/ClaudeWatcherCore/Model/`: shared types (`ClaudeSession`, `SessionStatus`,
   `TerminalKind`, `FocusResult`, `SubagentInfo`; `SubagentTree` draws the tree prefixes,
-  `ElapsedFormat` the short elapsed labels).
+  `ElapsedFormat` the short elapsed labels). `ClaudeSession.agent` (`AgentKind` `.claude`/`.codex`)
+  and `contextWindow` (nil = Claude's assumed 1M; `effectiveContextWindow`).
 - `Sources/ClaudeWatcherCore/Sessions/`: `SessionStore` (`@MainActor @Observable`) over
   `SessionDiscovery` (actor): registry + transcripts + liveness, joined with hook state.
   `SubagentTracker` (owned by discovery, like `TranscriptReader`): a session's running
-  subagents (see "Subagents" below).
+  subagents (see "Subagents" below). `CodexDiscovery` (actor, optional second source of the
+  store, scanned concurrently, merged by `SessionDiscovery.finalize`) with `CodexStateDB`,
+  `CodexRolloutReader`/`CodexRolloutParser` and `CodexMatcher` (see "Codex" below).
+  `ProcessInspecting` also has `allPIDs()`, `currentDirectory(pid:)`, `processName(pid:)`
+  (defaulted, so fakes needn't implement them). `CodexPaths` (`ClaudeHome.swift`) resolves
+  `$CODEX_HOME` like the Claude home (shared probes, own queue; `AppDelegate` prewarms it).
 - `Sources/ClaudeWatcherCore/Hook/`: `HookState`/`HookStateStore`/`HookStateCache` (reads the
   hook's output, `<sid>.json` + `<sid>.ghostty` sidecar), `HookInstaller` (edits
   `settings.json` under the resolved Claude home, order-preserving, updates our entries in place,
@@ -22,6 +28,9 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 - `Sources/ClaudeWatcherCore/Focus/`: `RoutingFocuser` -> `GhosttyFocuser` (resolver chain) /
   `AppleTerminalFocuser` / activate-hosting-app fallback. `AppleScriptRunner` runs scripts.
   `OSC7Probe` (`GhosttyOSC7Probe.swift`) + `OSC7ProbeLock` (cross-process lock shared with the hook).
+  `GhosttyTitleReader` (`GhosttyTitles.swift`): every Ghostty terminal's title by tty (Ghostty
+  1.4+), only if `AutomationPermission` (`AEDeterminePermissionToAutomateTarget`, never prompts,
+  cached 30 s) says Automation was already granted: background reads must not raise the prompt.
   `TerminalHighlighter` (`.shared`): tints a Ghostty session's split pane on sidebar hover and
   pulses it after a successful focus (see "Pane highlight" below).
 - `Sources/ClaudeWatcherCore/Theme/`: `GhosttyColor`, `GhosttyConfigParser` (+ `GhosttyThemeSpec`,
@@ -77,9 +86,11 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   the session has no agents; the header
   adds `⑂ N agents`; a session with `contextTokens` ends in a `ContextMeter` line: a drawn bar,
   not `█░` glyphs (seams, font fallback), green/yellow/red per `ContextUsage.level`, its fill
-  keeping that color under the selection, and `245k / 1M · 25%` right-aligned in a fixed
-  16-cell reserve so every row's bar is as long; narrow panes fall back to `25%`, then the bar
-  alone), `SidebarPanel`, `TerminalStyle` (SwiftUI
+  keeping that color under the selection, and `245k / 1M · 25%` (Codex: `/ 475k`, the session's
+  window) right-aligned in a fixed 18-cell reserve so every row's bar is as long; narrow panes
+  fall back to `25%`, then the bar alone; a Codex row's location line ends in ` [codex]`, an
+  ambiguous Codex row (`.unknown`) says "thread unknown", and the header reads `❯ agent
+  sessions` once a non-Claude session is listed), `SidebarPanel`, `TerminalStyle` (SwiftUI
   colors/font/metrics from a `GhosttyTheme`, injected via `\.terminalStyle`), `ThemeStore` (reloads when a watched config/theme
   file changes, stat-polled every 2 s, and on system appearance flips for light:/dark: themes).
   `PanelResizeHandle`: 8 pt AppKit strip on the pane's right edge, pinned or auto-shown (not in
@@ -89,6 +100,11 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `[pin]`/`[pinned]` toggles `isPinned` (persisted as `sidebarPinned`, not in demo); pinning an
   auto-shown panel keeps it on its screen.
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
+- `hooks/codex-watcher-hook.sh`: the Codex hook (bundled too; see "Codex hook" below).
+  `CodexHookInstaller` registers it in `$CODEX_HOME/hooks.json` via `HookInstaller` with
+  `Profile.codex` (`Profile.claude` is every existing call's default); `CodexHookState(Cache)`
+  reads its output. Menu: Settings › "Codex Hook: …" (only when Codex is present or ours is
+  installed), top-level Install/Update Codex Hook only when Codex is present.
 - `Tests/ClaudeWatcherCoreTests/`: Swift Testing (`import Testing`). Keep logic in Core so it is testable.
   Tests run in parallel on the shared cooperative pool and must never block it (`waitUntilExit`,
   `Thread.sleep`, blocking reads/`queue.sync` starve other tests): use `TestSupport.swift`'s
@@ -109,6 +125,10 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 
 ## Commands
 - `make build` (`swift build`), `make test` (`swift test`)
+- Without Xcode (Command Line Tools only) the app target doesn't build: no SwiftUI macro plugin.
+  Core + tests still do: `swift build --target ClaudeWatcherCoreTests -Xswiftc -plugin-path
+  -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing`, then
+  `swift test --skip-build`.
 - `make app`: release build, assembles and signs `build/ClaudeWatcher.app`
 - `make run`: kills any running instance, builds the app, opens it
 - `make clean`
@@ -120,11 +140,12 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
   show the info banner. Screenshot helpers (demo only): `CW_DEMO_NOTICE=error|info`,
   `CW_DEMO_HOVER=<id>`, `CW_DEMO_PENDING=<id>`, `CW_DEMO_COLLAPSED=<id>[,<id>…]` (collapse those
-  rows' agent trees; demo-1 has a nested one, demo-3 one agent), `CW_DEMO_EMPTY=1`,
+  rows' agent trees; demo-1 has a nested one, demo-3 and demo-codex one agent), `CW_DEMO_EMPTY=1`,
   `CW_DEMO_UPDATE=X.Y.Z|fail|checking` (menu update line; default "Up to Date").
 - Theme overrides: `CW_GHOSTTY_CONFIG=<path>` (read only that config),
   `CW_GHOSTTY_THEME=<name or light:A,dark:B>` (preview a theme, ignoring config colors).
-- Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery`. Live update check against
+- Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery` (Codex threads and TUIs:
+  `--filter liveCodexDiscovery`). Live update check against
   GitHub (repo's Info.plist version vs `releases/latest`, plus an ETag revalidation):
   `CW_LIVE=1 swift test --filter liveUpdateCheck`.
 - Logs: `/usr/bin/log stream --predicate 'subsystem == "com.thegoldenmule.ClaudeWatcher"'`
@@ -286,7 +307,9 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   queries (`every terminal`) never arrive and the script hangs past its `with timeout`.
   `AppleScriptRunner` hops to the MainActor; every generated script carries
   `with timeout of 3 seconds`. The first run per target app blocks on the TCC Automation prompt.
-- Ghostty 1.3.1 has no `tty` terminal property. The OSC 7 probe identifies a terminal by
+- Ghostty 1.4.0 adds `tty`, `pid` (foreground process) and `name` (title) to `terminal`, so
+  `TTYPropertyResolver` resolves directly there (and `GhosttyTitleReader` works); the rest of
+  this paragraph is the 1.3.1 path. Ghostty 1.3.1 has no `tty` terminal property. The OSC 7 probe identifies a terminal by
   writing an OSC 7 with a nonce cwd to the session's tty and asking Ghostty which terminal's
   `working directory` matches, then restoring the real cwd. The hook runs it once at
   SessionStart; `GhosttyFocuser` runs it on demand (cached per pid) when no hook id exists.
@@ -347,3 +370,57 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   orderFront), logged as an error with `panelState`; show/hide/screen changes log it too.
 - Don't name a Core type `RGBColor`: it clashes with QuickDraw's `RGBColor` in AppKit targets
   (hence `GhosttyColor`).
+- Codex (CLI 0.169, standalone installer `~/.codex/packages/standalone/releases/<ver>/bin/codex`;
+  Homebrew cask `Caskroom/codex/`; npm vendors the same native binary; node never matches):
+  - The TUI (`codex`, owns the tty) normally doesn't run threads: a shared daemon (`codex
+    app-server --managed-daemon`, setsid, no tty, `~/.codex/app-server-daemon/daemon.pid`,
+    outlives its TUIs) runs every thread and writes every rollout, so a TUI's open files say
+    nothing. `--no-daemon` and a few flags run it embedded. `ProcessRules.isCodexTUI`: binary
+    named `codex`, first positional argument not a non-interactive subcommand (`app-server`,
+    `exec`, …); discovery also requires a tty and filters `allPIDs()` by `proc_name` first.
+  - No per-process registry. Threads: `$CODEX_HOME/state_<n>.sqlite` (newest n), `threads`
+    (`name` = thread name, auto-generated ~1 s after the first prompt or `/rename`; `title` =
+    first message; `cwd`, `git_branch` at start, `created_at_ms`/`updated_at_ms` (or seconds),
+    `thread_source` user|subagent|…, `source` cli|vscode (the daemon's TUI threads say
+    "vscode")|exec|mcp|JSON for subagents, `originator` codex-tui (daemon) / codex_cli_rs
+    (embedded); other clients excluded), `thread_spawn_edges(parent, child, status)` (`open`
+    even after the child finished). Opened `SQLITE_OPEN_READONLY` (WAL: still sees commits,
+    never checkpoints), kept open while Codex TUIs exist, closed when none.
+  - Matching (`CodexMatcher`): a thread is eligible for a TUI if in its cwd (realpaths), active
+    since the TUI started, and created after it (unless `codex resume`/`fork`; `/resume` inside
+    the TUI isn't seen). Alone in its cwd: most recently active eligible thread, none = fresh
+    TUI (idle, id `codex-pid-<pid>-<startms>`). Shared cwd: Ghostty titles containing exactly
+    one candidate's name fix that TUI's thread; then every assignment of threads to eligible
+    TUIs is enumerated (each TUI's threads must not overlap: `/new` starts after the previous
+    one's last activity); a TUI gets a thread only if all consistent assignments agree, else
+    `.unknown` ("thread unknown"). User's choice: never guess.
+  - Rollouts `sessions/YYYY/MM/DD/rollout-<local ts>-<thread id>.jsonl`, created at the first
+    prompt; lines `{"timestamp","ordinal","type","payload"}`. Busy = last `event_msg`
+    `task_started` without a later `task_complete`/`turn_aborted`; context = last `token_count`
+    `info.last_token_usage.total_tokens` / `info.model_context_window` (effective window, e.g.
+    475k; never the cumulative `total_token_usage`); last prompt = `item_completed` with
+    `item.type` "UserMessage". Only a 512-byte prefix is inspected per line; incremental like
+    `TranscriptReader`, backward scan (≤16 MB) for fields the 256 KB tail lacks. Approval
+    requests are never persisted. Subagents: child threads' rollouts (they start with a copy
+    of the parent's history; their own last turn event decides), stale after 10 min idle while
+    the session isn't busy; label = agent path's last component, type = nickname.
+  - Waiting: a readable Ghostty title (`[ ! ] Action Required | …`, blinking with `[ . ]`) is
+    authoritative; else the hook's `PermissionRequest` while its turn is open and nothing was
+    recorded since (stays "waiting" until a long approved command's output lands). Titles are
+    read at most once per scan, only for Ghostty Codex TUIs mid-turn or ambiguous.
+  - Codex hook (`codex-watcher-hook.sh`): Codex runs hooks in the daemon (`$SHELL -lc`,
+    setsid: no tty or TUI pid), JSON on stdin; events SessionStart (at the first turn, not at
+    launch), UserPromptSubmit, PermissionRequest, Stop, Interrupt (async), SessionEnd (always
+    sync in Codex; ≥60 s after a TUI exits, when the daemon unloads the thread). It writes
+    `codex-hook-state/<root thread id>.json` (`session_id`, `last_event`, `turn_id`, `agent_id`,
+    `cwd`, `updated_at` ms) atomically, removes it on SessionEnd, GCs > 48 h; prints nothing
+    (SessionStart stdout becomes model context), exits 0; jq optional (`CODEX_WATCHER_NO_JQ=1`,
+    `CODEX_WATCHER_STATE_DIR`). Separate dir: the Claude hook's GC deletes non-Claude state.
+    `hooks.json` allows only top-level `description` and `hooks`. Trust: Codex only runs a
+    user hook with `[hooks.state."<hooks.json path>:<event_snake>:<group>:<handler>"]
+    trusted_hash` in `config.toml`, written when the user approves at Codex's startup "Review
+    hooks" prompt; we never write it (user's choice). `CodexHookInstaller.status.needsTrust`
+    ("Approve in Codex") checks presence only (not the hash), literal and realpath key forms.
+  - Terminal side: Codex sets OSC 0 titles (`<spinner> <thread> | <project>`), queries OSC
+    10/11 once at startup (never sets 11/111), never sends OSC 7; also OSC 7501 status for
+    supporting terminals. Focus/highlight need nothing Codex-specific (pid + tty).

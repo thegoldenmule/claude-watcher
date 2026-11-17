@@ -63,13 +63,27 @@ public actor SessionDiscovery {
         shellValue: @autoclosure () -> String?,
         home: String
     ) -> URL {
+        resolveConfigHome(
+            variable: "CLAUDE_CONFIG_DIR", defaultName: ".claude", env: env,
+            launchctlValue: launchctlValue(), shellValue: shellValue(), home: home)
+    }
+
+    /// `resolveClaudeHome` for any config-dir variable (`CODEX_HOME` → `~/.codex`).
+    public static func resolveConfigHome(
+        variable: String,
+        defaultName: String,
+        env: [String: String],
+        launchctlValue: @autoclosure () -> String?,
+        shellValue: @autoclosure () -> String?,
+        home: String
+    ) -> URL {
         let fallback = URL(fileURLWithPath: home, isDirectory: true)
-            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent(defaultName, isDirectory: true)
         func clean(_ value: String?) -> String? {
             guard let v = value?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty else { return nil }
             return v
         }
-        guard let raw = clean(env["CLAUDE_CONFIG_DIR"]) ?? clean(launchctlValue()) ?? clean(shellValue())
+        guard let raw = clean(env[variable]) ?? clean(launchctlValue()) ?? clean(shellValue())
         else { return fallback }
         var path = raw
         if path == "~" {

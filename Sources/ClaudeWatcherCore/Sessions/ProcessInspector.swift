@@ -26,10 +26,22 @@ public protocol ProcessInspecting: Sendable {
     /// The process's argv (argv[0] first), if readable. Comparatively expensive: callers
     /// should only ask when the executable alone is not conclusive (e.g. `node`).
     func arguments(pid: Int32) -> [String]?
+    /// Every pid on the system (used to find processes that have no registry, e.g. Codex).
+    func allPIDs() -> [Int32]
+    /// The process's current working directory, if readable.
+    func currentDirectory(pid: Int32) -> String?
+    /// The process's short name (`p_comm`, the executable's basename truncated to 16 bytes):
+    /// one cheap call, for filtering `allPIDs()` before taking snapshots.
+    func processName(pid: Int32) -> String?
 }
 
 extension ProcessInspecting {
     public func arguments(pid: Int32) -> [String]? { nil }
+    public func allPIDs() -> [Int32] { [] }
+    public func currentDirectory(pid: Int32) -> String? { nil }
+    public func processName(pid: Int32) -> String? {
+        snapshot(pid: pid)?.executablePath.map { String(($0 as NSString).lastPathComponent.utf8.prefix(16)) ?? $0 }
+    }
 
     /// Ancestors of `pid` (parent first), stopping before launchd (pid 1).
     public func ancestors(of pid: Int32, maxDepth: Int = 24) -> [ProcessSnapshot] {
@@ -129,6 +141,38 @@ public struct SystemProcessInspector: ProcessInspecting {
         return args
     }
 
+    public func allPIDs() -> [Int32] {
+        // Ask for the count, then fetch with headroom for processes started in between.
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return [] }
+        var pids = [Int32](repeating: 0, count: Int(count) + 64)
+        let n = pids.withUnsafeMutableBytes { buf in
+            proc_listallpids(buf.baseAddress, Int32(buf.count))
+        }
+        guard n > 0 else { return [] }
+        return pids.prefix(Int(n)).filter { $0 > 0 }
+    }
+
+    public func processName(pid: Int32) -> String? {
+        guard pid > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: 64)
+        let n = proc_name(pid, &buffer, UInt32(buffer.count))
+        guard n > 0 else { return nil }
+        return String(decoding: buffer.prefix(Int(n)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    public func currentDirectory(pid: Int32) -> String? {
+        guard pid > 0 else { return nil }
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.stride)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafeBytes(of: info.pvi_cdir.vip_path) { raw -> String in
+            let bytes = raw.prefix { $0 != 0 }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+        return path.isEmpty ? nil : path
+    }
+
     static func kinfo(pid: Int32) -> kinfo_proc? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var kp = kinfo_proc()
@@ -222,6 +266,29 @@ public enum ProcessRules {
             return delta >= -startTolerance && delta <= 600
         }
         return true
+    }
+
+    /// Codex CLI subcommands (and aliases) that are not the interactive TUI. Anything else
+    /// (no subcommand, a prompt, `resume`, `fork`) is the TUI.
+    static let codexNonInteractiveSubcommands: Set<String> = [
+        "exec", "e", "review", "login", "logout", "mcp", "mcp-server", "plugin", "app-server",
+        "app", "remote-control", "completion", "update", "doctor", "sandbox", "debug",
+        "execpolicy", "apply", "a", "queue", "archive", "unarchive", "delete", "migrate-rollouts",
+        "migrate-nfs-db", "cloud", "cloud-tasks", "agents", "tcp-tunnel", "git-credential",
+        "responses-api-proxy", "stdio-to-uds", "exec-server", "features", "help",
+    ]
+
+    /// Whether a process is an interactive Codex CLI TUI: a native binary named `codex` (the
+    /// standalone installer's `~/.codex/packages/standalone/releases/<ver>/bin/codex`, Homebrew's
+    /// `Caskroom/codex/<ver>/bin/codex`, npm's vendored `…/@openai/codex…/codex`; npm's node
+    /// launcher execs or spawns that binary, so the node process itself never matches) whose
+    /// first positional argument isn't a non-interactive subcommand (`app-server` is the shared
+    /// daemon, `exec` is headless). `arguments` is only read for `codex` binaries.
+    public static func isCodexTUI(_ executablePath: String?, arguments: () -> [String]?) -> Bool {
+        guard let path = executablePath, (path as NSString).lastPathComponent == "codex" else { return false }
+        guard let argv = arguments() else { return true }
+        guard let sub = argv.dropFirst().first(where: { !$0.hasPrefix("-") }) else { return true }
+        return !codexNonInteractiveSubcommands.contains(sub)
     }
 
     /// Classifies the hosting terminal from ancestor executable paths (nearest first).

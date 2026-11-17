@@ -139,6 +139,18 @@ enum DemoMode {
                 status: .idle, tty: "/dev/ttys004", terminal: .ghostty,
                 startedAt: ago(95), updatedAt: ago(30), contextTokens: 41_200),
             ClaudeSession(
+                id: "demo-codex", agent: .codex, pid: 41006, cwd: "\(home)/projects/acme/mobile-app",
+                title: "Investigate crash on launch", branch: "main",
+                lastPrompt: "spawn agents to bisect the crash and check the symbolicated logs",
+                status: .busy, tty: "/dev/ttys006", terminal: .ghostty,
+                startedAt: ago(14), updatedAt: ago(0.1),
+                subagents: [
+                    SubagentInfo(
+                        id: "demo-codex-a1", agentType: "Sagan", label: "bisect crash",
+                        activity: "exec", startedAt: ago(4), lastActivityAt: ago(0.1)),
+                ],
+                contextTokens: 121_300, contextWindow: 475_000),
+            ClaudeSession(
                 id: "demo-5", pid: 41005, cwd: "\(home)/scratch",
                 title: "scratch", branch: nil, lastPrompt: nil,
                 status: .unknown, tty: "/dev/ttys005", terminal: .other("iTerm2"),

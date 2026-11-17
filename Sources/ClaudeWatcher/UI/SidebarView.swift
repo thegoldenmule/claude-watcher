@@ -143,14 +143,19 @@ private struct PaneBackground: View {
 
 // MARK: - Header
 
-/// `❯ claude sessions` plus a line of colored counts, like a prompt and its output. The
-/// `[pin]`/`[pinned]` control toggles pinning.
+/// `❯ claude sessions` (`❯ agent sessions` once a Codex session is listed) plus a line of
+/// colored counts, like a prompt and its output. The `[pin]`/`[pinned]` control toggles pinning.
 private struct SidebarHeader: View {
     let sessions: [ClaudeSession]
     let isPinned: Bool
     let onTogglePin: () -> Void
 
     @Environment(\.terminalStyle) private var style
+
+    /// "claude", or "agent" once any other kind of session (Codex) is listed.
+    private var noun: String {
+        sessions.allSatisfy { $0.agent == .claude } ? "claude" : "agent"
+    }
 
     private var counts: [SessionStatus: Int] {
         sessions.reduce(into: [:]) { $0[$1.status, default: 0] += 1 }
@@ -160,7 +165,7 @@ private struct SidebarHeader: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 0) {
                 Text(.span("❯ ", style.success, font: style.boldFont)
-                    + .span("claude", font: style.boldFont) + .span(" sessions"))
+                    + .span(noun, font: style.boldFont) + .span(" sessions"))
                 Spacer(minLength: style.cellWidth)
                 PinToggle(isPinned: isPinned, action: onTogglePin)
                 Text(" ")
@@ -205,7 +210,7 @@ private struct EmptyStateView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("no claude code sessions running").foregroundStyle(style.faint)
+            Text("no claude code or codex sessions running").foregroundStyle(style.faint)
             HStack(spacing: 0) {
                 Text("❯ ").foregroundStyle(style.success).font(style.boldFont)
                 TimelineView(.animation(minimumInterval: 0.6, paused: reduceMotion || !panelVisible)) { context in
@@ -218,7 +223,7 @@ private struct EmptyStateView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("No Claude Code sessions running")
+        .accessibilityLabel("No Claude Code or Codex sessions running")
     }
 }
 
@@ -344,6 +349,12 @@ private struct SessionRow: View {
                     Text(tag("stopped", style.idle))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                } else if session.agent == .codex && session.status == .unknown {
+                    // CodexDiscovery couldn't tell this TUI's thread from another's in the same folder.
+                    Text("? thread unknown: another codex shares this folder")
+                        .foregroundStyle(ink(style.faint, faint: true))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
 
                 locationLine
@@ -359,7 +370,9 @@ private struct SessionRow: View {
                 }
 
                 if let tokens = session.contextTokens {
-                    ContextMeter(tokens: tokens, textColor: ink(style.faint, faint: true))
+                    ContextMeter(
+                        tokens: tokens, window: session.effectiveContextWindow,
+                        textColor: ink(style.faint, faint: true))
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -413,12 +426,16 @@ private struct SessionRow: View {
         .span(" \(word) ", style.background, font: style.boldFont, background: color)
     }
 
-    /// `folder (branch)`, like git's `__git_ps1` prompt.
+    /// `folder (branch)`, like git's `__git_ps1` prompt, then ` [codex]` for a Codex session
+    /// and ` [terminal]` for a terminal other than Ghostty.
     private var locationLine: Text {
         let punctuation = ink(style.faint, faint: true)
         var line = AttributedString.span(folderName, ink(style.cyan))
         if let branch = session.branch, !branch.isEmpty {
             line += .span(" (", punctuation) + .span(branch, ink(style.magenta)) + .span(")", punctuation)
+        }
+        if session.agent != .claude {
+            line += .span(" [", punctuation) + .span(session.agent.label, ink(style.blue)) + .span("]", punctuation)
         }
         if case .ghostty = session.terminal {} else {
             line += .span(" [\(Self.terminalName(session.terminal))]", punctuation)
@@ -446,15 +463,17 @@ private struct SessionRow: View {
 }
 
 /// How full the session's context window is: a bar in the level's palette color (green, then
-/// yellow from 50%, red from 75%) and `245k / 1M · 25%`. The fill keeps its color under the
-/// selection highlight, like the status glyph; the track and label follow `textColor`.
+/// yellow from 50%, red from 75%) and `245k / 1M · 25%` (Codex: `120k / 475k · 25%`). The fill
+/// keeps its color under the selection highlight, like the status glyph; the track and label
+/// follow `textColor`.
 private struct ContextMeter: View {
     let tokens: Int
+    let window: Int
     let textColor: Color
 
     @Environment(\.terminalStyle) private var style
 
-    private var fraction: Double { ContextUsage.fraction(tokens) }
+    private var fraction: Double { ContextUsage.fraction(tokens, window: window) }
 
     private var fill: Color {
         switch ContextUsage.level(fraction) {
@@ -467,13 +486,13 @@ private struct ContextMeter: View {
     var body: some View {
         // Narrow panes drop the token counts, then the label.
         ViewThatFits(in: .horizontal) {
-            meter(label: ContextUsage.label(tokens), reserve: 16)
-            meter(label: "\(ContextUsage.percent(tokens))%", reserve: 4)
+            meter(label: ContextUsage.label(tokens, window: window), reserve: 18)
+            meter(label: "\(ContextUsage.percent(tokens, window: window))%", reserve: 4)
             bar
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Context \(ContextUsage.percent(tokens)) percent full, "
-            + "\(ContextUsage.shortTokens(tokens)) of 1M tokens")
+        .accessibilityLabel("Context \(ContextUsage.percent(tokens, window: window)) percent full, "
+            + "\(ContextUsage.shortTokens(tokens)) of \(ContextUsage.windowLabel(window)) tokens")
     }
 
     /// The label is right-aligned in a fixed `reserve` of cells, so every row's bar is as long.

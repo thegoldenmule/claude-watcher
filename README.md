@@ -3,7 +3,8 @@
 # ClaudeWatcher
 
 A macOS auto-hiding left-edge sidebar that lists your running [Claude Code](https://claude.com/claude-code)
-sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/desktops.
+and [Codex CLI](https://github.com/openai/codex) sessions and jumps to their Ghostty / Terminal.app
+tab, even across Spaces/desktops.
 
 <img src="docs/screenshot.png" width="299" alt="The ClaudeWatcher sidebar listing Claude Code sessions with their status, folder and git branch">
 
@@ -11,7 +12,7 @@ sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/deskt
 
 - Auto-hiding bar on the left screen edge, revealed by moving the pointer there (like the Dock).
 - Each row shows the session title, folder, git branch and status (working / waiting for you / idle);
-  sessions waiting for input float to the top.
+  sessions waiting for input float to the top. Codex sessions are tagged `[codex]`.
 - Click a row to focus its exact Ghostty or Terminal.app tab, switching Spaces if needed.
   Other terminals: the hosting app is brought to the front.
 - Drag the sidebar's right edge to resize it (double-click to reset); the width is kept.
@@ -19,9 +20,10 @@ sessions and jumps to their Ghostty / Terminal.app tab, even across Spaces/deskt
 - Menu bar: Pin Sidebar, Pause Edge Reveal (15 min / 1 h / 4 h / until resumed; while paused
   the item shows until when, with Resume Now, and the icon turns to a moon), Settings, Quit.
   Settings holds the terminal highlight and pulse toggles, Reset Sidebar Width, Launch at Login,
-  the Claude Code Hook (status / install / update / uninstall), and the app's version with
-  Check for Updates (checked against GitHub releases at launch and twice a day). Items that need
-  you also appear at the top level: Install/Update Claude Code Hook, Approve Launch at Login,
+  the Claude Code and Codex hooks (status / install / update / uninstall), and the app's version
+  with Check for Updates (checked against GitHub releases at launch and twice a day). Items that
+  need you also appear at the top level: Install/Update Claude Code Hook (and Codex Hook, when
+  Codex is installed), Approve Launch at Login,
   errors, and "Update Available" (opens the release page; nothing is downloaded).
 - Demo mode: `open build/ClaudeWatcher.app --args --demo`.
 
@@ -65,10 +67,23 @@ records each session's terminal id and tty to `~/Library/Application Support/Cla
 It never blocks Claude and only affects sessions started after install. Without it, Ghostty
 tabs are still found on first click by a quick probe.
 
+## Optional Codex hook
+
+Codex never records "waiting for approval" on disk, so **Install Codex Hook** adds a hook to
+`$CODEX_HOME/hooks.json` (default `~/.codex`, with a backup) that records each session's last
+event to `~/Library/Application Support/ClaudeWatcher/codex-hook-state/`. Codex runs a new hook
+only after you approve it: the next time you start `codex` it asks you to review hooks (choose
+Trust). Settings shows "Codex Hook: Approve in Codex" until then. Without the hook, Codex
+sessions still show working / idle, and in Ghostty 1.4+ "waiting" too (read from the terminal
+title once Automation for Ghostty has been granted).
+
 ## How it works
 
-Sessions come from `~/.claude/sessions/` and their transcripts; Ghostty tabs are matched by an
-OSC 7 probe (a nonce cwd written to the session's tty) via Ghostty's AppleScript.
+Claude Code sessions come from `~/.claude/sessions/` and their transcripts. Codex sessions are
+found from running `codex` processes, matched to their threads in Codex's state database
+(`~/.codex/state_*.sqlite`, read-only) and read from their rollout files. Ghostty tabs are
+matched by tty (Ghostty 1.4+) or an OSC 7 probe (a nonce cwd written to the session's tty) via
+Ghostty's AppleScript.
 
 ## Releasing
 

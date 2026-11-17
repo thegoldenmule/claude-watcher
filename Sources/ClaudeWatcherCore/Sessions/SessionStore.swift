@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Owns the live list of Claude Code sessions.
+/// Owns the live list of Claude Code and Codex CLI sessions.
 ///
 /// Change notification:
 /// - vnode sources on `~/.claude/sessions` and the hook-state directory catch files being
@@ -12,6 +12,8 @@ import Observation
 /// - a `pollInterval` poll is the safety net (process exit, transcripts, missing directories),
 ///   and the only source for subagents: running agents append to their jsonl many times a
 ///   second, so watching them would rescan constantly; a poll's lag is fine for that list.
+/// Codex sessions (`CodexDiscovery`, optional) have no registry to watch: the poll finds them,
+/// and the Codex hook-state directory is watched for its `PermissionRequest` events.
 /// Discovery runs off the main actor; `sessions` is only assigned when it changes.
 @MainActor
 @Observable
@@ -19,6 +21,7 @@ public final class SessionStore {
     public private(set) var sessions: [ClaudeSession] = []
 
     @ObservationIgnored public let discovery: SessionDiscovery
+    @ObservationIgnored public let codex: CodexDiscovery?
     @ObservationIgnored private let pollInterval: Duration
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     /// path -> source, for the watched directories and registry files.
@@ -31,10 +34,12 @@ public final class SessionStore {
         claudeHome: URL,
         hookStateDirectory: URL? = nil,
         inspector: any ProcessInspecting = SystemProcessInspector(),
+        codex: CodexDiscovery? = nil,
         pollInterval: Duration = .seconds(2)
     ) {
         self.discovery = SessionDiscovery(
             claudeHome: claudeHome, hookStateDirectory: hookStateDirectory, inspector: inspector)
+        self.codex = codex
         self.pollInterval = pollInterval
     }
 
@@ -72,8 +77,8 @@ public final class SessionStore {
             return
         }
         scanning = true
-        Task { [discovery] in
-            let result = await discovery.scan()
+        Task { [discovery, codex] in
+            let result = await Self.scanAll(discovery, codex)
             self.apply(result)
             self.scanning = false
             if self.rescanPending {
@@ -85,8 +90,16 @@ public final class SessionStore {
 
     /// Runs a discovery pass and waits for it to be applied (useful for tests and tools).
     public func reload() async {
-        let result = await discovery.scan()
+        let result = await Self.scanAll(discovery, codex)
         apply(result)
+    }
+
+    /// Both sources, scanned concurrently, merged in start order.
+    nonisolated static func scanAll(_ claude: SessionDiscovery, _ codex: CodexDiscovery?) async -> [ClaudeSession] {
+        async let claudeSessions = claude.scan()
+        let codexSessions = await codex?.scan() ?? []
+        let merged = await claudeSessions + codexSessions
+        return codexSessions.isEmpty ? merged : SessionDiscovery.finalize(merged)
     }
 
     private func apply(_ result: [ClaudeSession]) {
@@ -98,6 +111,7 @@ public final class SessionStore {
 
     private var watchedDirectories: [URL] {
         [discovery.sessionsDirectory] + (discovery.hookStateDirectory.map { [$0] } ?? [])
+            + (codex?.hookStateDirectory.map { [$0] } ?? [])
     }
 
     private func installDirectoryWatchers() {
@@ -108,7 +122,7 @@ public final class SessionStore {
     private func syncRegistryFileWatchers() {
         guard running else { return }
         let dirPaths = Set(watchedDirectories.map(\.path))
-        let wanted = Set(sessions.map {
+        let wanted = Set(sessions.filter { $0.agent == .claude }.map {
             discovery.sessionsDirectory.appendingPathComponent("\($0.pid).json").path
         })
         for (path, source) in sources where !dirPaths.contains(path) && !wanted.contains(path) {

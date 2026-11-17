@@ -24,6 +24,9 @@ struct ClaudeWatcherApp: App {
                 if let title = menu.hookInstallTitle {
                     Button("\(title == "Install Hook" ? "Install" : "Update") Claude Code Hook") { menu.installHook() }
                 }
+                if menu.codexHookNeedsAttention, let title = menu.codexHookInstallTitle {
+                    Button("\(title == "Install Hook" ? "Install" : "Update") Codex Hook") { menu.installCodexHook() }
+                }
                 if menu.launchAtLoginStatus == .requiresApproval {
                     Button("Approve Launch at Login…") { menu.openLoginItemsSettings() }
                 }
@@ -51,7 +54,8 @@ struct ClaudeWatcherApp: App {
     private var needsAttention: Bool {
         let menu = appDelegate.menu
         if case .available = appDelegate.updates.state { return true }
-        return menu.hookInstallTitle != nil || menu.launchAtLoginStatus == .requiresApproval || menu.lastError != nil
+        return menu.hookInstallTitle != nil || menu.codexHookNeedsAttention
+            || menu.launchAtLoginStatus == .requiresApproval || menu.lastError != nil
     }
 
     /// One item either way: "Pause Edge Reveal" to pause for a while, or, while paused, its
@@ -73,7 +77,7 @@ struct ClaudeWatcherApp: App {
     }
 
     /// Everything that's set once and rarely touched: terminal effects, sidebar width, login
-    /// item, the hook, and the version with its update check.
+    /// item, the Claude Code and Codex hooks, and the version with its update check.
     private var settingsMenu: some View {
         let menu = appDelegate.menu
         return Menu("Settings") {
@@ -103,6 +107,17 @@ struct ClaudeWatcherApp: App {
             }
             if menu.canUninstallHook {
                 Button("Uninstall Hook") { menu.uninstallHook() }
+            }
+
+            if menu.codexPresent || menu.canUninstallCodexHook {
+                Divider()
+                Text(menu.codexHookStatusText)
+                if let title = menu.codexHookInstallTitle {
+                    Button(title) { menu.installCodexHook() }
+                }
+                if menu.canUninstallCodexHook {
+                    Button("Uninstall Codex Hook") { menu.uninstallCodexHook() }
+                }
             }
 
             Divider()

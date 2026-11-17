@@ -1,7 +1,8 @@
 import Foundation
 
 /// How full a session's context window is. Claude Code's window is 1M tokens; transcripts don't
-/// record it, so it's assumed.
+/// record it, so it's assumed (`window`). Codex records its window per session
+/// (`ClaudeSession.contextWindow`).
 public enum ContextUsage {
     public static let window = 1_000_000
 
@@ -38,7 +39,11 @@ public enum ContextUsage {
 
     /// "245k / 1M · 25%". A round window drops the decimal ("1M", not "1.0M").
     public static func label(_ tokens: Int, window: Int = window) -> String {
-        let size = window > 0 && window % 1_000_000 == 0 ? "\(window / 1_000_000)M" : shortTokens(window)
-        return "\(shortTokens(tokens)) / \(size) · \(percent(tokens, window: window))%"
+        "\(shortTokens(tokens)) / \(windowLabel(window)) · \(percent(tokens, window: window))%"
+    }
+
+    /// "1M", "475k".
+    public static func windowLabel(_ window: Int) -> String {
+        window > 0 && window % 1_000_000 == 0 ? "\(window / 1_000_000)M" : shortTokens(window)
     }
 }

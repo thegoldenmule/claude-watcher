@@ -246,11 +246,17 @@ private let blue = GhosttyColor(0x202040)
 }
 
 @Test func hoverAutoResetsAfterCap() async throws {
-    let f = Fixture(hoverCap: .milliseconds(150))
+    let cap = Duration.milliseconds(150)
+    let f = Fixture(hoverCap: cap)
     defer { f.cleanup() }
+    let clock = ContinuousClock()
+    let hover = clock.now
     f.highlighter.beginHover(session(1), tint: red)
     try await f.idle()
-    #expect(f.recorder.ops == [.tint("/dev/ttys91", "#402020")])
+    // Still tinted, unless a loaded run got here after the cap already fired.
+    if clock.now - hover < cap - .milliseconds(30) {
+        #expect(f.recorder.ops == [.tint("/dev/ttys91", "#402020")])
+    }
     try await Task.sleep(for: .milliseconds(500))
     try await f.idle()
     #expect(f.recorder.ops == [.tint("/dev/ttys91", "#402020"), .reset("/dev/ttys91")])
@@ -265,6 +271,7 @@ private let blue = GhosttyColor(0x202040)
     let f = Fixture(hoverCap: cap)
     defer { f.cleanup() }
     let clock = ContinuousClock()
+    let firstHover = clock.now
     f.highlighter.beginHover(session(1), tint: red)
     try await f.idle()
     try await Task.sleep(for: .milliseconds(250))
@@ -273,8 +280,9 @@ private let blue = GhosttyColor(0x202040)
     try await Task.sleep(for: .milliseconds(250))
     try await f.idle()
     // Past the first hover's cap; still tinted if the re-hover's cap hasn't run out yet (only
-    // checkable when the run wasn't delayed past it).
-    if clock.now - rehover < cap - .milliseconds(50) {
+    // checkable when the run wasn't delayed past either: a late first sleep lets the first cap
+    // fire before the re-hover, a late second one lets the re-hover's cap fire too).
+    if rehover - firstHover < cap - .milliseconds(50), clock.now - rehover < cap - .milliseconds(50) {
         #expect(f.recorder.ops == [.tint("/dev/ttys91", "#402020")])
     }
     try await Task.sleep(for: .milliseconds(600))

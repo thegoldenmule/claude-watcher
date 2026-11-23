@@ -512,3 +512,13 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   pass. A clock going backwards re-anchors these waits at `now` (never longer than set).
   `URLError.cancelled` is a network error unless the poll's task was cancelled. Not logged in -> `.unavailable`, snapshot cleared (meter hidden); other failures ->
   `.stale` with a snapshot, `.error` without.
+- Usage known gaps (reviewed, accepted): Claude: a usage key present with a renamed inner schema
+  parses as "no windows" (meter hidden, no error line); a `.credentials.json` read error counts as
+  no file; after unlocking a locked keychain the meter can take up to 30 min (Keychain backoff)
+  to return; with `CLAUDE_CONFIG_DIR=~/.claude` plus a leftover plain item of another account,
+  freshest-token-wins can switch accounts; `CLAUDE_SECURESTORAGE_CONFIG_DIR` (overrides the
+  suffixed service name) isn't handled. Codex: in-place rollout rewrites aren't detected (never
+  seen); the newest `state_N.sqlite` is trusted even if half-migrated; only `limit_id`
+  "codex"/null is read; a window without `resets_at` never shows as reset. UI: menu "resets in"
+  can read up to a minute long (minute-truncated clock); the coloured (warning/critical) status
+  item draws in `labelColor`, unverified on macOS 26's wallpaper-tinted menu bar.

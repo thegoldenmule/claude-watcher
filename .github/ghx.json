@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "components": {
+    "docs": {
+      "paths": [
+        "docs/**"
+      ]
+    },
+    "hooks": {
+      "paths": [
+        "hooks/**"
+      ]
+    },
+    "resources": {
+      "paths": [
+        "Resources/**"
+      ]
+    },
+    "scripts": {
+      "paths": [
+        "scripts/**"
+      ]
+    },
+    "sources": {
+      "paths": [
+        "Sources/**"
+      ]
+    },
+    "tests": {
+      "paths": [
+        "Tests/**"
+      ]
+    }
+  },
+  "merge": {
+    "method": "squash",
+    "allowedMethods": [
+      "squash"
+    ],
+    "deleteBranch": true
+  },
+  "ci": {
+    "expected": [],
+    "keySteps": [],
+    "ignore": []
+  }
+}

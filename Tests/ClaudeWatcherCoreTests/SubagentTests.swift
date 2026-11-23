@@ -242,11 +242,11 @@ private final class AgentFixture {
 }
 
 @Test func idleSessionWithRunningAgentsIsBusy() {
-    #expect(SessionDiscovery.status(.idle, runningAgents: 1) == .busy)
-    #expect(SessionDiscovery.status(.idle, runningAgents: 0) == .idle)
-    #expect(SessionDiscovery.status(.waiting, runningAgents: 2) == .waiting)
-    #expect(SessionDiscovery.status(.unknown, runningAgents: 2) == .unknown)
-    #expect(SessionDiscovery.status(.busy, runningAgents: 0) == .busy)
+    #expect(SessionDiscovery.status(.idle, runningTasks: 1) == .busy)
+    #expect(SessionDiscovery.status(.idle, runningTasks: 0) == .idle)
+    #expect(SessionDiscovery.status(.waiting, runningTasks: 2) == .waiting)
+    #expect(SessionDiscovery.status(.unknown, runningTasks: 2) == .unknown)
+    #expect(SessionDiscovery.status(.busy, runningTasks: 0) == .busy)
 }
 
 @Test func trackerSkipsAgentsWrittenBeforeProcessStart() throws {

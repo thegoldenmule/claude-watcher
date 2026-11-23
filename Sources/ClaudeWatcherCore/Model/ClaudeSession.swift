@@ -34,6 +34,7 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
     public var startedAt: Date
     public var updatedAt: Date
     public var subagents: [SubagentInfo]  // running subagents, pre-order (children follow their parent)
+    public var backgroundShells: [BackgroundShellInfo]  // main conversation's running background shells, by start
     public var contextTokens: Int?        // main conversation's context size at its last reply
     public var contextWindow: Int?        // nil = the agent's default (`ContextUsage.window`)
 
@@ -53,6 +54,7 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
         startedAt: Date,
         updatedAt: Date,
         subagents: [SubagentInfo] = [],
+        backgroundShells: [BackgroundShellInfo] = [],
         contextTokens: Int? = nil,
         contextWindow: Int? = nil,
         terminalCwd: String? = nil
@@ -73,6 +75,7 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
         self.startedAt = startedAt
         self.updatedAt = updatedAt
         self.subagents = subagents
+        self.backgroundShells = backgroundShells
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
     }

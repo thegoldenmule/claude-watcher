@@ -111,6 +111,11 @@ enum DemoMode {
                         label: "Survey NSPanel animation APIs", activity: "WebSearch NSAnimationContext panel",
                         startedAt: ago(0.75), lastActivityAt: ago(0.1), depth: 1),
                 ],
+                backgroundShells: [
+                    BackgroundShellInfo(
+                        id: "demo-1-s1", label: "Wait for CI on PR 42", command: "ghx ci wait 42",
+                        startedAt: ago(6.5)),
+                ],
                 contextTokens: 182_400),
             ClaudeSession(
                 id: "demo-2", pid: 41002, cwd: "\(home)/projects/acme/payments-api",

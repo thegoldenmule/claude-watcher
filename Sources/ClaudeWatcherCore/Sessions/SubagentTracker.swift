@@ -200,13 +200,19 @@ enum SubagentRules {
     /// dequeue/remove lines, agent hand-back messages and status-less (Monitor) events: nil.
     static func parseNotification(_ line: Data) -> (taskID: String, at: Date, parked: Bool)? {
         guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
-              obj["type"] as? String == "queue-operation",
+              let n = notification(obj) else { return nil }
+        return (n.taskID, n.notice.at, n.notice.parked)
+    }
+
+    /// `parseNotification` for an already decoded line.
+    static func notification(_ obj: [String: Any]) -> (taskID: String, notice: SubagentNotice)? {
+        guard obj["type"] as? String == "queue-operation",
               obj["operation"] as? String == "enqueue",
               let content = text(obj["content"]),
               let id = finishedTaskID(in: content),
               let at = (obj["timestamp"] as? String).flatMap(date)
         else { return nil }
-        return (id, at, isParked(content))
+        return (id, SubagentNotice(at: at, parked: isParked(content)))
     }
 
     /// The `<task-id>` of a `<task-notification>` that carries a `<status>`, else nil.
@@ -245,16 +251,9 @@ enum SubagentRules {
 /// and an agent's jsonl is read only when its stat changes (just the appended lines, or a
 /// fresh `tailBytes` tail). Files last written before the session's process started are never
 /// opened (long or resumed sessions keep hundreds of old agents). The parent transcript's
-/// notifications are indexed only once some agent was written recently enough to be running.
+/// notifications come from a `TranscriptTaskIndex`, shared with `backgroundShells`.
 /// Not thread-safe; owned by `SessionDiscovery`.
 final class SubagentTracker {
-    private struct FileStat: Equatable {
-        var inode: UInt64
-        var size: UInt64
-        var mtime: Date
-        var birthtime: Date
-    }
-
     private struct Agent {
         var stat: FileStat
         var startedAt: Date            // birthtime on first sight, floored
@@ -267,17 +266,11 @@ final class SubagentTracker {
         var tail = AgentTail()
     }
 
-    private struct NotificationIndex {
-        var inode: UInt64
-        var consumed: UInt64
-        var times: [String: SubagentNotice]
-    }
-
     private struct State {
         var listingMtime: Date?
         var ids: [String] = []
         var agents: [String: Agent] = [:]
-        var index: NotificationIndex?
+        var index: TranscriptTaskIndex?
     }
 
     let tailBytes: UInt64
@@ -285,18 +278,36 @@ final class SubagentTracker {
     let parkedStaleAfter: TimeInterval
     /// Chunk size for indexing the parent transcript.
     let chunkBytes: Int
+    /// Backstop for a background shell whose end was never recorded.
+    let shellStaleAfter: TimeInterval
     private var states: [String: State] = [:]
 
     init(tailBytes: UInt64 = 64 * 1024, staleAfter: TimeInterval = 10 * 60,
-         parkedStaleAfter: TimeInterval = SubagentRules.defaultParkedStaleAfter, chunkBytes: Int = 1024 * 1024) {
+         parkedStaleAfter: TimeInterval = SubagentRules.defaultParkedStaleAfter, chunkBytes: Int = 1024 * 1024,
+         shellStaleAfter: TimeInterval = SubagentRules.defaultParkedStaleAfter) {
         self.tailBytes = tailBytes
         self.staleAfter = staleAfter
         self.parkedStaleAfter = parkedStaleAfter
         self.chunkBytes = chunkBytes
+        self.shellStaleAfter = shellStaleAfter
     }
 
     func forget(except transcriptPaths: Set<String>) {
         states = states.filter { transcriptPaths.contains($0.key) }
+    }
+
+    /// The background shells the main conversation of the session whose transcript is
+    /// `transcript` is running, by start time (see `TranscriptTaskIndex`,
+    /// `BackgroundShellRules.running`). Indexes the transcript on first sight, then reads only
+    /// appended lines.
+    func backgroundShells(transcript: URL, processStart: Date, parentStatus: SessionStatus,
+                          now: Date = Date()) -> [BackgroundShellInfo] {
+        var state = states[transcript.path] ?? State()
+        defer { states[transcript.path] = state }
+        state.index = TranscriptTaskIndex.updated(state.index, path: transcript.path, chunkBytes: chunkBytes)
+        return BackgroundShellRules.running(
+            state.index?.shells ?? [:], processStart: processStart, parentStatus: parentStatus,
+            now: now, staleAfter: shellStaleAfter)
     }
 
     /// The running subagents of the session whose transcript is `transcript`, in pre-order:
@@ -308,8 +319,8 @@ final class SubagentTracker {
         var state = states[transcript.path] ?? State()
         defer { states[transcript.path] = state }
 
-        guard let dirStat = Self.fileStat(dir.path) else {
-            state = State()
+        guard let dirStat = FileStat(path: dir.path) else {
+            state = State(index: state.index)  // the index also serves `backgroundShells`
             return []
         }
         if state.listingMtime != dirStat.mtime {
@@ -323,7 +334,7 @@ final class SubagentTracker {
         var agents: [String: Agent] = [:]
         for id in state.ids {
             let base = dir.appendingPathComponent("agent-\(id)").path
-            guard let stat = Self.fileStat(base + ".jsonl"), stat.mtime >= cutoff else { continue }
+            guard let stat = FileStat(path: base + ".jsonl"), stat.mtime >= cutoff else { continue }
             var agent: Agent
             if let cached = state.agents[id], cached.stat.inode == stat.inode {
                 agent = cached
@@ -331,7 +342,7 @@ final class SubagentTracker {
             } else {
                 agent = Agent(stat: stat, startedAt: Self.floor(stat.birthtime))
             }
-            let metaStat = Self.fileStat(base + ".meta.json")
+            let metaStat = FileStat(path: base + ".meta.json")
             if metaStat != agent.metaStat {
                 agent.metaStat = metaStat
                 agent.meta = metaStat == nil ? nil
@@ -370,8 +381,8 @@ final class SubagentTracker {
         // 3. The parent transcript's notifications. Needed even for a tail that ended its turn:
         // a parked notice there keeps it running.
         if !undecided.isEmpty {
-            updateIndex(&state, transcript: transcript.path)
-            notices.merge(state.index?.times ?? [:], uniquingKeysWith: SubagentNotice.latest)
+            state.index = TranscriptTaskIndex.updated(state.index, path: transcript.path, chunkBytes: chunkBytes)
+            notices.merge(state.index?.notices ?? [:], uniquingKeysWith: SubagentNotice.latest)
             undecided = undecided.filter { !finished($0, notice: notices[$0]) }
         }
         state.agents = agents
@@ -457,7 +468,7 @@ final class SubagentTracker {
         if let old = agent.tailStat, old.inode == stat.inode, stat.size >= agent.consumed,
            stat.size - agent.consumed <= tailBytes {
             if stat.size > agent.consumed,
-               let data = Self.read(handle, offset: agent.consumed, length: stat.size - agent.consumed),
+               let data = FileStat.read(handle, offset: agent.consumed, length: stat.size - agent.consumed),
                let lastNL = data.lastIndex(of: 0x0A) {
                 let end = data.index(after: lastNL)
                 AgentTail.apply(data.subdata(in: data.startIndex..<end), to: &agent.tail)
@@ -468,7 +479,7 @@ final class SubagentTracker {
         }
         var tail = agent.tailStat?.inode == stat.inode ? agent.tail : AgentTail()
         let start = stat.size > tailBytes ? stat.size - tailBytes : 0
-        guard var data = Self.read(handle, offset: start, length: stat.size - start) else { return }
+        guard var data = FileStat.read(handle, offset: start, length: stat.size - start) else { return }
         var lineStart = start
         if start > 0 {
             if let nl = data.firstIndex(of: 0x0A) {
@@ -493,83 +504,7 @@ final class SubagentTracker {
         agent.tailStat = stat
     }
 
-    // MARK: - Parent transcript notifications
-
-    private let queueMarker = Data("\"queue-operation\"".utf8)
-    private let taskIDMarker = Data("<task-id>".utf8)
-
-    /// Indexes the transcript's enqueue notifications: the whole file once (streamed in
-    /// `chunkBytes` chunks, decoding only lines with both markers), then appended lines.
-    /// A new inode or a shrunken file is re-indexed from scratch.
-    private func updateIndex(_ state: inout State, transcript path: String) {
-        guard let stat = Self.fileStat(path) else {
-            state.index = nil
-            return
-        }
-        var index = state.index ?? NotificationIndex(inode: stat.inode, consumed: 0, times: [:])
-        if index.inode != stat.inode || stat.size < index.consumed {
-            index = NotificationIndex(inode: stat.inode, consumed: 0, times: [:])
-        }
-        defer { state.index = index }
-        guard stat.size > index.consumed, let handle = FileHandle(forReadingAtPath: path) else { return }
-        defer { try? handle.close() }
-        var offset = index.consumed
-        var carry = Data()  // the partial line at the end of the previous chunk
-        while offset < stat.size {
-            let length = min(UInt64(chunkBytes), stat.size - offset)
-            guard let chunk = Self.read(handle, offset: offset, length: length), !chunk.isEmpty else { break }
-            offset += UInt64(chunk.count)
-            var buffer = carry
-            buffer.append(chunk)
-            guard let lastNL = buffer.lastIndex(of: 0x0A) else {
-                carry = buffer
-                continue
-            }
-            let end = buffer.index(after: lastNL)
-            Self.forEachLine(in: buffer[buffer.startIndex..<end], containing: queueMarker) { line in
-                guard line.range(of: taskIDMarker) != nil,
-                      let (id, at, parked) = SubagentRules.parseNotification(Data(line)) else { return }
-                let notice = SubagentNotice(at: at, parked: parked)
-                index.times[id] = index.times[id].map { .latest($0, notice) } ?? notice
-            }
-            index.consumed += UInt64(end - buffer.startIndex)
-            carry = buffer.subdata(in: end..<buffer.endIndex)
-        }
-    }
-
-    /// Calls `body` once per line of `buffer` holding `marker`, found with a byte search so the
-    /// rest of the buffer is never split or decoded.
-    static func forEachLine(in buffer: Data, containing marker: Data, _ body: (Data) -> Void) {
-        var from = buffer.startIndex
-        while from < buffer.endIndex, let hit = buffer.range(of: marker, in: from..<buffer.endIndex) {
-            let lineStart = buffer[buffer.startIndex..<hit.lowerBound].lastIndex(of: 0x0A)
-                .map { buffer.index(after: $0) } ?? buffer.startIndex
-            let lineEnd = buffer[hit.upperBound...].firstIndex(of: 0x0A) ?? buffer.endIndex
-            body(buffer.subdata(in: lineStart..<lineEnd))
-            from = lineEnd
-        }
-    }
-
     // MARK: - IO
-
-    private static func fileStat(_ path: String) -> FileStat? {
-        var st = stat()
-        guard stat(path, &st) == 0 else { return nil }
-        func date(_ ts: timespec) -> Date {
-            Date(timeIntervalSince1970: TimeInterval(ts.tv_sec) + TimeInterval(ts.tv_nsec) / 1_000_000_000)
-        }
-        return FileStat(inode: UInt64(st.st_ino), size: UInt64(max(0, st.st_size)),
-                        mtime: date(st.st_mtimespec), birthtime: date(st.st_birthtimespec))
-    }
-
-    private static func read(_ handle: FileHandle, offset: UInt64, length: UInt64) -> Data? {
-        do {
-            try handle.seek(toOffset: offset)
-            return try handle.read(upToCount: Int(length)) ?? Data()
-        } catch {
-            return nil
-        }
-    }
 
     private static func floor(_ date: Date) -> Date {
         Date(timeIntervalSince1970: date.timeIntervalSince1970.rounded(.down))

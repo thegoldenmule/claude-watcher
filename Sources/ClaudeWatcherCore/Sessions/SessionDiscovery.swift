@@ -178,9 +178,12 @@ public actor SessionDiscovery {
 
             var info: TranscriptInfo?
             var agents: [SubagentInfo] = []
+            var shells: [BackgroundShellInfo] = []
             if let url = transcriptURL(for: record) {
                 info = transcripts.info(at: url)
                 if info != nil { liveTranscriptPaths.insert(url.path) }
+                shells = subagents.backgroundShells(
+                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus)
                 agents = subagents.running(
                     transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus)
                 liveSubagentPaths.insert(url.path)
@@ -205,7 +208,7 @@ public actor SessionDiscovery {
                 title: title,
                 branch: branch,
                 lastPrompt: lastPrompt,
-                status: Self.status(record.sessionStatus, runningAgents: agents.count),
+                status: Self.status(record.sessionStatus, runningTasks: agents.count + shells.count),
                 waitingFor: waitingFor,
                 tty: process.tty,
                 terminal: terminal,
@@ -213,6 +216,7 @@ public actor SessionDiscovery {
                 startedAt: startedAt,
                 updatedAt: record.updatedAtDate ?? startedAt,
                 subagents: agents,
+                backgroundShells: shells,
                 contextTokens: info?.contextTokens,
                 terminalCwd: terminalRecord.cwd != record.cwd ? terminalRecord.cwd : nil))
         }
@@ -229,11 +233,12 @@ public actor SessionDiscovery {
         return Self.finalize(sessions)
     }
 
-    /// The registry's status, except that an idle session with running subagents is busy: the
-    /// registry goes idle once the main turn ends even while an agent that stopped with background
-    /// work of its own (e.g. a CI wait) is still alive.
-    public static func status(_ registry: SessionStatus, runningAgents: Int) -> SessionStatus {
-        registry == .idle && runningAgents > 0 ? .busy : registry
+    /// The registry's status, except that an idle session with running subagents or background
+    /// shells is busy: the registry goes idle once the main turn ends, even while an agent that
+    /// stopped with background work of its own, or a background command the session waits on
+    /// (e.g. a CI wait), is still running. Claude Code resumes the session when it ends.
+    public static func status(_ registry: SessionStatus, runningTasks: Int) -> SessionStatus {
+        registry == .idle && runningTasks > 0 ? .busy : registry
     }
 
     /// Stable order (startedAt, then pid) and unique ids: if two processes report the

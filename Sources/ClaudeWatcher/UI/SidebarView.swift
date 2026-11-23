@@ -16,7 +16,7 @@ struct SidebarView: View {
     /// Sessions whose subagent tree is hidden; the others show theirs.
     var collapsedSessionIDs: Set<String> = []
     let onSelect: (ClaudeSession) -> Void
-    /// A row's `▸ N agents` line was clicked.
+    /// A row's `▸ N agents` / `▸ N shells` line was clicked.
     var onToggleExpanded: (_ sessionID: String) -> Void = { _ in }
     /// The header's `[pin]`/`[pinned]` control was clicked.
     var onTogglePin: () -> Void = {}
@@ -196,6 +196,8 @@ private struct SidebarHeader: View {
         if unknown > 0 { parts.append(part("? \(unknown) unknown", style.faint)) }
         let agents = sessions.reduce(0) { $0 + $1.subagents.count }
         if agents > 0 { parts.append(part("⑂ \(agents) agent\(agents == 1 ? "" : "s")", style.cyan)) }
+        let shells = sessions.reduce(0) { $0 + $1.backgroundShells.count }
+        if shells > 0 { parts.append(part("$ \(shells) shell\(shells == 1 ? "" : "s")", style.green)) }
         return Text(parts.dropFirst().reduce(parts.first ?? "") { $0 + .span("  ") + $1 })
     }
 }
@@ -229,8 +231,8 @@ private struct EmptyStateView: View {
 
 // MARK: - Row
 
-/// One session's block: its lines, then (with running subagents) a `▸ N agents running` line
-/// that toggles the agent tree below it. These are sibling buttons, never nested: the session's
+/// One session's block: its lines, then (with running subagents or background shells) a
+/// `▸ N agents · N shells running` line that toggles the tree of both below it. These are sibling buttons, never nested: the session's
 /// lines and the tree focus the session, the toggle line only expands/collapses. Hover, the
 /// selection highlight and the pane tint cover the whole block.
 private struct SessionRow: View {
@@ -271,7 +273,9 @@ private struct SessionRow: View {
     }
 
     private var agents: [SubagentInfo] { session.subagents }
-    private var showsTree: Bool { isExpanded && !agents.isEmpty }
+    private var shells: [BackgroundShellInfo] { session.backgroundShells }
+    private var hasTasks: Bool { !agents.isEmpty || !shells.isEmpty }
+    private var showsTree: Bool { isExpanded && hasTasks }
     private var rowPadding: CGFloat { style.lineHeight * 0.35 }
     /// The agent tree hangs off the toggle line: its branches start under the agent count, past
     /// the `▸ `, so the tree reads as nested inside the session.
@@ -283,12 +287,12 @@ private struct SessionRow: View {
                 sessionLines
                     .padding(.horizontal, style.paddingX)
                     .padding(.top, rowPadding)
-                    .padding(.bottom, agents.isEmpty ? rowPadding : 0)
+                    .padding(.bottom, hasTasks ? 0 : rowPadding)
                     .contentShape(.rect)
             }
             .buttonStyle(RowButtonStyle())
 
-            if !agents.isEmpty {
+            if hasTasks {
                 Button(action: onToggleExpanded) {
                     agentsToggle
                         .padding(.leading, style.paddingX + style.gutterWidth)
@@ -298,7 +302,7 @@ private struct SessionRow: View {
                         .contentShape(.rect)
                 }
                 .buttonStyle(RowButtonStyle())
-                .accessibilityLabel("\(isExpanded ? "Hide" : "Show") \(agentCount)")
+                .accessibilityLabel("\(isExpanded ? "Hide" : "Show") \(taskCounts.map(\.text).joined(separator: ", "))")
             }
 
             if showsTree {
@@ -379,43 +383,96 @@ private struct SessionRow: View {
         }
     }
 
-    private var agentCount: String { "\(agents.count) agent\(agents.count == 1 ? "" : "s")" }
+    /// "2 agents", "1 shell": the non-zero counts, in the toggle line's colors.
+    private var taskCounts: [(text: String, color: Color)] {
+        var counts: [(String, Color)] = []
+        if !agents.isEmpty { counts.append(("\(agents.count) agent\(agents.count == 1 ? "" : "s")", style.cyan)) }
+        if !shells.isEmpty { counts.append(("\(shells.count) shell\(shells.count == 1 ? "" : "s")", style.green)) }
+        return counts
+    }
 
-    /// `▸ 2 agents running`, `▾` while the tree is open.
+    /// `▸ 2 agents · 1 shell running`, `▾` while the tree is open.
     private var agentsToggle: some View {
-        Text(.span(isExpanded ? "▾ " : "▸ ", ink(style.foreground))
-            + .span(agentCount, ink(style.cyan)) + .span(" running", ink(style.faint, faint: true)))
+        let guide = ink(style.faint, faint: true)
+        var text = AttributedString.span(isExpanded ? "▾ " : "▸ ", ink(style.foreground))
+        for (i, count) in taskCounts.enumerated() {
+            if i > 0 { text += .span(" · ", guide) }
+            text += .span(count.text, ink(count.color))
+        }
+        return Text(text + .span(" running", guide))
             .lineLimit(1)
             .truncationMode(.tail)
     }
 
+    /// The tree's entries: the agents in pre-order, then the session's background shells.
+    private enum TreeEntry {
+        case agent(SubagentInfo)
+        case shell(BackgroundShellInfo)
+
+        var id: String {
+            switch self {
+            case .agent(let a): "agent:\(a.id)"
+            case .shell(let s): "shell:\(s.id)"
+            }
+        }
+        var depth: Int {
+            if case .agent(let a) = self { a.depth } else { 0 }
+        }
+    }
+
+    private struct TreeLine: Identifiable {
+        var entry: TreeEntry
+        var prefix: String
+        var continuation: String
+        var id: String { entry.id }
+    }
+
+    private var treeLines: [TreeLine] {
+        let entries = agents.map(TreeEntry.agent) + shells.map(TreeEntry.shell)
+        return zip(entries, SubagentTree.prefixes(depths: entries.map(\.depth))).map {
+            TreeLine(entry: $0, prefix: $1.prefix, continuation: $1.continuation)
+        }
+    }
+
     /// `├── Explore · find the hook installer    2m`, then the agent's latest action under its
-    /// text. The elapsed times tick while the panel is visible.
+    /// text; `└── shell · Wait for CI    3m`, then `$ ghx ci wait 12`. The elapsed times tick
+    /// while the panel is visible.
     private var agentTree: some View {
         TimelineView(.animation(minimumInterval: 5, paused: !panelVisible)) { context in
             VStack(alignment: .leading, spacing: 0) {
-                ForEach(SubagentTree.lines(agents), id: \.agent.id) { line in
-                    agentLines(line, now: context.date)
+                ForEach(treeLines) { line in
+                    switch line.entry {
+                    case .agent(let agent):
+                        treeEntryLines(line, type: agent.agentType, typeColor: style.cyan, label: agent.label,
+                                  startedAt: agent.startedAt, detail: agent.activity, now: context.date)
+                    case .shell(let shell):
+                        treeEntryLines(line, type: "shell", typeColor: style.green, label: shell.label,
+                                  startedAt: shell.startedAt, detail: shell.command.map { "$ \($0)" },
+                                  now: context.date)
+                    }
                 }
             }
         }
     }
 
-    @ViewBuilder private func agentLines(_ line: SubagentTreeLine, now: Date) -> some View {
+    @ViewBuilder private func treeEntryLines(
+        _ line: TreeLine, type: String, typeColor: Color, label: String, startedAt: Date, detail: String?,
+        now: Date
+    ) -> some View {
         let guide = ink(style.faint, faint: true)
         HStack(spacing: 0) {
-            Text(.span(line.prefix, guide) + .span(line.agent.agentType, ink(style.cyan))
-                + .span(" · ", guide) + .span(line.agent.label, ink(style.foreground)))
+            Text(.span(line.prefix, guide) + .span(type, ink(typeColor))
+                + .span(" · ", guide) + .span(label, ink(style.foreground)))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text(ElapsedFormat.short(now.timeIntervalSince(line.agent.startedAt)))
+            Text(ElapsedFormat.short(now.timeIntervalSince(startedAt)))
                 .foregroundStyle(guide)
                 .fixedSize()
                 .padding(.leading, style.cellWidth)
         }
-        if let activity = line.agent.activity {
-            Text(.span(line.continuation, guide) + .span(activity, guide))
+        if let detail {
+            Text(.span(line.continuation, guide) + .span(detail, guide))
                 .lineLimit(1)
                 .truncationMode(.tail)
         }

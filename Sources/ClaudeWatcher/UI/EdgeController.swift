@@ -47,9 +47,9 @@ final class EdgeController {
     /// Outcome of the last focus attempt that didn't fully succeed; holds the panel open.
     private(set) var notice: FocusNotice?
 
-    /// Sessions whose subagent tree the user collapsed; every other tree is shown. Kept here, not
-    /// in the row: the list is lazy and recycles rows. Not persisted; an id stays while its
-    /// session has no agents, so the tree stays collapsed when new ones start.
+    /// Sessions whose agent/shell tree the user collapsed; every other tree is shown. Kept here,
+    /// not in the row: the list is lazy and recycles rows. Not persisted; an id stays while its
+    /// session has no agents or shells, so the tree stays collapsed when new ones start.
     private(set) var collapsedSessionIDs: Set<String> = DemoMode.previewCollapsedIDs
 
     /// Tint the hovered row's Ghostty pane (persisted; default on).

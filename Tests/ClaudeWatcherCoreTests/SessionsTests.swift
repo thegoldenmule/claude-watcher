@@ -474,6 +474,37 @@ private let transcriptSample = """
     #expect(session.status == .busy)
 }
 
+@Test func discoveryKeepsAnIdleSessionWithABackgroundShellBusy() async throws {
+    let home = try TempHome()
+    let t0 = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 3600).rounded(.down))
+    let slug = SessionDiscovery.projectSlug(for: "/x")
+    try home.write("sessions/100.json", recordJSON(
+        pid: 100, sessionId: "s-100", cwd: "/x", startedAt: t0.timeIntervalSince1970 * 1000,
+        procStart: procStartString(t0), status: "idle"))
+    let now = Date().addingTimeInterval(-5).formatted(.iso8601)
+    let transcript = "projects/\(slug)/s-100.jsonl"
+    try home.write(transcript, transcriptSample + """
+    {"type":"assistant","timestamp":"\(now)","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ghx ci wait 7","description":"Wait for CI","run_in_background":true}}]}}
+    {"type":"user","timestamp":"\(now)","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"Command running in background with ID: bx1."}]},"toolUseResult":{"stdout":"","backgroundTaskId":"bx1"}}
+
+    """)
+    let inspector = FakeInspector(table: [
+        100: ProcessSnapshot(pid: 100, ppid: 1, startTime: t0, executablePath: claudeBinary),
+    ])
+    let discovery = SessionDiscovery(claudeHome: home.url, inspector: inspector)
+    let session = try #require(await discovery.scan().first)
+    #expect(session.backgroundShells.map(\.label) == ["Wait for CI"])
+    #expect(session.status == .busy)
+
+    try home.append(transcript, """
+    {"type":"queue-operation","operation":"enqueue","timestamp":"\(now)","content":"<task-notification>\\n<task-id>bx1</task-id>\\n<status>completed</status>\\n</task-notification>"}
+
+    """)
+    let done = try #require(await discovery.scan().first)
+    #expect(done.backgroundShells.isEmpty)
+    #expect(done.status == .idle)
+}
+
 @Test func discoveryShowsParkedJobActivityInItsOriginalTerminal() async throws {
     let home = try TempHome()
     let terminalStart = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 120).rounded(.down))
@@ -759,6 +790,10 @@ func liveDiscovery() async throws {
             print("LIVE:   \(line.prefix)\(a.id) \(a.agentType) · \(a.label) "
                   + "[\(a.isBackground ? "bg" : "fg"), \(ElapsedFormat.short(Date().timeIntervalSince(a.startedAt)))]"
                   + (a.activity.map { "\n" + "LIVE:   \(line.continuation)  \($0)" } ?? ""))
+        }
+        for shell in s.backgroundShells {
+            print("LIVE:   $ \(shell.id) \(shell.label) [\(ElapsedFormat.short(Date().timeIntervalSince(shell.startedAt)))]"
+                  + (shell.command.map { " $ \($0)" } ?? ""))
         }
     }
     // The tracker on its own, per session with a subagents dir: cold, then cached.

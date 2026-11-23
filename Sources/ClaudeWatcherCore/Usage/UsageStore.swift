@@ -13,8 +13,10 @@ import Observation
 /// Sleep/wake is the caller's job (AppKit lives in the app): `suspend()` on will-sleep cancels
 /// the loops; `resume()` on wake restarts them, each polling at its deadline but no sooner than
 /// `wakeDelay` from now (the network is often not up yet right after wake). That wake hold also
-/// binds `pollOverdue()`. A suspension older than `maxSuspension` (a did-wake that never came)
-/// is ended by the next `pollOverdue()`.
+/// binds `pollOverdue()` until it passes. A suspension that lasted more than `maxSuspension` of
+/// awake time (a did-wake that never came) is ended by the next `pollOverdue()`; it is measured
+/// on `uptime`, which stops while the system sleeps, so a dark wake (Power Nap) during a real
+/// sleep never ends it.
 ///
 /// A loop never sleeps longer than `maxWait` at a time before polling, so a backward wall-clock
 /// jump (deadline suddenly hours away) can't stall a source; sources guard their own backoff.
@@ -34,6 +36,7 @@ public final class UsageStore {
     @ObservationIgnored private let maxWait: TimeInterval
     @ObservationIgnored private let maxSuspension: TimeInterval
     @ObservationIgnored private let clock: @Sendable () -> Date
+    @ObservationIgnored private let uptime: @Sendable () -> TimeInterval
     @ObservationIgnored private var loops: [AgentKind: Task<Void, Never>] = [:]
     /// When each source wants its next poll; absent = now.
     @ObservationIgnored private var deadlines: [AgentKind: Date] = [:]
@@ -42,8 +45,8 @@ public final class UsageStore {
     /// Bumped by every loop (re)start, so a superseded loop drops its result.
     @ObservationIgnored private var generations: [AgentKind: Int] = [:]
     @ObservationIgnored private var isSuspended = false
-    /// When `suspend()` ran; nil unless suspended.
-    @ObservationIgnored private var suspendedAt: Date?
+    /// `uptime()` when `suspend()` ran; nil unless suspended.
+    @ObservationIgnored private var suspendedAt: TimeInterval?
     /// No poll before this after a `resume()` (the network may still be down); cleared by
     /// `start`/`stop`.
     @ObservationIgnored private var wakeHoldUntil: Date?
@@ -53,11 +56,13 @@ public final class UsageStore {
     ///   - minimumInterval: floor for a source's `nextPollIn`, so a source can't spin.
     ///   - wakeDelay: seconds after `resume()` before any poll.
     ///   - maxWait: longest a loop sleeps before polling (caps a backward wall-clock jump).
-    ///   - maxSuspension: a suspension older than this is ended by `pollOverdue()`.
+    ///   - maxSuspension: a suspension longer than this (awake time) is ended by `pollOverdue()`.
     ///   - now: the wall clock (injectable for tests).
+    ///   - uptime: seconds of awake time, stopping during system sleep (injectable for tests).
     public init(sources: [any UsageSource], minimumInterval: TimeInterval = 5, wakeDelay: TimeInterval = 5,
                 maxWait: TimeInterval = 3600, maxSuspension: TimeInterval = 300,
-                now: @escaping @Sendable () -> Date = { Date() }) {
+                now: @escaping @Sendable () -> Date = { Date() },
+                uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         var byAgent: [AgentKind: any UsageSource] = [:]
         var order: [AgentKind] = []
         for source in sources where byAgent[source.agent] == nil {
@@ -74,6 +79,7 @@ public final class UsageStore {
         self.maxWait = maxWait
         self.maxSuspension = maxSuspension
         clock = now
+        self.uptime = uptime
     }
 
     /// Starts every source's loop (a source never polled yet polls right away). Idempotent.
@@ -100,7 +106,7 @@ public final class UsageStore {
     public func suspend() {
         guard isRunning, !isSuspended else { return }
         isSuspended = true
-        suspendedAt = clock()
+        suspendedAt = uptime()
         cancelLoops()
     }
 
@@ -124,9 +130,12 @@ public final class UsageStore {
         guard isRunning else { return }
         let now = clock()
         if isSuspended {
-            if let suspendedAt, abs(now.timeIntervalSince(suspendedAt)) > maxSuspension { resume() }
+            if let suspendedAt, uptime() - suspendedAt > maxSuspension { resume() }
             return
         }
+        // Drop a passed hold (or one a backward clock jump left far ahead), so it can't keep
+        // holding back the catch-up.
+        if let hold = wakeHoldUntil, hold <= now || hold.timeIntervalSince(now) > wakeDelay { wakeHoldUntil = nil }
         for agent in agents where !polling.contains(agent) {
             guard var due = deadlines[agent] else { continue }
             if let wakeHoldUntil, wakeHoldUntil > due { due = wakeHoldUntil }

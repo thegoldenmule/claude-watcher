@@ -419,21 +419,39 @@ private final class TestClock: Sendable {
 
 @MainActor @Test func usageStoreEndsASuspensionWithoutAWake() async {
     let clock = TestClock()
+    let awake = TestClock()  // awake time: only what `uptime` sees
     let source = FakeSource(.claude, nextPollIn: 100)
     let store = UsageStore(sources: [source], minimumInterval: 0, wakeDelay: 0, maxSuspension: 300,
-                           now: clock.now)
+                           now: clock.now, uptime: { awake.now().timeIntervalSince1970 })
     defer { store.stop() }
     store.start()
     #expect(await waitUntil { await source.polls == 1 })
     store.suspend()
-    clock.advance(200)  // past the deadline, but a recent suspension: still asleep
+    // A real overnight sleep with a dark wake: the wall clock moved hours, awake time didn't.
+    clock.advance(8 * 3600)
     store.pollOverdue()
     try? await Task.sleep(for: .milliseconds(100))
     #expect(await source.polls == 1)
-    // Suspended for more than `maxSuspension` with no did-wake: the tick resumes polling.
-    clock.advance(200)
+    // Awake but suspended, under `maxSuspension`: still waiting for did-wake.
+    awake.advance(200)
+    store.pollOverdue()
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(await source.polls == 1)
+    // Awake and suspended for more than `maxSuspension` with no did-wake: the tick resumes polling.
+    awake.advance(200)
     store.pollOverdue()
     #expect(await waitUntil { await source.polls == 2 })
+}
+
+@Test func usageMeterLevelFollowsTheRoundedLabel() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    func level(_ percent: Double) -> UsageLevel? {
+        let snapshot = UsageSnapshot(session: UsageWindow(percent: percent, resetsAt: nil), weekly: nil, asOf: now)
+        return UsageDisplay.meter(for: AgentUsage(agent: .claude, snapshot: snapshot, status: .ok), now: now)?.level
+    }
+    #expect(level(79.4) == .normal)
+    #expect(level(79.6) == .warning)   // reads "80%"
+    #expect(level(94.7) == .critical)  // reads "95%"
 }
 
 @MainActor @Test func usageStoreIgnoresDuplicateAgents() async {

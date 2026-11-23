@@ -101,7 +101,7 @@ public enum UsageDisplay {
         guard let (kind, window) = mostConstraining(usage, now: now) else { return nil }
         let percent = window.displayPercent(at: now)
         return UsageMeter(agent: usage.agent, kind: kind, percent: percent,
-                          level: UsageLevel(percent: percent), isStale: isStale(usage.status))
+                          level: UsageLevel(percent: Double(wholePercent(percent))), isStale: isStale(usage.status))
     }
 
     /// The meters to draw, in `agents` order.

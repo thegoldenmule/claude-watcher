@@ -90,22 +90,24 @@ enum CodexRateLimitParser {
 /// Finds the newest plan-limit reading in the Codex home. Not thread-safe: used only on
 /// `CodexUsageSource`'s queue.
 ///
-/// Which rollouts: the state DB's threads ordered by `updated_at` (subagent and helper threads
+/// Which rollouts: the state DB's most recently updated threads (subagent and helper threads
 /// too; a long-lived thread keeps writing to a rollout in an old date directory, so file paths
-/// say nothing). The DB is opened read-only per pass and closed again: a pass every 30 s
-/// doesn't justify holding the WAL open. Per rollout, the last `token_count` with usable
-/// `rate_limits` is found by scanning backward from the end in chunks (bounded), cached by
-/// (inode, size, mtime); a grown file only has its appended bytes scanned.
+/// say nothing), newest possible event first, down to the first one last written no later than
+/// the best reading found: a rollout can't hold an event newer than its last write, which is
+/// the later of the thread's `updated_at` and the file's mtime (Codex doesn't bump `updated_at`
+/// on every write). At most `maxRolloutsToCheck` threads. The DB is opened read-only per pass
+/// and closed again: a pass every 30 s doesn't justify holding the WAL open. Per rollout, the
+/// last `token_count` with usable `rate_limits` is found by scanning backward from the end in
+/// chunks (bounded), cached by (inode, size, mtime) of the descriptor actually read; a grown
+/// file only has its appended bytes scanned.
 final class CodexUsageReader: @unchecked Sendable {
-    /// Rollouts checked per pass (newest `updated_at` first)...
-    static let rolloutsToCheck = 3
-    /// ...or further down this many while none of them had a reading.
+    /// Threads considered per pass (newest `updated_at` first), a cost cap.
     static let maxRolloutsToCheck = 10
 
     let codexHome: URL
     let chunkSize: Int
     let maxScan: Int
-    /// Rollout files opened (tests: an unchanged file must not be re-read).
+    /// Rollout files read (tests: an unchanged file must not be re-read).
     private(set) var fileReads = 0
 
     private struct Entry {
@@ -115,6 +117,11 @@ final class CodexUsageReader: @unchecked Sendable {
         /// End of the last complete line scanned; nil = rescan from the end next time.
         var completeEnd: Int64?
         var reading: CodexRateLimitReading?
+
+        func matches(_ st: stat) -> Bool {
+            inode == UInt64(st.st_ino) && size == Int64(st.st_size)
+                && mtime.tv_sec == st.st_mtimespec.tv_sec && mtime.tv_nsec == st.st_mtimespec.tv_nsec
+        }
     }
 
     private var entries: [String: Entry] = [:]
@@ -130,8 +137,18 @@ final class CodexUsageReader: @unchecked Sendable {
         case unavailable
         /// The DB couldn't be read.
         case failed(String)
-        /// `reading` is the newest found (nil: none); `errors` lists rollouts that couldn't be read.
+        /// `reading` is the newest found (nil: none); `errors` lists rollouts that couldn't be
+        /// read although they may hold a newer reading.
         case scanned(reading: CodexRateLimitReading?, errors: [String])
+    }
+
+    private struct Candidate {
+        var path: String
+        /// The rollout's stat, or why it failed.
+        var info: Result<stat, CodexUsageError>
+        /// Its last write (nil: unknown); no event in it is newer.
+        var lastWrite: Date?
+        var order: Int
     }
 
     /// One pass. Blocking (sqlite + file reads).
@@ -143,42 +160,72 @@ final class CodexUsageReader: @unchecked Sendable {
             entries = [:]
             return .unavailable
         }
-        let paths: [String]
-        switch Self.recentRolloutPaths(dbFile: dbFile, limit: Self.maxRolloutsToCheck) {
+        let threads: [RecentThread]
+        switch Self.recentThreads(dbFile: dbFile, limit: Self.maxRolloutsToCheck) {
         case .failure(let error): return .failed(error.message)
-        case .success(let p): paths = p
+        case .success(let t): threads = t
+        }
+        var seen: Set<String> = []
+        var candidates: [Candidate] = []
+        for thread in threads where seen.insert(thread.path).inserted {
+            var st = stat()
+            if stat(thread.path, &st) == 0 {
+                let mtime = Self.date(st.st_mtimespec)
+                candidates.append(Candidate(path: thread.path, info: .success(st),
+                                            lastWrite: max(thread.updatedAt ?? mtime, mtime), order: candidates.count))
+            } else {
+                let code = errno
+                entries[thread.path] = nil
+                if code == ENOENT || code == ENOTDIR { continue }
+                candidates.append(Candidate(path: thread.path, info: .failure(Self.error(thread.path, code)),
+                                            lastWrite: thread.updatedAt, order: candidates.count))
+            }
+        }
+        // Newest possible event first (unknown first), DB order among equals.
+        candidates.sort {
+            let a = $0.lastWrite ?? .distantFuture, b = $1.lastWrite ?? .distantFuture
+            return a != b ? a > b : $0.order < $1.order
         }
         var best: CodexRateLimitReading?
         var errors: [String] = []
-        var checked = 0
-        var seen: Set<String> = []
-        for path in paths where seen.insert(path).inserted {
-            if checked >= Self.rolloutsToCheck && best != nil { break }
-            switch reading(at: path) {
-            case .missing:
-                continue
-            case .failed(let message):
-                errors.append(message)
-            case .read(let reading):
+        for candidate in candidates {
+            if let best, let lastWrite = candidate.lastWrite, lastWrite <= best.timestamp { break }
+            do {
+                let reading = try reading(at: candidate.path, stat: candidate.info.get())
                 if let reading, best.map({ reading.timestamp > $0.timestamp }) ?? true { best = reading }
+            } catch {
+                errors.append((error as? CodexUsageError)?.message ?? error.localizedDescription)
             }
-            checked += 1
         }
         entries = entries.filter { seen.contains($0.key) }
         return .scanned(reading: best, errors: errors)
     }
 
+    private static func date(_ t: timespec) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(t.tv_sec) + TimeInterval(t.tv_nsec) / 1e9)
+    }
+
+    private static func error(_ path: String, _ code: Int32) -> CodexUsageError {
+        CodexUsageError("\((path as NSString).lastPathComponent): \(String(cString: strerror(code)))")
+    }
+
     // MARK: - State DB
 
+    struct RecentThread: Equatable {
+        var path: String
+        /// `updated_at_ms` (else `updated_at`); nil if neither is a number.
+        var updatedAt: Date?
+    }
+
     static let recentQuery = """
-        SELECT rollout_path FROM threads
-        ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC LIMIT ?1
+        SELECT rollout_path, COALESCE(updated_at_ms, updated_at * 1000) AS updated FROM threads
+        ORDER BY updated DESC LIMIT ?1
         """
     /// Older schemas without the `_ms` columns.
-    static let legacyRecentQuery = "SELECT rollout_path FROM threads ORDER BY updated_at DESC LIMIT ?1"
+    static let legacyRecentQuery = "SELECT rollout_path, updated_at * 1000 FROM threads ORDER BY updated_at DESC LIMIT ?1"
 
-    /// Rollout paths of the most recently updated threads (any kind, archived or not).
-    static func recentRolloutPaths(dbFile: URL, limit: Int) -> Result<[String], CodexUsageError> {
+    /// The most recently updated threads (any kind, archived or not).
+    static func recentThreads(dbFile: URL, limit: Int) -> Result<[RecentThread], CodexUsageError> {
         var db: OpaquePointer?
         guard sqlite3_open_v2(dbFile.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK,
               let db else {
@@ -198,16 +245,23 @@ final class CodexUsageReader: @unchecked Sendable {
             }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_int64(stmt, 1, Int64(limit))
-            var paths: [String] = []
+            var threads: [RecentThread] = []
             while true {
                 let rc = sqlite3_step(stmt)
                 if rc == SQLITE_ROW {
-                    if let c = sqlite3_column_text(stmt, 0) {
-                        let path = String(cString: c)
-                        if !path.isEmpty { paths.append(path) }
+                    guard let c = sqlite3_column_text(stmt, 0) else { continue }
+                    let path = String(cString: c)
+                    guard !path.isEmpty else { continue }
+                    var updatedAt: Date?
+                    let type = sqlite3_column_type(stmt, 1)
+                    if type == SQLITE_INTEGER || type == SQLITE_FLOAT {
+                        var value = sqlite3_column_double(stmt, 1)
+                        if value < 1e11 { value *= 1000 }  // seconds in an `_ms` column
+                        updatedAt = Date(timeIntervalSince1970: value / 1000)
                     }
+                    threads.append(RecentThread(path: path, updatedAt: updatedAt))
                 } else if rc == SQLITE_DONE {
-                    return .success(paths)
+                    return .success(threads)
                 } else {
                     return .failure(CodexUsageError("state DB: \(String(cString: sqlite3_errmsg(db)))"))
                 }
@@ -218,34 +272,31 @@ final class CodexUsageReader: @unchecked Sendable {
 
     // MARK: - Rollouts
 
-    enum FileResult: Equatable {
-        case missing
-        case failed(String)
-        case read(CodexRateLimitReading?)
-    }
-
-    /// The newest reading in the rollout at `path`.
-    func reading(at path: String) -> FileResult {
-        var st = stat()
-        guard stat(path, &st) == 0 else {
+    /// The newest reading in the rollout at `path`, whose stat by path was `st`. Throws a
+    /// `CodexUsageError` naming the file. A file gone since `st` has no reading.
+    func reading(at path: String, stat st: stat) throws -> CodexRateLimitReading? {
+        let cached = entries[path]
+        if let cached, cached.matches(st) { return cached.reading }
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
             let code = errno
             entries[path] = nil
-            if code == ENOENT || code == ENOTDIR { return .missing }
-            return .failed("\((path as NSString).lastPathComponent): \(String(cString: strerror(code)))")
+            if code == ENOENT || code == ENOTDIR { return nil }
+            throw Self.error(path, code)
         }
-        let inode = UInt64(st.st_ino)
-        let size = Int64(st.st_size)
-        let mtime = st.st_mtimespec
-        let cached = entries[path]
-        if let cached, cached.inode == inode, cached.size == size,
-           cached.mtime.tv_sec == mtime.tv_sec, cached.mtime.tv_nsec == mtime.tv_nsec {
-            return .read(cached.reading)
+        defer { Darwin.close(fd) }
+        // Keyed on the file actually opened: it may have been replaced since `st`.
+        var opened = stat()
+        guard fstat(fd, &opened) == 0 else {
+            let code = errno
+            entries[path] = nil
+            throw Self.error(path, code)
         }
-        guard let handle = FileHandle(forReadingAtPath: path) else {
-            return .failed("\((path as NSString).lastPathComponent): can't open")
-        }
-        defer { try? handle.close() }
+        if let cached, cached.matches(opened) { return cached.reading }
         fileReads += 1
+        let inode = UInt64(opened.st_ino)
+        let size = Int64(opened.st_size)
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         // Grown (append-only while its thread is loaded): scan only the new bytes.
         let incremental = cached.flatMap { c -> Int64? in
             guard c.inode == inode, let end = c.completeEnd, size >= end else { return nil }
@@ -257,57 +308,69 @@ final class CodexUsageReader: @unchecked Sendable {
             let found = try Self.scanBackward(
                 handle: handle, end: size, floor: floor, floorIsLineStart: floor == lowest,
                 chunkSize: chunkSize, parse: CodexRateLimitParser.reading(fromLine:))
-            var entry = Entry(inode: inode, size: size, mtime: mtime, completeEnd: found.completeEnd, reading: found.value)
+            var entry = Entry(inode: inode, size: size, mtime: opened.st_mtimespec,
+                              completeEnd: found.completeEnd, reading: found.value)
             if let cached, incremental != nil {
                 if entry.reading == nil { entry.reading = cached.reading }
                 if entry.completeEnd == nil { entry.completeEnd = cached.completeEnd }
             }
             entries[path] = entry
-            return .read(entry.reading)
+            return entry.reading
         } catch {
             entries[path] = nil
-            return .failed("\((path as NSString).lastPathComponent): \(error.localizedDescription)")
+            throw CodexUsageError("\((path as NSString).lastPathComponent): \(error.localizedDescription)")
         }
     }
 
     /// Scans the complete lines in `floor..<end` newest first and returns the first that
     /// `parse` accepts, plus the end of the last complete line (nil if none). A trailing line
-    /// without its newline is still being written and is skipped. Lines spanning chunks are
-    /// carried over to the next (older) chunk; if `floor` isn't a line start, the partial line
-    /// there is dropped.
+    /// without its newline is still being written and is skipped. A line spanning chunks is
+    /// assembled once, when its start is found (its newer pieces are kept, not re-copied per
+    /// chunk); if `floor` isn't a line start, the partial line there is dropped.
     static func scanBackward<T>(
         handle: FileHandle, end: Int64, floor: Int64, floorIsLineStart: Bool, chunkSize: Int,
         parse: (Data) -> T?
     ) throws -> (value: T?, completeEnd: Int64?) {
         var position = end
-        var carry = Data()  // start of a line that began in an older chunk
+        var tail: [Data] = []  // newer pieces of a line that began in an older chunk, newest first
         var completeEnd: Int64?
         while position > floor {
             let start = max(floor, position - Int64(chunkSize))
             try handle.seek(toOffset: UInt64(start))
             let count = Int(position - start)
-            guard var chunk = try handle.read(upToCount: count), chunk.count == count else {
+            guard let chunk = try handle.read(upToCount: count), chunk.count == count else {
                 throw CodexUsageError("short read")
             }
-            chunk.append(carry)
-            carry = Data()
             position = start
+            var body = chunk[...]
             if completeEnd == nil {
                 guard let nl = chunk.lastIndex(of: 0x0A) else { continue }  // all trailing partial line
-                completeEnd = start + Int64(nl) + 1
-                chunk = Data(chunk[..<nl])
+                completeEnd = start + Int64(nl - chunk.startIndex) + 1
+                body = chunk[..<nl]
             }
+            // `head`: the part of a line that began in an older chunk (nil: `body` starts a line).
+            var head: Data.SubSequence?
             if start > floor || !floorIsLineStart {
-                guard let nl = chunk.firstIndex(of: 0x0A) else {
-                    carry = chunk  // one line spans the whole chunk
+                guard let nl = body.firstIndex(of: 0x0A) else {
+                    tail.append(Data(body))  // one line spans the whole chunk
                     continue
                 }
-                carry = Data(chunk[..<nl])
-                chunk = Data(chunk[(nl + 1)...])
+                head = body[..<nl]
+                body = body[(nl + 1)...]
             }
-            for line in chunk.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
+            if !tail.isEmpty {
+                // `body`'s last line continues in `tail`.
+                let lineStart = body.lastIndex(of: 0x0A).map { $0 + 1 } ?? body.startIndex
+                var line = Data(body[lineStart...])
+                for piece in tail.reversed() { line.append(piece) }
+                tail = []
+                body = body[..<lineStart]
+                if !line.isEmpty, let value = parse(line) { return (value, completeEnd) }
+            }
+            for line in body.split(separator: 0x0A, omittingEmptySubsequences: true).reversed() {
                 if let value = parse(Data(line)) { return (value, completeEnd) }
             }
+            if let head { tail = [Data(head)] }
         }
         return (nil, completeEnd)
     }

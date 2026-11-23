@@ -4,7 +4,9 @@ import Foundation
 /// records its rate limits there after every model response (`CodexUsageReader`).
 ///
 /// Status: no Codex home, no state DB, or no reading in the recent rollouts → `.unavailable`.
-/// A failed read after a reading was had → `.stale`, keeping it; otherwise `.ok`. The reading
+/// With a reading: `.stale` (keeping the newest one had) if the DB or a rollout that may hold a
+/// newer reading couldn't be read, even if this pass found a newer one elsewhere (so the meter
+/// doesn't flip between ok and stale while one active rollout stays unreadable); else `.ok`. The reading
 /// may be days old (`asOf` is the event's time); `UsageWindow.displayPercent` shows 0 once a
 /// window's `resetsAt` has passed. A newer reading always wins, so a resumed old thread rising
 /// to the top of the DB can't roll the snapshot back.
@@ -68,12 +70,12 @@ public actor CodexUsageSource: UsageSource {
         case .scanned(let reading, let errors):
             if let reading, last.map({ reading.timestamp >= $0.timestamp }) ?? true {
                 last = reading
-                return result(.ok, Self.pollInterval)
             }
             guard last != nil else {
                 return result(.unavailable, errors.isEmpty ? Self.unavailableInterval : Self.pollInterval)
             }
-            if reading == nil, let first = errors.first {
+            // An unreadable rollout may hold a newer reading (the reader only reports those).
+            if let first = errors.first {
                 return result(.stale(Self.message(first)), Self.pollInterval)
             }
             return result(.ok, Self.pollInterval)

@@ -54,7 +54,8 @@ final class UsageModel {
     private static let prefKey = "menuBarUsage"
 
     init(sources: [any UsageSource], isDemo: Bool, showInMenuBar demoShowInMenuBar: Bool = true) {
-        store = UsageStore(sources: sources)
+        // A dark wake (Power Nap) keeps the display asleep: never end a stuck suspension then.
+        store = UsageStore(sources: sources, isFullWake: { CGDisplayIsAsleep(CGMainDisplayID()) == 0 })
         self.isDemo = isDemo
         showInMenuBar = isDemo
             ? demoShowInMenuBar

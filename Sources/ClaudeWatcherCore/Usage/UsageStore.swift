@@ -15,8 +15,9 @@ import Observation
 /// `wakeDelay` from now (the network is often not up yet right after wake). That wake hold also
 /// binds `pollOverdue()` until it passes. A suspension that lasted more than `maxSuspension` of
 /// awake time (a did-wake that never came) is ended by the next `pollOverdue()`; it is measured
-/// on `uptime`, which stops while the system sleeps, so a dark wake (Power Nap) during a real
-/// sleep never ends it.
+/// on `uptime`, which stops while the system sleeps, and also requires `isFullWake` (the app:
+/// the display is awake): dark wakes (Power Nap) add up to awake time over a night, so uptime
+/// alone would end a real sleep's suspension during one.
 ///
 /// A loop never sleeps longer than `maxWait` at a time before polling, so a backward wall-clock
 /// jump (deadline suddenly hours away) can't stall a source; sources guard their own backoff.
@@ -37,6 +38,7 @@ public final class UsageStore {
     @ObservationIgnored private let maxSuspension: TimeInterval
     @ObservationIgnored private let clock: @Sendable () -> Date
     @ObservationIgnored private let uptime: @Sendable () -> TimeInterval
+    @ObservationIgnored private let isFullWake: @Sendable () -> Bool
     @ObservationIgnored private var loops: [AgentKind: Task<Void, Never>] = [:]
     /// When each source wants its next poll; absent = now.
     @ObservationIgnored private var deadlines: [AgentKind: Date] = [:]
@@ -59,10 +61,12 @@ public final class UsageStore {
     ///   - maxSuspension: a suspension longer than this (awake time) is ended by `pollOverdue()`.
     ///   - now: the wall clock (injectable for tests).
     ///   - uptime: seconds of awake time, stopping during system sleep (injectable for tests).
+    ///   - isFullWake: false during a dark wake; gates ending a stuck suspension.
     public init(sources: [any UsageSource], minimumInterval: TimeInterval = 5, wakeDelay: TimeInterval = 5,
                 maxWait: TimeInterval = 3600, maxSuspension: TimeInterval = 300,
                 now: @escaping @Sendable () -> Date = { Date() },
-                uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+                uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                isFullWake: @escaping @Sendable () -> Bool = { true }) {
         var byAgent: [AgentKind: any UsageSource] = [:]
         var order: [AgentKind] = []
         for source in sources where byAgent[source.agent] == nil {
@@ -80,6 +84,7 @@ public final class UsageStore {
         self.maxSuspension = maxSuspension
         clock = now
         self.uptime = uptime
+        self.isFullWake = isFullWake
     }
 
     /// Starts every source's loop (a source never polled yet polls right away). Idempotent.
@@ -130,12 +135,18 @@ public final class UsageStore {
         guard isRunning else { return }
         let now = clock()
         if isSuspended {
-            if let suspendedAt, uptime() - suspendedAt > maxSuspension { resume() }
+            if let suspendedAt, uptime() - suspendedAt > maxSuspension, isFullWake() { resume() }
             return
         }
-        // Drop a passed hold (or one a backward clock jump left far ahead), so it can't keep
-        // holding back the catch-up.
-        if let hold = wakeHoldUntil, hold <= now || hold.timeIntervalSince(now) > wakeDelay { wakeHoldUntil = nil }
+        // Drop a passed hold; clamp one a backward clock jump left far ahead to a full wake delay
+        // from now, so it can neither hold back the catch-up for long nor be skipped.
+        if let hold = wakeHoldUntil {
+            if hold <= now {
+                wakeHoldUntil = nil
+            } else if hold.timeIntervalSince(now) > wakeDelay {
+                wakeHoldUntil = now.addingTimeInterval(wakeDelay)
+            }
+        }
         for agent in agents where !polling.contains(agent) {
             guard var due = deadlines[agent] else { continue }
             if let wakeHoldUntil, wakeHoldUntil > due { due = wakeHoldUntil }

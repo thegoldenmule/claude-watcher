@@ -57,8 +57,12 @@ public struct UsageMeter: Sendable, Equatable {
         self.isStale = isStale
     }
 
-    /// Whole percent for display, never negative.
-    public var roundedPercent: Int { max(0, Int(percent.rounded())) }
+    /// Whole percent for display, as the menu shows it (`UsageDisplay.wholePercent`).
+    public var roundedPercent: Int { UsageDisplay.wholePercent(percent) }
+
+    /// How much of the bar to fill, 0...1. Follows `roundedPercent`, so the bar and its label
+    /// agree: a value that reads "0%" draws no fill (and any fill reads at least "1%").
+    public var fillFraction: Double { min(Double(roundedPercent) / 100, 1) }
 
     /// "Claude Code session usage 42 percent", plus ", warning"/", critical" and ", out of date".
     public var accessibilityText: String {
@@ -81,6 +85,16 @@ public struct UsageMeter: Sendable, Equatable {
 /// `.error`/`.stale` (the error line only). So `.unavailable`, and `.loading` with no snapshot,
 /// show nothing anywhere.
 public enum UsageDisplay {
+    /// Largest whole percent shown; a bigger (malformed) value reads as this.
+    public static let maxWholePercent = 9999
+
+    /// `percent` rounded to a whole number for display, clamped to 0...`maxWholePercent`
+    /// (NaN reads 0), so no server value can trap the `Int` conversion.
+    public static func wholePercent(_ percent: Double) -> Int {
+        guard !percent.isNaN else { return 0 }
+        return Int(min(max(percent, 0), Double(maxWholePercent)).rounded())
+    }
+
     /// The meter for `usage` at `now`, or nil if hidden. Shows whichever window has the higher
     /// `displayPercent(at:)` (a reset window counts 0); the session window wins a tie.
     public static func meter(for usage: AgentUsage, now: Date) -> UsageMeter? {
@@ -126,7 +140,7 @@ public enum UsageDisplay {
     /// "5h 42% (resets in 2h 10m)", "Week 67% (resets Thu 9:00 AM)", "5h 0% (reset)", "Week 12%".
     public static func windowText(kind: UsageWindowKind, window: UsageWindow, now: Date,
                                   calendar: Calendar = .current, locale: Locale = .current) -> String {
-        let percent = max(0, Int(window.displayPercent(at: now).rounded()))
+        let percent = wholePercent(window.displayPercent(at: now))
         let head = "\(kind.shortLabel) \(percent)%"
         guard let resetsAt = window.resetsAt else { return head }
         if window.hasReset(at: now) { return head + " (reset)" }

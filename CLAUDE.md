@@ -71,13 +71,18 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   wall-clock deadlines; never two polls of a source at once (a restarted loop awaits the old one;
   a superseded loop's result is dropped; the poll runs unstructured so stop/suspend don't cancel
   it under the source); `suspend()`/`resume()` (each source polls at its deadline but no sooner
-  than 5 s after resume), `pollOverdue()` (deadline > 2 s past: poll now). `UsageDisplay` (pure):
+  than 5 s after resume; that wake hold binds `pollOverdue()` too, cleared by start/stop),
+  `pollOverdue()` (deadline, or the wake hold if later, > 2 s past: poll now; while suspended,
+  only resumes a suspension > 5 min old: a will-sleep without did-wake); a loop sleeps at most
+  1 h before polling (a backward wall-clock jump can't stall it). `UsageDisplay` (pure):
   the meter = the window with the higher display percent (session wins ties); shown iff a
   snapshot has a window and the status is ok/stale (or loading with a snapshot); menu lines iff
   the meter shows, plus the error line for stale/error; `.unavailable` and snapshot-less
   `.loading` show nothing. Menu text `Claude Code: 5h 42% (resets in 2h 10m) · Week 67% (resets
   Thu 9:00 AM)` (relative < 24 h, else weekday within 6 days, else date; `(reset)` once passed);
-  stale adds `Claude Code: <message> (as of 3:05 PM)`.
+  stale adds `Claude Code: <message> (as of 3:05 PM)`. Percents display via `wholePercent`
+  (rounded, clamped 0...9999, NaN 0: a malformed value can't trap); the meter's bar fill
+  (`fillFraction`) follows that rounded value, so "0%" draws no fill.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
   `EdgeController`, `MenuModel`, `UpdateModel`, `UsageModel`), `ClaudeWatcherApp` (menu bar
   extra), `DemoMode`.
@@ -87,7 +92,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `lastError`, Update Available); everything else is in the Settings submenu (incl. "Show Usage
   in Menu Bar", before Launch at Login).
   `UsageModel`: owns the `UsageStore` (`ClaudeUsageSource` + `CodexUsageSource`; demo: canned
-  sources), a minute clock (`now`, also on wake and menu open; each tick `pollOverdue()`: a
+  sources), a minute clock (`now`, truncated to the minute and set only when it changes, so the
+  label image isn't redrawn per tick; also on wake and menu open; each tick `pollOverdue()`: a
   TimelineView in a MenuBarExtra label isn't re-evaluated), the "Show Usage in Menu Bar" pref
   (UserDefaults `menuBarUsage`, default on, not persisted in demo) and NSWorkspace sleep/wake
   (`suspend`/`resume`). No App Nap activity: it would un-nap the whole app (session poll, panel
@@ -133,6 +139,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   "%", "100%" width reserved, ~61 pt per meter). Template unless a fresh meter is
   warning/critical (then labelColor with an orange/red fill); stale meters dimmed (0.4), never
   coloured. No meters (or the pref off): the label is the plain `Image(systemName:)`.
+  `image(symbol:meters:)` is nonisolated on purpose: NSImage may run the drawing handler off
+  main, and a `@MainActor`-inferred handler would trap there.
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `hooks/codex-watcher-hook.sh`: the Codex hook (bundled too; see "Codex hook" below).
   `CodexHookInstaller` registers it in `$CODEX_HOME/hooks.json` via `HookInstaller` with

@@ -44,8 +44,11 @@ enum StatusItemRenderer {
     static var meterWidth: CGFloat { captionWidth + captionGap + barWidth + labelGap + percentWidth }
 
     /// The whole label. `meters` must not be empty (the plain symbol is used then).
-    @MainActor
-    static func image(symbol symbolName: String, meters: [UsageMeter]) -> NSImage {
+    ///
+    /// Deliberately not `@MainActor`: the drawing handler would inherit that isolation, and
+    /// Swift 6 would trap if AppKit draws the image off the main thread, which NSImage allows.
+    /// The handler only touches its captured values and AppKit drawing calls.
+    nonisolated static func image(symbol symbolName: String, meters: [UsageMeter]) -> NSImage {
         let configuration = NSImage.SymbolConfiguration(pointSize: symbolPointSize, weight: .regular)
         let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
             .withSymbolConfiguration(configuration)
@@ -112,7 +115,8 @@ enum StatusItemRenderer {
         base.withAlphaComponent(alpha * (colored ? 0.55 : 0.85)).setStroke()
         outline.stroke()
 
-        let fraction = min(max(meter.percent / 100, 0), 1)
+        // Follows the rounded label: "0%" draws no fill, "1%" at least a dot.
+        let fraction = meter.fillFraction
         if fraction > 0 {
             let fill: NSColor
             switch (colored && !meter.isStale, meter.level) {

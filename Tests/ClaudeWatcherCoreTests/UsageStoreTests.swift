@@ -404,6 +404,27 @@ private final class TestClock: Sendable {
     #expect(await source.polls == 2)
 }
 
+@MainActor @Test func usageStoreWakeHoldSurvivesABackwardClockJump() async {
+    let clock = TestClock()
+    let source = FakeSource(.claude, nextPollIn: 100)
+    let store = UsageStore(sources: [source], minimumInterval: 0, wakeDelay: 0.4, now: clock.now)
+    defer { store.stop() }
+    store.start()
+    #expect(await waitUntil { await source.polls == 1 })
+    store.suspend()
+    clock.advance(200)  // slept past the deadline
+    let resumed = ContinuousClock.now
+    store.resume()
+    // An NTP step back right after wake leaves the hold further ahead than the wake delay: it's
+    // clamped, not dropped, so the overdue catch-up still can't poll inside the wake delay.
+    clock.advance(-1)
+    store.pollOverdue(tolerance: 0)
+    try? await Task.sleep(for: .milliseconds(150))
+    #expect(await source.polls == 1)
+    #expect(await waitUntil { await source.polls == 2 })
+    #expect(ContinuousClock.now - resumed >= .milliseconds(390))
+}
+
 @MainActor @Test func usageStoreCapsTheWaitAfterABackwardClockJump() async {
     let clock = TestClock()
     let source = FakeSource(.claude, nextPollIn: 100)
@@ -420,9 +441,11 @@ private final class TestClock: Sendable {
 @MainActor @Test func usageStoreEndsASuspensionWithoutAWake() async {
     let clock = TestClock()
     let awake = TestClock()  // awake time: only what `uptime` sees
+    let fullWake = Mutex(true)
     let source = FakeSource(.claude, nextPollIn: 100)
     let store = UsageStore(sources: [source], minimumInterval: 0, wakeDelay: 0, maxSuspension: 300,
-                           now: clock.now, uptime: { awake.now().timeIntervalSince1970 })
+                           now: clock.now, uptime: { awake.now().timeIntervalSince1970 },
+                           isFullWake: { fullWake.withLock { $0 } })
     defer { store.stop() }
     store.start()
     #expect(await waitUntil { await source.polls == 1 })
@@ -437,8 +460,14 @@ private final class TestClock: Sendable {
     store.pollOverdue()
     try? await Task.sleep(for: .milliseconds(100))
     #expect(await source.polls == 1)
-    // Awake and suspended for more than `maxSuspension` with no did-wake: the tick resumes polling.
+    // Dark wakes add up to more than `maxSuspension` of awake time: still asleep (display off).
     awake.advance(200)
+    fullWake.withLock { $0 = false }
+    store.pollOverdue()
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(await source.polls == 1)
+    // Fully awake and suspended for more than `maxSuspension` with no did-wake: the tick resumes.
+    fullWake.withLock { $0 = true }
     store.pollOverdue()
     #expect(await waitUntil { await source.polls == 2 })
 }

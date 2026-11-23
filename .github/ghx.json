@@ -33,9 +33,9 @@
     }
   },
   "merge": {
-    "method": "squash",
+    "method": "rebase",
     "allowedMethods": [
-      "squash"
+      "rebase"
     ],
     "deleteBranch": true
   },

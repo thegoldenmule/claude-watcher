@@ -11,9 +11,12 @@ public struct SessionRecord: Decodable, Sendable, Equatable {
     /// `ctime`-style process start, in UTC, e.g. "Thu Oct 22 14:58:56 2026".
     public var procStart: String?
     public var version: String?
-    /// interactive | background | sdk | worker
+    /// interactive | bg | background | sdk | worker
     public var kind: String?
     public var entrypoint: String?
+    /// `bg` process identifier, referenced by the interactive record's `parkedJobId`.
+    public var jobId: String?
+    public var parkedJobId: String?
     public var name: String?
     /// derived | auto | user | collision
     public var nameSource: String?
@@ -31,7 +34,7 @@ public struct SessionRecord: Decodable, Sendable, Equatable {
         procStart: String? = nil, version: String? = nil, kind: String? = "interactive",
         entrypoint: String? = nil, name: String? = nil, nameSource: String? = nil,
         status: String? = nil, waitingFor: String? = nil, updatedAt: Double? = nil,
-        statusUpdatedAt: Double? = nil
+        statusUpdatedAt: Double? = nil, jobId: String? = nil, parkedJobId: String? = nil
     ) {
         self.pid = pid
         self.sessionId = sessionId
@@ -41,6 +44,8 @@ public struct SessionRecord: Decodable, Sendable, Equatable {
         self.version = version
         self.kind = kind
         self.entrypoint = entrypoint
+        self.jobId = jobId
+        self.parkedJobId = parkedJobId
         self.name = name
         self.nameSource = nameSource
         self.status = status

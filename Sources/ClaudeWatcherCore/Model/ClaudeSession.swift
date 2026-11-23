@@ -28,6 +28,8 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
     public var waitingFor: String?   // e.g. "input needed"
     public var tty: String?          // "/dev/ttys001"
     public var terminal: TerminalKind
+    /// The interactive terminal's cwd when it differs from a parked job's cwd.
+    var terminalCwd: String?
     public var ghosttyTerminalID: String?  // Ghostty AppleScript terminal UUID, if known
     public var startedAt: Date
     public var updatedAt: Date
@@ -52,7 +54,8 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
         updatedAt: Date,
         subagents: [SubagentInfo] = [],
         contextTokens: Int? = nil,
-        contextWindow: Int? = nil
+        contextWindow: Int? = nil,
+        terminalCwd: String? = nil
     ) {
         self.id = id
         self.agent = agent
@@ -65,6 +68,7 @@ public struct ClaudeSession: Identifiable, Equatable, Hashable, Sendable {
         self.waitingFor = waitingFor
         self.tty = tty
         self.terminal = terminal
+        self.terminalCwd = terminalCwd
         self.ghosttyTerminalID = ghosttyTerminalID
         self.startedAt = startedAt
         self.updatedAt = updatedAt

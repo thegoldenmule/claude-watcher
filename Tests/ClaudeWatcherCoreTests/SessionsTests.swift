@@ -474,6 +474,64 @@ private let transcriptSample = """
     #expect(session.status == .busy)
 }
 
+@Test func discoveryShowsParkedJobActivityInItsOriginalTerminal() async throws {
+    let home = try TempHome()
+    let terminalStart = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 120).rounded(.down))
+    let jobStart = terminalStart.addingTimeInterval(60)
+    try home.write("sessions/100.json", """
+    {"pid":100,"sessionId":"placeholder","cwd":"/terminal","kind":"interactive",
+    "procStart":"\(procStartString(terminalStart))","parkedJobId":"job-1","status":"idle"}
+    """)
+    let jobPath = "sessions/200.json"
+    try home.write(jobPath, """
+    {"pid":200,"sessionId":"parked","cwd":"/worktree","kind":"bg","jobId":"job-1",
+    "procStart":"\(procStartString(jobStart))","status":"idle"}
+    """)
+    try home.write("sessions/300.json", """
+    {"pid":300,"sessionId":"unpaired","cwd":"/worktree","kind":"bg","jobId":"job-2",
+    "procStart":"\(procStartString(jobStart))","status":"busy"}
+    """)
+    try home.write("projects/-worktree/parked.jsonl", "{\"type\":\"ai-title\",\"aiTitle\":\"Parked job\"}\n")
+    let agentPath = "projects/-worktree/parked/subagents/agent-a1.jsonl"
+    let now = Date().formatted(.iso8601)
+    try home.write(agentPath, """
+    {"type":"assistant","timestamp":"\(now)","message":{"stop_reason":"tool_use"}}
+
+    """)
+    let inspector = FakeInspector(table: [
+        100: ProcessSnapshot(pid: 100, ppid: 101, startTime: terminalStart, tty: "/dev/ttys003", executablePath: claudeBinary),
+        101: ProcessSnapshot(pid: 101, ppid: 1, startTime: terminalStart, executablePath: ghosttyBinary),
+        200: ProcessSnapshot(pid: 200, ppid: 1, startTime: jobStart, tty: "/dev/ttys001", executablePath: claudeBinary),
+        300: ProcessSnapshot(pid: 300, ppid: 1, startTime: jobStart, executablePath: claudeBinary),
+    ])
+
+    let discovery = SessionDiscovery(claudeHome: home.url, inspector: inspector)
+    let sessions = await discovery.scan()
+    #expect(sessions.map(\.id) == ["parked"])
+    let session = try #require(sessions.first)
+    #expect(session.title == "Parked job")
+    #expect(session.status == .busy)
+    #expect(session.subagents.map(\.id) == ["a1"])
+    #expect(session.pid == 100)
+    #expect(session.tty == "/dev/ttys003")
+    #expect(session.terminal == .ghostty)
+    #expect(session.cwd == "/worktree")
+    #expect(session.terminalCwd == "/terminal")
+
+    try home.append(agentPath, """
+    {"type":"assistant","timestamp":"\(now)","message":{"stop_reason":"end_turn"}}
+
+    """)
+    let finished = try #require(await discovery.scan().first)
+    #expect(finished.status == .idle)
+    #expect(finished.subagents.isEmpty)
+
+    try FileManager.default.removeItem(at: home.url.appendingPathComponent(jobPath))
+    let fallback = await discovery.scan()
+    #expect(fallback.map(\.id) == ["placeholder"])
+    #expect(fallback.first?.status == .idle)
+}
+
 @Test func discoversCaskAndNpmInstalls() async throws {
     let home = try TempHome()
     let t0 = Date(timeIntervalSince1970: 1792681136)

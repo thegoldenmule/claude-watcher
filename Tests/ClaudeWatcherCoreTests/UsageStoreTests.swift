@@ -163,6 +163,38 @@ private func usage(_ agent: AgentKind = .claude, session: Double?, sessionReset:
     #expect(text(UsageWindow(percent: 12.5, resetsAt: nil), .weekly) == "Week 13%")
     #expect(text(UsageWindow(percent: 104, resetsAt: nil)) == "5h 104%")
     #expect(text(UsageWindow(percent: -3, resetsAt: nil)) == "5h 0%")
+    // A malformed server value must not trap the Int conversion.
+    #expect(text(UsageWindow(percent: 1e19, resetsAt: nil)) == "5h 9999%")
+    #expect(text(UsageWindow(percent: .infinity, resetsAt: nil)) == "5h 9999%")
+    #expect(text(UsageWindow(percent: .nan, resetsAt: nil)) == "5h 0%")
+}
+
+@Test func usageWholePercentClamps() {
+    #expect(UsageDisplay.wholePercent(42.5) == 43)
+    #expect(UsageDisplay.wholePercent(-0.4) == 0)
+    #expect(UsageDisplay.wholePercent(-1e300) == 0)
+    #expect(UsageDisplay.wholePercent(1e19) == 9999)
+    #expect(UsageDisplay.wholePercent(.infinity) == 9999)
+    #expect(UsageDisplay.wholePercent(-.infinity) == 0)
+    #expect(UsageDisplay.wholePercent(.nan) == 0)
+    let huge = UsageMeter(agent: .claude, kind: .session, percent: 1e19, level: .critical, isStale: false)
+    #expect(huge.roundedPercent == 9999)
+    #expect(huge.fillFraction == 1)
+}
+
+@Test func usageMeterFillFollowsTheRoundedLabel() {
+    func meter(_ percent: Double) -> UsageMeter {
+        UsageMeter(agent: .claude, kind: .session, percent: percent, level: UsageLevel(percent: percent), isStale: false)
+    }
+    // Reads "0%": no fill (not a dot).
+    #expect(meter(0.3).roundedPercent == 0)
+    #expect(meter(0.3).fillFraction == 0)
+    // Reads "1%": a fill, so the dot shows.
+    #expect(meter(0.6).roundedPercent == 1)
+    #expect(meter(0.6).fillFraction == 0.01)
+    #expect(meter(42).fillFraction == 0.42)
+    #expect(meter(-3).fillFraction == 0)
+    #expect(meter(150).fillFraction == 1)
 }
 
 // MARK: - Store
@@ -344,6 +376,61 @@ private final class TestClock: Sendable {
     try? await Task.sleep(for: .milliseconds(50))
     #expect(await source.polls == 1)
     // The wall clock jumped past the deadline but the loop's timer hasn't fired (App Nap).
+    clock.advance(200)
+    store.pollOverdue()
+    #expect(await waitUntil { await source.polls == 2 })
+}
+
+@MainActor @Test func usageStorePollOverdueHonoursTheWakeHold() async {
+    let clock = TestClock()
+    let source = FakeSource(.claude, nextPollIn: 100)
+    let store = UsageStore(sources: [source], minimumInterval: 0, wakeDelay: 0.4, now: clock.now)
+    defer { store.stop() }
+    store.start()
+    #expect(await waitUntil { await source.polls == 1 })
+    store.suspend()
+    clock.advance(200)  // slept past the deadline
+    let resumed = ContinuousClock.now
+    store.resume()
+    // A menu open / minute tick right after wake: the deadline is long past, but the wake
+    // hold isn't, so no poll yet.
+    store.pollOverdue(tolerance: 0)
+    try? await Task.sleep(for: .milliseconds(150))
+    #expect(await source.polls == 1)
+    store.pollOverdue(tolerance: 0)
+    #expect(await waitUntil { await source.polls == 2 })
+    #expect(ContinuousClock.now - resumed >= .milliseconds(390))
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(await source.polls == 2)
+}
+
+@MainActor @Test func usageStoreCapsTheWaitAfterABackwardClockJump() async {
+    let clock = TestClock()
+    let source = FakeSource(.claude, nextPollIn: 100)
+    let store = UsageStore(sources: [source], minimumInterval: 0, maxWait: 0.2, now: clock.now)
+    defer { store.stop() }
+    store.start()
+    #expect(await waitUntil { await source.polls == 1 })
+    // The wall clock went back two hours: the deadline is now ~2 h away, but the loop polls
+    // after at most `maxWait`.
+    clock.advance(-7200)
+    #expect(await waitUntil { await source.polls == 2 })
+}
+
+@MainActor @Test func usageStoreEndsASuspensionWithoutAWake() async {
+    let clock = TestClock()
+    let source = FakeSource(.claude, nextPollIn: 100)
+    let store = UsageStore(sources: [source], minimumInterval: 0, wakeDelay: 0, maxSuspension: 300,
+                           now: clock.now)
+    defer { store.stop() }
+    store.start()
+    #expect(await waitUntil { await source.polls == 1 })
+    store.suspend()
+    clock.advance(200)  // past the deadline, but a recent suspension: still asleep
+    store.pollOverdue()
+    try? await Task.sleep(for: .milliseconds(100))
+    #expect(await source.polls == 1)
+    // Suspended for more than `maxSuspension` with no did-wake: the tick resumes polling.
     clock.advance(200)
     store.pollOverdue()
     #expect(await waitUntil { await source.polls == 2 })

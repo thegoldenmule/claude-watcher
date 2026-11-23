@@ -7,10 +7,14 @@ import os
 /// demo mode) and the system sleep/wake handling.
 ///
 /// - Sleep/wake: will-sleep suspends the store's loops; did-wake resumes them (each source
-///   polls ~5 s later, or at its own later deadline).
+///   polls ~5 s later, or at its own later deadline). A did-wake that never comes is covered by
+///   the tick: `pollOverdue` resumes a suspension older than 5 minutes.
 /// - Clock: `now` ticks every minute (a TimelineView in a MenuBarExtra label isn't
 ///   re-evaluated), on wake and when a menu opens, so a window whose reset passed shows 0.
-///   Each tick also polls any source whose timer is overdue (`UsageStore.pollOverdue`).
+///   It's truncated to the minute and only assigned when the minute changed, so repeated
+///   ticks and menu opens within a minute don't re-render the label image (a reset passing
+///   mid-minute shows at the next minute). Each tick also polls any source whose timer is
+///   overdue (`UsageStore.pollOverdue`).
 /// - No App Nap activity: holding one would keep the whole app (the 2 s session poll, panel
 ///   timers) out of App Nap. Usage only changes on a minutes scale, deadlines are wall-clock
 ///   and the minute tick and menu open catch up on any drift.
@@ -19,7 +23,7 @@ import os
 final class UsageModel {
     let store: UsageStore
     /// The minute clock the display rules are evaluated at.
-    private(set) var now = Date()
+    private(set) var now = UsageModel.minute(of: Date())
     var showInMenuBar: Bool {
         didSet {
             guard !isDemo, showInMenuBar != oldValue else { return }
@@ -68,7 +72,7 @@ final class UsageModel {
         }
         observe(workspace, NSWorkspace.didWakeNotification) { model in
             model.logger.notice("system woke: usage polling resumes")
-            model.now = Date()
+            model.updateNow()
             model.store.resume()
         }
         observe(.default, NSMenu.didBeginTrackingNotification) { model in model.tick() }
@@ -89,8 +93,18 @@ final class UsageModel {
     }
 
     private func tick() {
-        now = Date()
+        updateNow()
         store.pollOverdue()
+    }
+
+    /// Sets `now` to the current minute, only if that changed (so observers aren't invalidated).
+    private func updateNow() {
+        let minute = Self.minute(of: Date())
+        if minute != now { now = minute }
+    }
+
+    nonisolated private static func minute(of date: Date) -> Date {
+        Date(timeIntervalSinceReferenceDate: (date.timeIntervalSinceReferenceDate / 60).rounded(.down) * 60)
     }
 
     private func observe(_ center: NotificationCenter, _ name: Notification.Name,

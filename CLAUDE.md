@@ -71,9 +71,9 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   it under the source); `suspend()`/`resume()` (each source polls at its deadline but no sooner
   than 5 s after resume; that wake hold binds `pollOverdue()` too until it passes, cleared by
   start/stop), `pollOverdue()` (deadline, or the wake hold if later, > 2 s past: poll now; while
-  suspended, only resumes after > 5 min of awake time (`systemUptime`, stopped during sleep) and
-  only at full wake (`isFullWake`; app: main display awake): dark wakes/Power Nap add up to more
-  than 5 min over a night; i.e. a will-sleep without did-wake; a hold a backward clock step left
+  suspended, it only ends a will-sleep that never got its did-wake: after > 5 min of awake time
+  (`systemUptime`, stopped during sleep) and only at full wake (`isFullWake`; app: main display
+  awake, since dark wakes/Power Nap add up to more than 5 min over a night); a hold a backward clock step left
   more than the wake delay ahead is clamped to now + delay, never dropped); a loop sleeps at most
   1 h before polling (a backward wall-clock jump can't stall it). `UsageDisplay` (pure):
   the meter = the window with the higher display percent (session wins ties); shown iff a

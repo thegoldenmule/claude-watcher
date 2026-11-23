@@ -55,6 +55,7 @@ final class UsageModel {
 
     init(sources: [any UsageSource], isDemo: Bool, showInMenuBar demoShowInMenuBar: Bool = true) {
         // A dark wake (Power Nap) keeps the display asleep: never end a stuck suspension then.
+        // An offline main display (-1, e.g. headless) also counts as not awake; did-wake still resumes.
         store = UsageStore(sources: sources, isFullWake: { CGDisplayIsAsleep(CGMainDisplayID()) == 0 })
         self.isDemo = isDemo
         showInMenuBar = isDemo

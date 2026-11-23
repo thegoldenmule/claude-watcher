@@ -83,6 +83,43 @@ enum DemoMode {
         }
     }
 
+    /// Demo plan usage (never the Keychain, network or Codex files): Claude Code 5h 42% /
+    /// week 67%, Codex 5h 18% / week 96% (critical). `CW_DEMO_USAGE=off` turns the menu bar
+    /// meters off, `=stale` makes Claude Code's reading stale, `=error` fails it with no
+    /// reading, `=none` makes both unavailable (no meters, no menu lines).
+    static var usageSources: [any UsageSource] {
+        let now = Date()
+        func window(_ percent: Double, _ resetsIn: TimeInterval) -> UsageWindow {
+            UsageWindow(percent: percent, resetsAt: now.addingTimeInterval(resetsIn))
+        }
+        let mode = ProcessInfo.processInfo.environment["CW_DEMO_USAGE"]
+        let claudeSnapshot = UsageSnapshot(
+            session: window(42, 2 * 3600 + 10 * 60), weekly: window(67, 3 * 86_400 + 4 * 3600),
+            asOf: now.addingTimeInterval(mode == "stale" ? -25 * 60 : 0))
+        let codexSnapshot = UsageSnapshot(
+            session: window(18, 3 * 3600 + 5 * 60), weekly: window(96, 86_400 + 20 * 3600), asOf: now)
+        let claude: AgentUsage, codex: AgentUsage
+        switch mode {
+        case "stale":
+            claude = AgentUsage(agent: .claude, snapshot: claudeSnapshot, status: .stale("Couldn't reach claude.ai"))
+        case "error":
+            claude = AgentUsage(agent: .claude, snapshot: nil, status: .error("Couldn't read usage: not logged in"))
+        case "none":
+            claude = AgentUsage(agent: .claude, snapshot: nil, status: .unavailable)
+        default:
+            claude = AgentUsage(agent: .claude, snapshot: claudeSnapshot, status: .ok)
+        }
+        codex = mode == "none"
+            ? AgentUsage(agent: .codex, snapshot: nil, status: .unavailable)
+            : AgentUsage(agent: .codex, snapshot: codexSnapshot, status: .ok)
+        return [DemoUsageSource(claude), DemoUsageSource(codex)]
+    }
+
+    /// `CW_DEMO_USAGE=off`: the "Show Usage in Menu Bar" toggle starts off.
+    static var usageShownInMenuBar: Bool {
+        ProcessInfo.processInfo.environment["CW_DEMO_USAGE"] != "off"
+    }
+
     static var sessions: [ClaudeSession] {
         ProcessInfo.processInfo.environment["CW_DEMO_EMPTY"] == "1" ? [] : allSessions
     }
@@ -162,4 +199,19 @@ enum DemoMode {
                 startedAt: ago(130), updatedAt: ago(60)),
         ]
     }()
+}
+
+/// Always returns the same canned reading.
+private actor DemoUsageSource: UsageSource {
+    nonisolated let agent: AgentKind
+    private let usage: AgentUsage
+
+    init(_ usage: AgentUsage) {
+        agent = usage.agent
+        self.usage = usage
+    }
+
+    func poll(now: Date) async -> UsagePollResult {
+        UsagePollResult(usage: usage, nextPollIn: 3600)
+    }
 }

@@ -177,8 +177,9 @@ final class CodexUsageReader: @unchecked Sendable {
                 let code = errno
                 entries[thread.path] = nil
                 if code == ENOENT || code == ENOTDIR { continue }
+                // Unknown last write (`updated_at` isn't bumped on every write): always consulted.
                 candidates.append(Candidate(path: thread.path, info: .failure(Self.error(thread.path, code)),
-                                            lastWrite: thread.updatedAt, order: candidates.count))
+                                            lastWrite: nil, order: candidates.count))
             }
         }
         // Newest possible event first (unknown first), DB order among equals.

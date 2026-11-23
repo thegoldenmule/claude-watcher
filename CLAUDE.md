@@ -69,9 +69,10 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   wall-clock deadlines; never two polls of a source at once (a restarted loop awaits the old one;
   a superseded loop's result is dropped; the poll runs unstructured so stop/suspend don't cancel
   it under the source); `suspend()`/`resume()` (each source polls at its deadline but no sooner
-  than 5 s after resume; that wake hold binds `pollOverdue()` too, cleared by start/stop),
-  `pollOverdue()` (deadline, or the wake hold if later, > 2 s past: poll now; while suspended,
-  only resumes a suspension > 5 min old: a will-sleep without did-wake); a loop sleeps at most
+  than 5 s after resume; that wake hold binds `pollOverdue()` too until it passes, cleared by
+  start/stop), `pollOverdue()` (deadline, or the wake hold if later, > 2 s past: poll now; while
+  suspended, only resumes after > 5 min of awake time (`systemUptime`, stopped during sleep, so a
+  dark wake/Power Nap mid-sleep never ends it): a will-sleep without did-wake); a loop sleeps at most
   1 h before polling (a backward wall-clock jump can't stall it). `UsageDisplay` (pure):
   the meter = the window with the higher display percent (session wins ties); shown iff a
   snapshot has a window and the status is ok/stale (or loading with a snapshot); menu lines iff

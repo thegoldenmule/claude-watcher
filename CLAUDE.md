@@ -270,7 +270,9 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   `<task-notification>` with that `<task-id>` and a `<status>` (completed/failed/killed/stopped)
   in any `queue-operation` (enqueue or remove), a `queued_command` attachment, or a `user`
   record with `origin.kind` "task-notification" (parked `bg` sessions may write only that; it is
-  also an agent notice), or by a TaskStop result (`toolUseResult.task_id`, message
+  also an agent notice for ids with no enqueue, whose time it would push seconds late; it can
+  batch several notifications, each block parsed by `SubagentRules.finishedNotifications`), or
+  by a TaskStop result (`toolUseResult.task_id`, message
   "Successfully stopped task…"). Ended ids are remembered, so an end seen before its launch
   holds. Only shells launched since the process started count (they die with it); 24 h display
   backstop while the session isn't busy. The registry goes idle while the session waits on one,

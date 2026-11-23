@@ -138,6 +138,32 @@ private final class ShellFixture {
     #expect(f.shells(tracker).isEmpty)
 }
 
+@Test func aUserRecordBatchingNotificationsEndsEveryShell() throws {
+    let f = try ShellFixture(bashCall("toolu_1", at: Date(), command: "sleep 1"),
+                             backgroundResult("toolu_1", taskID: "b1", at: Date()),
+                             bashCall("toolu_2", at: Date(), command: "sleep 2"),
+                             backgroundResult("toolu_2", taskID: "b2", at: Date()))
+    // A status-less (Monitor) block first, then both shells.
+    let monitor = "<task-notification>\n<task-id>m1</task-id>\n<summary>event</summary>\n</task-notification>"
+    let batched = json(["type": "user", "timestamp": iso(Date()),
+                        "origin": ["kind": "task-notification"],
+                        "message": ["role": "user", "content": monitor + "\n" + notificationXML("b1") + "\n" + notificationXML("b2")]]) + "\n"
+    try f.append(batched)
+    #expect(f.shells(SubagentTracker()).isEmpty)
+    #expect(SubagentRules.finishedNotifications(in: monitor).isEmpty)
+}
+
+@Test func aDeliveredRecordDoesNotMoveAnEnqueuedNotice() {
+    var index = TranscriptTaskIndex(inode: 1)
+    let t = Date(timeIntervalSince1970: 1_800_000_000)
+    index.apply(line: Data(queueLine("a1", at: t).utf8))
+    index.apply(line: Data(notificationUserLine("a1", at: t.addingTimeInterval(30)).utf8))
+    #expect(index.notices["a1"]?.at == t)
+    // Without an enqueue (parked bg session), the delivered record is the notice.
+    index.apply(line: Data(notificationUserLine("a2", at: t).utf8))
+    #expect(index.notices["a2"]?.at == t)
+}
+
 @Test func anEndBeforeItsLaunchStillEndsTheShell() throws {
     let f = try ShellFixture(queueLine("b1", at: Date()),
                              bashCall("toolu_1", at: Date(), command: "true"),

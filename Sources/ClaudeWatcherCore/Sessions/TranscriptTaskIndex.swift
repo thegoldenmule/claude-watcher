@@ -36,6 +36,10 @@ struct TranscriptTaskIndex: Equatable {
     var shells: [String: ShellLaunch] = [:]
     /// Task ids whose end was seen, so a launch recorded after its end isn't revived.
     var ended: Set<String> = []
+    /// Task ids with an enqueued notice. A delivered user record's later time is used only for
+    /// ids without one (parked `bg` sessions): delivery can lag the enqueue by seconds, past an
+    /// agent's resume.
+    var enqueued: Set<String> = []
     /// The latest Bash calls, so a result that went to the background finds its call (results
     /// follow their call within a few lines; parallel calls interleave a little).
     var recentBash: [BashCall] = []
@@ -87,18 +91,17 @@ struct TranscriptTaskIndex: Equatable {
         let at = (obj["timestamp"] as? String).flatMap(SubagentRules.date)
         switch obj["type"] as? String {
         case "queue-operation":
-            guard let content = SubagentRules.text(obj["content"]),
-                  let id = SubagentRules.finishedTaskID(in: content) else { return }
-            end(id)
+            guard let content = SubagentRules.text(obj["content"]) else { return }
+            for n in SubagentRules.finishedNotifications(in: content) { end(n.taskID) }
             if let notice = SubagentRules.notification(obj) {
                 notices[notice.taskID] = notices[notice.taskID].map { .latest($0, notice.notice) } ?? notice.notice
+                enqueued.insert(notice.taskID)
             }
         case "attachment":
             guard let attachment = obj["attachment"] as? [String: Any],
                   attachment["type"] as? String == "queued_command",
-                  let text = SubagentRules.text(attachment["prompt"]),
-                  let id = SubagentRules.finishedTaskID(in: text) else { return }
-            end(id)
+                  let text = SubagentRules.text(attachment["prompt"]) else { return }
+            for n in SubagentRules.finishedNotifications(in: text) { end(n.taskID) }
         case "assistant":
             let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
             for block in blocks where block["type"] as? String == "tool_use" && block["name"] as? String == "Bash" {
@@ -111,12 +114,12 @@ struct TranscriptTaskIndex: Equatable {
             }
         case "user":
             if (obj["origin"] as? [String: Any])?["kind"] as? String == "task-notification",
-               let content = SubagentRules.text((obj["message"] as? [String: Any])?["content"]),
-               let id = SubagentRules.finishedTaskID(in: content) {
-                end(id)
-                if let at {
-                    let notice = SubagentNotice(at: at, parked: SubagentRules.isParked(content))
-                    notices[id] = notices[id].map { .latest($0, notice) } ?? notice
+               let content = SubagentRules.text((obj["message"] as? [String: Any])?["content"]) {
+                for n in SubagentRules.finishedNotifications(in: content) {
+                    end(n.taskID)
+                    guard let at, !enqueued.contains(n.taskID) else { continue }
+                    let notice = SubagentNotice(at: at, parked: n.parked)
+                    notices[n.taskID] = notices[n.taskID].map { .latest($0, notice) } ?? notice
                 }
                 return
             }

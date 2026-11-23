@@ -186,7 +186,7 @@ public actor SessionDiscovery {
                 shells = subagents.backgroundShells(
                     transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus, now: now)
                 agents = subagents.running(
-                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus)
+                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus, now: now)
                 liveSubagentPaths.insert(url.path)
             }
 

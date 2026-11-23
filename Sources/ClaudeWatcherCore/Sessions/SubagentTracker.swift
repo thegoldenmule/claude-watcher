@@ -225,6 +225,21 @@ enum SubagentRules {
         return id.isEmpty ? nil : id
     }
 
+    /// Every `<task-notification>` block in `text` that carries a `<status>`: (task id, parked).
+    /// A delivered user record can batch several.
+    static func finishedNotifications(in text: String) -> [(taskID: String, parked: Bool)] {
+        var found: [(String, Bool)] = []
+        var rest = text[...]
+        while let open = rest.range(of: "<task-notification>") {
+            let close = rest.range(of: "</task-notification>", range: open.upperBound..<rest.endIndex)
+            let block = String(rest[open.lowerBound..<(close?.upperBound ?? rest.endIndex)])
+            if let id = finishedTaskID(in: block) { found.append((id, isParked(block))) }
+            guard let close else { break }
+            rest = rest[close.upperBound...]
+        }
+        return found
+    }
+
     /// A string, or the concatenated `text` of an array of content blocks.
     static func text(_ any: Any?) -> String? {
         if let s = any as? String { return s }

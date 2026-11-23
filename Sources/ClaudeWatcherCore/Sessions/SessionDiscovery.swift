@@ -136,15 +136,35 @@ public actor SessionDiscovery {
         let states = hookStateDirectory.map { hookStates.load(directory: $0) } ?? [:]
         let statesByPID = HookStateStore.latestByPID(states)
 
+        func liveProcess(for record: SessionRecord) -> ProcessSnapshot? {
+            let process = inspector.snapshot(pid: record.pid)
+            guard ProcessRules.isLive(record, process: process, arguments: { inspector.arguments(pid: record.pid) })
+            else { return nil }
+            return process
+        }
+
+        let interactiveRecords = records.filter(\.isInteractive)
+        let parkedJobIDs = Set(interactiveRecords.compactMap(\.parkedJobId))
+        var parkedJobs: [String: (record: SessionRecord, process: ProcessSnapshot)] = [:]
+        for record in records where record.kind == "bg" {
+            guard let jobID = record.jobId, !jobID.isEmpty, parkedJobIDs.contains(jobID),
+                  let process = liveProcess(for: record)
+            else { continue }
+            if let existing = parkedJobs[jobID], existing.process.startTime >= process.startTime { continue }
+            parkedJobs[jobID] = (record, process)
+        }
+
+        let now = Date()
         var sessions: [ClaudeSession] = []
         var liveTranscriptPaths: Set<String> = []
         var liveSubagentPaths: Set<String> = []
         var liveTerminalKeys: Set<String> = []
-        for record in records where record.isInteractive {
-            let process = inspector.snapshot(pid: record.pid)
-            guard ProcessRules.isLive(record, process: process, arguments: { inspector.arguments(pid: record.pid) }),
-                  let process
-            else { continue }
+        for terminalRecord in interactiveRecords {
+            guard let process = liveProcess(for: terminalRecord) else { continue }
+            // A parked job runs on a private PTY. Focus the interactive terminal that parked it.
+            let job = terminalRecord.parkedJobId.flatMap { parkedJobs[$0] }
+            let record = job?.record ?? terminalRecord
+            let sessionProcessStart = job?.process.startTime ?? process.startTime
 
             let terminalKey = "\(process.pid)@\(process.startTime.timeIntervalSince1970)"
             liveTerminalKeys.insert(terminalKey)
@@ -159,11 +179,14 @@ public actor SessionDiscovery {
 
             var info: TranscriptInfo?
             var agents: [SubagentInfo] = []
+            var shells: [BackgroundShellInfo] = []
             if let url = transcriptURL(for: record) {
                 info = transcripts.info(at: url)
                 if info != nil { liveTranscriptPaths.insert(url.path) }
+                shells = subagents.backgroundShells(
+                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus, now: now)
                 agents = subagents.running(
-                    transcript: url, processStart: process.startTime, parentStatus: record.sessionStatus)
+                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus, now: now)
                 liveSubagentPaths.insert(url.path)
             }
 
@@ -173,20 +196,20 @@ public actor SessionDiscovery {
             let branch = info?.gitBranch ?? gitBranch(cwd: record.cwd)
             let lastPrompt = info?.lastPrompt
                 ?? history.lastPrompt(sessionId: record.sessionId, historyURL: historyFile)
-            let startedAt = record.startedAtDate ?? process.startTime
+            let startedAt = record.startedAtDate ?? sessionProcessStart
             let waitingFor = record.sessionStatus == .waiting ? SessionTitle.nonEmpty(record.waitingFor) : nil
             let hook = HookStateStore.match(
-                sessionID: record.sessionId, pid: record.pid, tty: process.tty,
+                sessionID: terminalRecord.sessionId, pid: process.pid, tty: process.tty,
                 processStart: process.startTime, states: states, byPID: statesByPID)
 
             sessions.append(ClaudeSession(
                 id: record.sessionId,
-                pid: record.pid,
+                pid: process.pid,
                 cwd: record.cwd,
                 title: title,
                 branch: branch,
                 lastPrompt: lastPrompt,
-                status: Self.status(record.sessionStatus, runningAgents: agents.count),
+                status: Self.status(record.sessionStatus, runningTasks: agents.count + shells.filter { BackgroundShellRules.keepsBusy($0, now: now) }.count),
                 waitingFor: waitingFor,
                 tty: process.tty,
                 terminal: terminal,
@@ -194,7 +217,9 @@ public actor SessionDiscovery {
                 startedAt: startedAt,
                 updatedAt: record.updatedAtDate ?? startedAt,
                 subagents: agents,
-                contextTokens: info?.contextTokens))
+                backgroundShells: shells,
+                contextTokens: info?.contextTokens,
+                terminalCwd: terminalRecord.cwd != record.cwd ? terminalRecord.cwd : nil))
         }
 
         transcripts.forget(except: liveTranscriptPaths)
@@ -209,11 +234,13 @@ public actor SessionDiscovery {
         return Self.finalize(sessions)
     }
 
-    /// The registry's status, except that an idle session with running subagents is busy: the
-    /// registry goes idle once the main turn ends even while an agent that stopped with background
-    /// work of its own (e.g. a CI wait) is still alive.
-    public static func status(_ registry: SessionStatus, runningAgents: Int) -> SessionStatus {
-        registry == .idle && runningAgents > 0 ? .busy : registry
+    /// The registry's status, except that an idle session with running subagents or background
+    /// shells is busy: the registry goes idle once the main turn ends, even while an agent that
+    /// stopped with background work of its own, or a background command the session waits on
+    /// (e.g. a CI wait), is still running. Claude Code resumes the session when it ends. Callers
+    /// count only shells within `BackgroundShellRules.busyWindow`.
+    public static func status(_ registry: SessionStatus, runningTasks: Int) -> SessionStatus {
+        registry == .idle && runningTasks > 0 ? .busy : registry
     }
 
     /// Stable order (startedAt, then pid) and unique ids: if two processes report the

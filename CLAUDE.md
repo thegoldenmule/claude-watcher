@@ -9,12 +9,14 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
 ## Layout
 - `Sources/ClaudeWatcherCore/Model/`: shared types (`ClaudeSession`, `SessionStatus`,
   `TerminalKind`, `FocusResult`, `SubagentInfo`; `SubagentTree` draws the tree prefixes,
-  `ElapsedFormat` the short elapsed labels). `ClaudeSession.agent` (`AgentKind` `.claude`/`.codex`)
+  `ElapsedFormat` the short elapsed labels). `BackgroundShellInfo`: a running background shell
+  (`ClaudeSession.backgroundShells`). `ClaudeSession.agent` (`AgentKind` `.claude`/`.codex`)
   and `contextWindow` (nil = Claude's assumed 1M; `effectiveContextWindow`).
 - `Sources/ClaudeWatcherCore/Sessions/`: `SessionStore` (`@MainActor @Observable`) over
   `SessionDiscovery` (actor): registry + transcripts + liveness, joined with hook state.
   `SubagentTracker` (owned by discovery, like `TranscriptReader`): a session's running
-  subagents (see "Subagents" below). `CodexDiscovery` (actor, optional second source of the
+  subagents (see "Subagents" below) and background shells (`backgroundShells`, see "Background
+  shells" below), both from one incremental `TranscriptTaskIndex` of the session transcript. `CodexDiscovery` (actor, optional second source of the
   store, scanned concurrently, merged by `SessionDiscovery.finalize`) with `CodexStateDB`,
   `CodexRolloutReader`/`CodexRolloutParser` and `CodexMatcher` (see "Codex" below).
   `ProcessInspecting` also has `allPIDs()`, `currentDirectory(pid:)`, `processName(pid:)`
@@ -78,13 +80,15 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   magentas are darker), a 3 pt left bar and an inverse-video ` waiting `/` stopped ` tag line;
   their glyphs keep their color under the selection; only waiting rows sort first (status
   flips must not reorder rows); the header counts `● N waiting  ■ N stopped` first, bold in those
-  colors; a session with running subagents gets a
-  `▸ N agents running` line that toggles a `SubagentTree` under it: sibling buttons in one
+  colors; a session with running subagents or background shells gets a
+  `▸ N agents · N shells running` line (either count alone when the other is 0) that toggles a
+  tree under it (agents in pre-order, then the background shells as `shell · <description>`
+  roots with a `$ <command>` line; prefixes from `SubagentTree.prefixes(depths:)`): sibling buttons in one
   `SessionRow` block, never nested, so hover/selection/tint and the row frame cover the whole
   block and only the toggle doesn't focus; trees start expanded, the toggle collapses one into
   `EdgeController.collapsedSessionIDs`, not the lazily recycled row, unpersisted and kept while
-  the session has no agents; the header
-  adds `⑂ N agents`; a session with `contextTokens` ends in a `ContextMeter` line: a drawn bar,
+  the session has no agents or shells; the header
+  adds `⑂ N agents` and `$ N shells`; a session with `contextTokens` ends in a `ContextMeter` line: a drawn bar,
   not `█░` glyphs (seams, font fallback), green/yellow/red per `ContextUsage.level`, its fill
   keeping that color under the selection, and `245k / 1M · 25%` (Codex: `/ 475k`, the session's
   window) right-aligned in a fixed 18-cell reserve so every row's bar is as long; narrow panes
@@ -140,7 +144,8 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `CW_APPEARANCE=dark|light`). Demo Terminal rows fail with the permission banner, "other" rows
   show the info banner. Screenshot helpers (demo only): `CW_DEMO_NOTICE=error|info`,
   `CW_DEMO_HOVER=<id>`, `CW_DEMO_PENDING=<id>`, `CW_DEMO_COLLAPSED=<id>[,<id>…]` (collapse those
-  rows' agent trees; demo-1 has a nested one, demo-3 and demo-codex one agent), `CW_DEMO_EMPTY=1`,
+  rows' agent trees; demo-1 has a nested one and a background shell, demo-3 and demo-codex one
+  agent), `CW_DEMO_EMPTY=1`,
   `CW_DEMO_UPDATE=X.Y.Z|fail|checking` (menu update line; default "Up to Date").
 - Theme overrides: `CW_GHOSTTY_CONFIG=<path>` (read only that config),
   `CW_GHOSTTY_THEME=<name or light:A,dark:B>` (preview a theme, ignoring config colors).
@@ -254,9 +259,29 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   record for 10 min while the session isn't busy). Agent files last written before the
   session's process started (or over 24 h ago while it isn't busy) are never opened
   (long-lived sessions keep hundreds). Reads are incremental (stat-keyed, 64 KB tails); the
-  parent transcript (can be 15 MB+) is indexed once, lazily, then only appended lines; it is
+  parent transcript (can be 15 MB+) is indexed once (`TranscriptTaskIndex`), then only appended lines; it is
   always consulted for agents still in play, since a parked notice overrides their end_turn. Poll-only (no watchers): running agents append many times
   a second, and the 2 s poll lag is fine.
+- Background shells (`TranscriptTaskIndex`, `BackgroundShellRules`, Claude Code 2.1.330): the
+  main conversation's Bash calls that went to the background (`run_in_background`, or a
+  foreground command that timed out, `timedOutAfterMs`, or was backgrounded): the `tool_result`
+  user record's `toolUseResult.backgroundTaskId`; label = the call's `description`, else the
+  command's first line (the call is found among the last 64 Bash `tool_use`s). Ended by a
+  `<task-notification>` with that `<task-id>` and a `<status>` (completed/failed/killed/stopped)
+  in any `queue-operation` (enqueue or remove), a `queued_command` attachment, or a `user`
+  record with `origin.kind` "task-notification" (a resumed session's copied history, e.g. a parked `bg` job's, holds only that; it is
+  also an agent notice for ids with no enqueue, whose time it would push seconds late; it can
+  batch several notifications, each block parsed by `SubagentRules.finishedNotifications`), or
+  by a TaskStop result (`toolUseResult.task_id`, message
+  "Successfully stopped task…"). Ended ids are remembered, so an end seen before its launch
+  holds. Only shells launched since the process started count (they die with it); 24 h display
+  backstop while the session isn't busy. The registry goes idle while the session waits on one,
+  so discovery reports an idle session with running agents, or shells launched within the last
+  hour (`BackgroundShellRules.busyWindow`: past that it's likely a dev server, and the session
+  waits on the user), as `.busy` (`SessionDiscovery.status(_:runningTasks:)`); Claude Code
+  resumes it when the shell ends. Subagents' own background shells stay in their agent's
+  "waiting on …" activity. The transcript is always indexed (once in full, ~30–60 ms for
+  15–18 MB with byte-searched markers, then appended lines).
 - Claude home (`ClaudeHome`, `SessionDiscovery.defaultClaudeHome`): `CLAUDE_CONFIG_DIR` from our
   env, else `launchctl getenv`, else `$SHELL -lic` (value read after a marker, since rc files may
   print anything); 2 s timeout per probe, `~` expanded. Falls back to `~/.claude` only if no

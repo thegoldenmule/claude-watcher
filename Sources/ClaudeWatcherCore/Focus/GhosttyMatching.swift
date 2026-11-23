@@ -91,7 +91,8 @@ public enum GhosttyMatcher {
     /// New sessions are all titled "✳ Claude Code", so they usually end up `.ambiguous`.
     public static func match(session: ClaudeSession, in terminals: [GhosttyTerminalInfo]) -> GhosttyResolution {
         let wantTitle = stripTitleGlyph(session.title)
-        let wantCwd = normalizePath(session.cwd)
+        let cwd = session.terminalCwd ?? session.cwd
+        let wantCwd = normalizePath(cwd)
 
         let titleHits = wantTitle.isEmpty ? [] : terminals.filter { stripTitleGlyph($0.name) == wantTitle }
         let cwdHits = wantCwd.isEmpty ? [] : terminals.filter { normalizePath($0.workingDirectory) == wantCwd }
@@ -100,7 +101,7 @@ public enum GhosttyMatcher {
         if both.count == 1 { return .unique(terminalID: both[0].id) }
         if both.count > 1 {
             return .ambiguous(candidates: both.map(\.id),
-                              reason: "\(both.count) Ghostty terminals are titled \"\(wantTitle)\" in \((session.cwd as NSString).abbreviatingWithTildeInPath)")
+                              reason: "\(both.count) Ghostty terminals are titled \"\(wantTitle)\" in \((cwd as NSString).abbreviatingWithTildeInPath)")
         }
         if titleHits.count == 1 { return .unique(terminalID: titleHits[0].id) }
         if titleHits.count > 1 {

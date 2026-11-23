@@ -75,7 +75,8 @@ public struct OSC7ProbeResolver: GhosttyTerminalResolver {
     public func resolve(_ session: ClaudeSession, ghostty: GhosttyScripting) async throws(AppleScriptError) -> GhosttyResolution {
         guard let raw = session.tty, !raw.isEmpty, !ProcessTree.isInsideTmux(session.pid) else { return .notFound }
         let tty = AppleTerminalFocuser.normalizeTTY(raw)
-        guard let id = try await coordinator.probe(tty: tty, pid: session.pid, restoreCwd: session.cwd, ghostty: ghostty)
+        guard let id = try await coordinator.probe(
+            tty: tty, pid: session.pid, restoreCwd: session.terminalCwd ?? session.cwd, ghostty: ghostty)
         else { return .notFound }
         return .unique(terminalID: id)
     }

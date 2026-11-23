@@ -50,13 +50,21 @@ public enum SubagentTree {
     /// "│   " / "    " for each ancestor level. `continuation` is as wide as `prefix`, so a
     /// continuation line starts under the agent's text.
     public static func lines(_ agents: [SubagentInfo]) -> [SubagentTreeLine] {
-        agents.indices.map { i in
-            let depth = agents[i].depth
+        zip(agents, prefixes(depths: agents.map(\.depth))).map {
+            SubagentTreeLine(agent: $0, prefix: $1.prefix, continuation: $1.continuation)
+        }
+    }
+
+    /// `lines`' prefixes for any pre-ordered entries, given their depths (agents and the
+    /// session's background shells share one tree).
+    public static func prefixes(depths: [Int]) -> [(prefix: String, continuation: String)] {
+        depths.indices.map { i in
+            let depth = depths[i]
             // Is there a later sibling at `level` before the subtree at that level ends?
             func hasLaterSibling(at level: Int) -> Bool {
-                for later in agents[(i + 1)...] {
-                    if later.depth < level { return false }
-                    if later.depth == level { return true }
+                for later in depths[(i + 1)...] {
+                    if later < level { return false }
+                    if later == level { return true }
                 }
                 return false
             }
@@ -65,11 +73,7 @@ public enum SubagentTree {
                 prefix += hasLaterSibling(at: level) ? "│   " : "    "
             }
             let last = !hasLaterSibling(at: depth)
-            return SubagentTreeLine(
-                agent: agents[i],
-                prefix: prefix + (last ? "└── " : "├── "),
-                continuation: prefix + (last ? "    " : "│   ")
-            )
+            return (prefix + (last ? "└── " : "├── "), prefix + (last ? "    " : "│   "))
         }
     }
 }

@@ -496,11 +496,15 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
     window_minutes, resets_at}` epoch s, classified by length: < 3 days = session, else weekly; seen
     in 0.169: only `primary` 10080 min, `secondary` null; `rate_limits` may be null). `rate_limits`
     follows `info`, so the 512-byte prefix rule only gates the type; the line is decoded whole. Newest
-    reading by event timestamp across the 3 most recently updated threads (`updated_at_ms`, any kind;
-    up to 10 while none has one): not by date dir, long threads write to old ones. DB opened read-only
-    per pass and closed; files cached by (inode, size, mtime), backward chunked scan (≤ 8 MB), grown
-    files scan only the new bytes; work on a private queue. Never rolls back to an older reading.
-    No home/DB/reading = `.unavailable` (5 min); read error after a reading = `.stale`; else 30 s.
+    reading by event timestamp among the 10 most recently updated threads (`updated_at_ms`, any kind;
+    not by date dir, long threads write to old ones), read newest last write first (the later of
+    `updated_at_ms` and the file's mtime: Codex doesn't bump `updated_at` on every write), stopping at
+    the first last written no later than the best reading. DB opened read-only per pass and closed;
+    files cached by (inode, size, mtime) of the opened descriptor (`fstat`), backward chunked scan
+    (≤ 8 MB), grown files scan only the new bytes; work on a private queue. Never rolls back to an
+    older reading. No home/DB/reading = `.unavailable` (5 min); with a reading, a DB error or an
+    unreadable rollout that may hold a newer one = `.stale` (even if a newer one was found elsewhere);
+    else 30 s.
 - Claude usage (`ClaudeUsageSource`, `Usage/Claude*.swift`): `GET
   https://api.anthropic.com/api/oauth/usage` with Claude Code's own OAuth access token
   (`Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, UA `ClaudeWatcher/<ver>`,

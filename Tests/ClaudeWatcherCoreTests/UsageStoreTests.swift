@@ -421,8 +421,13 @@ private final class TestClock: Sendable {
     store.pollOverdue(tolerance: 0)
     try? await Task.sleep(for: .milliseconds(150))
     #expect(await source.polls == 1)
+    // The clamped hold releases at the wake delay: the catch-up polls then, well before the
+    // resumed loop's own (stepped-back, ~1.4 s) wait would.
+    try? await Task.sleep(for: .milliseconds(300))
+    store.pollOverdue(tolerance: 0)
     #expect(await waitUntil { await source.polls == 2 })
     #expect(ContinuousClock.now - resumed >= .milliseconds(390))
+    #expect(ContinuousClock.now - resumed < .milliseconds(1200))
 }
 
 @MainActor @Test func usageStoreCapsTheWaitAfterABackwardClockJump() async {

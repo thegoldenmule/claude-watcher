@@ -231,11 +231,15 @@ enum SubagentRules {
         var found: [(String, Bool)] = []
         var rest = text[...]
         while let open = rest.range(of: "<task-notification>") {
-            let close = rest.range(of: "</task-notification>", range: open.upperBound..<rest.endIndex)
-            let block = String(rest[open.lowerBound..<(close?.upperBound ?? rest.endIndex)])
+            // A block ends at its close, or (unclosed) where the next one opens.
+            let after = rest[open.upperBound...]
+            let close = after.range(of: "</task-notification>")
+            let next = after.range(of: "<task-notification>")
+            let end = [close?.upperBound, next?.lowerBound, rest.endIndex].compactMap { $0 }
+                .filter { $0 > open.lowerBound }.min()!
+            let block = String(rest[open.lowerBound..<end])
             if let id = finishedTaskID(in: block) { found.append((id, isParked(block))) }
-            guard let close else { break }
-            rest = rest[close.upperBound...]
+            rest = rest[end...]
         }
         return found
     }

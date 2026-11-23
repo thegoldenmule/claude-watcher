@@ -269,7 +269,7 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   command's first line (the call is found among the last 64 Bash `tool_use`s). Ended by a
   `<task-notification>` with that `<task-id>` and a `<status>` (completed/failed/killed/stopped)
   in any `queue-operation` (enqueue or remove), a `queued_command` attachment, or a `user`
-  record with `origin.kind` "task-notification" (parked `bg` sessions may write only that; it is
+  record with `origin.kind` "task-notification" (a resumed session's copied history, e.g. a parked `bg` job's, holds only that; it is
   also an agent notice for ids with no enqueue, whose time it would push seconds late; it can
   batch several notifications, each block parsed by `SubagentRules.finishedNotifications`), or
   by a TaskStop result (`toolUseResult.task_id`, message

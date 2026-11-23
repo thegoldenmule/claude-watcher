@@ -151,6 +151,9 @@ private final class ShellFixture {
     try f.append(batched)
     #expect(f.shells(SubagentTracker()).isEmpty)
     #expect(SubagentRules.finishedNotifications(in: monitor).isEmpty)
+    // An unclosed status-less block doesn't swallow the finished one after it.
+    let unclosed = "intro <task-notification>\n<task-id>m2</task-id>\n" + notificationXML("b3")
+    #expect(SubagentRules.finishedNotifications(in: unclosed).map(\.taskID) == ["b3"])
 }
 
 @Test func aDeliveredRecordDoesNotMoveAnEnqueuedNotice() {

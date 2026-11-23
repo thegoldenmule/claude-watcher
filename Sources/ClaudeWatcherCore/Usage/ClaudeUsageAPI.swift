@@ -9,7 +9,9 @@ enum ClaudeUsageAPI {
     typealias Fetch = @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
     /// Ephemeral: no cookies, no disk cache, nothing persisted.
-    private static let session: URLSession = {
+    private static let session = URLSession(configuration: sessionConfiguration())
+
+    static func sessionConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 15
@@ -20,10 +22,26 @@ enum ClaudeUsageAPI {
         config.urlCache = nil
         config.httpCookieStorage = nil
         config.httpShouldSetCookies = false
-        return URLSession(configuration: config)
-    }()
+        return config
+    }
 
-    static let defaultFetch: Fetch = { request in try await session.data(for: request) }
+    static let defaultFetch: Fetch = fetch(using: session)
+
+    /// Fetches with `session`, never following a redirect: the `Authorization` header must not
+    /// go anywhere else. A redirect comes back as its own 3xx response (`.http`).
+    static func fetch(using session: URLSession) -> Fetch {
+        { request in try await session.data(for: request, delegate: NoRedirects.shared) }
+    }
+
+    final class NoRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+        static let shared = NoRedirects()
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest) async -> URLRequest? {
+            nil
+        }
+    }
 
     static func request(token: String, userAgent: String) -> URLRequest {
         var request = URLRequest(url: endpoint)
@@ -36,14 +54,15 @@ enum ClaudeUsageAPI {
         return request
     }
 
-    /// Fetches current usage. Throws `ClaudeUsageError`, or `CancellationError` if the calling
-    /// task was cancelled.
+    /// Fetches current usage. Throws `ClaudeUsageError`, or `CancellationError` only if the
+    /// calling task was cancelled (a `URLError.cancelled` otherwise is a network failure: nothing
+    /// cancels polls, so it's e.g. an invalidated session, and must back off like one).
     static func fetch(token: String, userAgent: String, now: Date, fetch: Fetch) async throws -> UsageSnapshot {
         let data: Data, response: URLResponse
         do {
             (data, response) = try await fetch(request(token: token, userAgent: userAgent))
         } catch {
-            if error is CancellationError || (error as? URLError)?.code == .cancelled || Task.isCancelled {
+            if error is CancellationError || Task.isCancelled {
                 throw CancellationError()
             }
             // Never interpolate the request (it carries the token); URLError's text doesn't.
@@ -71,8 +90,11 @@ enum ClaudeUsageAPI {
     /// Both response shapes: the flat `five_hour`/`seven_day` objects (`utilization`,
     /// `resets_at`), and the newer `limits` array (`kind`, `group`, `percent`, `resets_at`,
     /// `is_active`), which some accounts get instead. Flat keys win; malformed fields are nil.
+    /// A body with none of `five_hour`, `seven_day`, `limits` (e.g. `{"error": ...}`, a renamed
+    /// schema) is `.decoding`, so it can't replace a good snapshot with an empty one; a present
+    /// but null `five_hour` is fine (no session limit).
     static func parse(_ data: Data, fetchedAt: Date) throws -> UsageSnapshot {
-        guard let body = try? JSONDecoder().decode(ResponseBody.self, from: data) else {
+        guard let body = try? JSONDecoder().decode(ResponseBody.self, from: data), body.hasUsageKey else {
             throw ClaudeUsageError.decoding
         }
         // Only entries with a usable percentage count (a malformed one never hides a good one).
@@ -125,6 +147,8 @@ enum ClaudeUsageAPI {
         let fiveHour: Window?
         let sevenDay: Window?
         let limits: [Limit]?
+        /// Any of the keys above was present (even null or malformed).
+        let hasUsageKey: Bool
 
         enum CodingKeys: String, CodingKey {
             case fiveHour = "five_hour"
@@ -138,6 +162,7 @@ enum ClaudeUsageAPI {
             fiveHour = try? c.decodeIfPresent(Window.self, forKey: .fiveHour)
             sevenDay = try? c.decodeIfPresent(Window.self, forKey: .sevenDay)
             limits = (try? c.decodeIfPresent([LossyLimit].self, forKey: .limits))?.compactMap(\.value)
+            hasUsageKey = c.contains(.fiveHour) || c.contains(.sevenDay) || c.contains(.limits)
         }
     }
 

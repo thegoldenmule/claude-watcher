@@ -10,6 +10,14 @@ struct ClaudeWatcherApp: App {
             if appDelegate.isDemo {
                 Text("Demo mode")
             }
+            // Plan usage, one disabled line per agent (plus an error line when a poll failed).
+            let usageLines = appDelegate.usage.menuLines
+            if !usageLines.isEmpty {
+                ForEach(Array(usageLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                }
+                Divider()
+            }
             Toggle("Pin Sidebar", isOn: Binding(
                 get: { appDelegate.edge.isPinned },
                 set: { appDelegate.edge.isPinned = $0 }
@@ -45,8 +53,22 @@ struct ClaudeWatcherApp: App {
             }
             .keyboardShortcut("q")
         } label: {
-            Image(systemName: appDelegate.edge.isRevealPaused ? "moon.zzz" : "sidebar.left")
+            statusItemLabel
+        }
+    }
+
+    /// The app's symbol, followed by the usage meters unless there are none (or they're turned
+    /// off): then exactly the plain symbol.
+    @ViewBuilder private var statusItemLabel: some View {
+        let paused = appDelegate.edge.isRevealPaused
+        let symbol = paused ? "moon.zzz" : "sidebar.left"
+        let meters = appDelegate.usage.menuBarMeters
+        if meters.isEmpty {
+            Image(systemName: symbol)
                 .accessibilityLabel("ClaudeWatcher")
+        } else {
+            Image(nsImage: StatusItemRenderer.image(symbol: symbol, meters: meters))
+                .accessibilityLabel(StatusItemRenderer.accessibilityLabel(meters: meters, paused: paused))
         }
     }
 
@@ -76,8 +98,8 @@ struct ClaudeWatcherApp: App {
         }
     }
 
-    /// Everything that's set once and rarely touched: terminal effects, sidebar width, login
-    /// item, the Claude Code and Codex hooks, and the version with its update check.
+    /// Everything that's set once and rarely touched: terminal effects, sidebar width, usage
+    /// meters, login item, the Claude Code and Codex hooks, and the version with its update check.
     private var settingsMenu: some View {
         let menu = appDelegate.menu
         return Menu("Settings") {
@@ -95,6 +117,10 @@ struct ClaudeWatcherApp: App {
                     .disabled(!appDelegate.edge.hasCustomPanelWidth)
                 Divider()
             }
+            Toggle("Show Usage in Menu Bar", isOn: Binding(
+                get: { appDelegate.usage.showInMenuBar },
+                set: { appDelegate.usage.showInMenuBar = $0 }
+            ))
             Toggle("Launch at Login", isOn: Binding(
                 get: { menu.launchAtLogin },
                 set: { menu.setLaunchAtLogin($0) }

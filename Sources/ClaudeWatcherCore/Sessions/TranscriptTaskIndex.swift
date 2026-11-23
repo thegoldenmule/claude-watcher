@@ -17,8 +17,10 @@ struct ShellLaunch: Equatable {
 /// foreground command that timed out or that the user backgrounded), then its `tool_result`
 /// user record whose `toolUseResult.backgroundTaskId` names the task. It ends with a
 /// `<task-notification>` for that task id (`<status>` completed/failed/killed) in a
-/// `queue-operation` (enqueue or remove) or a `queued_command` attachment, or with a TaskStop
-/// result (`toolUseResult.task_id`, message "Successfully stopped task…").
+/// `queue-operation` (enqueue or remove), a `queued_command` attachment, or (parked `bg`
+/// sessions, which may write no queue record) a `user` record with `origin.kind`
+/// "task-notification" whose content is the notification; or with a TaskStop result
+/// (`toolUseResult.task_id`, message "Successfully stopped task…").
 struct TranscriptTaskIndex: Equatable {
     struct BashCall: Equatable {
         var toolUseID: String
@@ -32,6 +34,8 @@ struct TranscriptTaskIndex: Equatable {
     var notices: [String: SubagentNotice] = [:]
     /// task id -> a background shell launched and not ended.
     var shells: [String: ShellLaunch] = [:]
+    /// Task ids whose end was seen, so a launch recorded after its end isn't revived.
+    var ended: Set<String> = []
     /// The latest Bash calls, so a result that went to the background finds its call (results
     /// follow their call within a few lines; parallel calls interleave a little).
     var recentBash: [BashCall] = []
@@ -43,7 +47,7 @@ struct TranscriptTaskIndex: Equatable {
 
     private static let markers = [
         "\"queue-operation\"", "\"queued_command\"", "\"backgroundTaskId\"", "\"name\":\"Bash\"",
-        "Successfully stopped task",
+        "Successfully stopped task", "\"kind\":\"task-notification\"",
     ].map { Data($0.utf8) }
 
     /// Brings the index up to the file at `path`; nil when the file is gone.
@@ -85,7 +89,7 @@ struct TranscriptTaskIndex: Equatable {
         case "queue-operation":
             guard let content = SubagentRules.text(obj["content"]),
                   let id = SubagentRules.finishedTaskID(in: content) else { return }
-            shells[id] = nil
+            end(id)
             if let notice = SubagentRules.notification(obj) {
                 notices[notice.taskID] = notices[notice.taskID].map { .latest($0, notice.notice) } ?? notice.notice
             }
@@ -94,7 +98,7 @@ struct TranscriptTaskIndex: Equatable {
                   attachment["type"] as? String == "queued_command",
                   let text = SubagentRules.text(attachment["prompt"]),
                   let id = SubagentRules.finishedTaskID(in: text) else { return }
-            shells[id] = nil
+            end(id)
         case "assistant":
             let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
             for block in blocks where block["type"] as? String == "tool_use" && block["name"] as? String == "Bash" {
@@ -106,8 +110,18 @@ struct TranscriptTaskIndex: Equatable {
                 recentBash.removeFirst(recentBash.count - Self.recentBashLimit)
             }
         case "user":
+            if (obj["origin"] as? [String: Any])?["kind"] as? String == "task-notification",
+               let content = SubagentRules.text((obj["message"] as? [String: Any])?["content"]),
+               let id = SubagentRules.finishedTaskID(in: content) {
+                end(id)
+                if let at {
+                    let notice = SubagentNotice(at: at, parked: SubagentRules.isParked(content))
+                    notices[id] = notices[id].map { .latest($0, notice) } ?? notice
+                }
+                return
+            }
             guard let result = obj["toolUseResult"] as? [String: Any] else { return }
-            if let taskID = SessionTitle.nonEmpty(result["backgroundTaskId"] as? String) {
+            if let taskID = SessionTitle.nonEmpty(result["backgroundTaskId"] as? String), !ended.contains(taskID) {
                 let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
                 let useID = blocks.first { $0["type"] as? String == "tool_result" }?["tool_use_id"] as? String
                 let call = useID.flatMap { id in recentBash.last { $0.toolUseID == id } }
@@ -116,11 +130,16 @@ struct TranscriptTaskIndex: Equatable {
             }
             if let stopped = SessionTitle.nonEmpty(result["task_id"] as? String),
                (result["message"] as? String)?.hasPrefix("Successfully stopped task") == true {
-                shells[stopped] = nil
+                end(stopped)
             }
         default:
             break
         }
+    }
+
+    private mutating func end(_ id: String) {
+        shells[id] = nil
+        ended.insert(id)
     }
 
     /// The ranges of the lines of `buffer` that hold any of `markers`, in file order, each once.
@@ -151,6 +170,16 @@ enum BackgroundShellRules {
             .lazy.compactMap { SessionTitle.nonEmpty(String($0)) }.first
         if let description { return (SubagentActivity.clip(description), command.map(SubagentActivity.clip)) }
         return (command.map(SubagentActivity.clip) ?? "background command", nil)
+    }
+
+    /// How long a running shell keeps an idle session busy. Most wait on CI or a build and
+    /// end within minutes; one still running after this is likely a server (a dev server), and
+    /// its session waits on the user: still listed, but shown stopped.
+    static let busyWindow: TimeInterval = 60 * 60
+
+    /// Whether `shell` still counts toward its idle session being busy.
+    static func keepsBusy(_ shell: BackgroundShellInfo, now: Date) -> Bool {
+        now.timeIntervalSince(shell.startedAt) <= busyWindow
     }
 
     /// The running shells: launched since the session's process started (Claude Code's

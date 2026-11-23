@@ -13,7 +13,7 @@ struct SidebarView: View {
     var pendingSessionID: String? = nil
     /// Banner for the last focus attempt that didn't fully succeed.
     var notice: FocusNotice? = nil
-    /// Sessions whose subagent tree is hidden; the others show theirs.
+    /// Sessions whose agent/shell tree is hidden; the others show theirs.
     var collapsedSessionIDs: Set<String> = []
     let onSelect: (ClaudeSession) -> Void
     /// A row's `▸ N agents` / `▸ N shells` line was clicked.
@@ -232,9 +232,10 @@ private struct EmptyStateView: View {
 // MARK: - Row
 
 /// One session's block: its lines, then (with running subagents or background shells) a
-/// `▸ N agents · N shells running` line that toggles the tree of both below it. These are sibling buttons, never nested: the session's
-/// lines and the tree focus the session, the toggle line only expands/collapses. Hover, the
-/// selection highlight and the pane tint cover the whole block.
+/// `▸ N agents · N shells running` line that toggles the tree of both below it. These are
+/// sibling buttons, never nested: the session's lines and the tree focus the session, the toggle
+/// line only expands/collapses. Hover, the selection highlight and the pane tint cover the
+/// whole block.
 private struct SessionRow: View {
     let session: ClaudeSession
     var isPending = false
@@ -277,7 +278,7 @@ private struct SessionRow: View {
     private var hasTasks: Bool { !agents.isEmpty || !shells.isEmpty }
     private var showsTree: Bool { isExpanded && hasTasks }
     private var rowPadding: CGFloat { style.lineHeight * 0.35 }
-    /// The agent tree hangs off the toggle line: its branches start under the agent count, past
+    /// The task tree hangs off the toggle line: its branches start under the first count, past
     /// the `▸ `, so the tree reads as nested inside the session.
     private var treeIndent: CGFloat { style.cellWidth * 2 }
 
@@ -294,7 +295,7 @@ private struct SessionRow: View {
 
             if hasTasks {
                 Button(action: onToggleExpanded) {
-                    agentsToggle
+                    tasksToggle
                         .padding(.leading, style.paddingX + style.gutterWidth)
                         .padding(.trailing, style.paddingX)
                         .padding(.bottom, showsTree ? 0 : rowPadding)
@@ -307,7 +308,7 @@ private struct SessionRow: View {
 
             if showsTree {
                 Button(action: action) {
-                    agentTree
+                    taskTree
                         .padding(.leading, style.paddingX + style.gutterWidth + treeIndent)
                         .padding(.trailing, style.paddingX)
                         .padding(.bottom, rowPadding)
@@ -392,7 +393,7 @@ private struct SessionRow: View {
     }
 
     /// `▸ 2 agents · 1 shell running`, `▾` while the tree is open.
-    private var agentsToggle: some View {
+    private var tasksToggle: some View {
         let guide = ink(style.faint, faint: true)
         var text = AttributedString.span(isExpanded ? "▾ " : "▸ ", ink(style.foreground))
         for (i, count) in taskCounts.enumerated() {
@@ -437,7 +438,7 @@ private struct SessionRow: View {
     /// `├── Explore · find the hook installer    2m`, then the agent's latest action under its
     /// text; `└── shell · Wait for CI    3m`, then `$ ghx ci wait 12`. The elapsed times tick
     /// while the panel is visible.
-    private var agentTree: some View {
+    private var taskTree: some View {
         TimelineView(.animation(minimumInterval: 5, paused: !panelVisible)) { context in
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(treeLines) { line in

@@ -62,6 +62,19 @@ private func taskStopResult(_ id: String, at: Date, type: String = "local_bash")
                  "toolUseResult": ["message": message, "task_id": id, "task_type": type, "command": "sleep 100"]]) + "\n"
 }
 
+/// A parked `bg` session's notification: only a user record (Claude Code 2.1.325+).
+private func notificationUserLine(_ id: String, at: Date) -> String {
+    json(["type": "user", "timestamp": iso(at), "isSidechain": false, "sessionKind": "bg",
+          "turnOrigin": "task_notification",
+          "origin": ["kind": "task-notification", "producer": "session-task"],
+          "message": ["role": "user", "content": notificationXML(id)]]) + "\n"
+}
+
+/// A transcript line that merely mentions the markers (the API request log).
+private func apiBlobLine(_ id: String) -> String {
+    json(["type": "api-request-blob", "content": notificationXML(id) + " \"name\":\"Bash\""]) + "\n"
+}
+
 private final class ShellFixture {
     let home: TempHome
     let transcript: URL
@@ -115,6 +128,30 @@ private final class ShellFixture {
     #expect(f.shells(tracker).isEmpty)
 }
 
+@Test func backgroundShellEndsOnAParkedJobsUserRecordNotification() throws {
+    let f = try ShellFixture(bashCall("toolu_1", at: Date(), command: "sleep 9"),
+                             backgroundResult("toolu_1", taskID: "b1", at: Date()),
+                             apiBlobLine("b1"))
+    let tracker = SubagentTracker()
+    #expect(f.shells(tracker).map(\.id) == ["b1"])
+    try f.append(notificationUserLine("b1", at: Date()))
+    #expect(f.shells(tracker).isEmpty)
+}
+
+@Test func anEndBeforeItsLaunchStillEndsTheShell() throws {
+    let f = try ShellFixture(queueLine("b1", at: Date()),
+                             bashCall("toolu_1", at: Date(), command: "true"),
+                             backgroundResult("toolu_1", taskID: "b1", at: Date()))
+    #expect(f.shells(SubagentTracker()).isEmpty)
+}
+
+@Test func onlyRecentShellsKeepASessionBusy() {
+    let now = Date()
+    let shell = BackgroundShellInfo(id: "b", label: "dev server", startedAt: now)
+    #expect(BackgroundShellRules.keepsBusy(shell, now: now.addingTimeInterval(59 * 60)))
+    #expect(!BackgroundShellRules.keepsBusy(shell, now: now.addingTimeInterval(61 * 60)))
+}
+
 @Test func backgroundShellLabels() throws {
     let f = try ShellFixture(
         // A foreground command that timed out into the background: no run_in_background.
@@ -124,7 +161,13 @@ private final class ShellFixture {
         bashCall("toolu_c", at: Date(), command: "\n  npm run dev  \nmore"),
         backgroundResult("toolu_c", taskID: "cmd", at: Date()),
         // A result whose call wasn't seen.
-        backgroundResult("toolu_missing", taskID: "orphan", at: Date()))
+        backgroundResult("toolu_missing", taskID: "orphan", at: Date()),
+        // A foreground Bash call and its plain result.
+        bashCall("toolu_fg", at: Date(), command: "ls", background: false),
+        json(["type": "user", "timestamp": iso(Date()), "toolUseResult": ["stdout": "x"],
+              "message": ["role": "user", "content": [["tool_use_id": "toolu_fg", "type": "tool_result", "content": "x"]]]]) + "\n",
+        // An agent stopped with TaskStop.
+        taskStopResult("agent1", at: Date(), type: "local_agent"))
     let byID = Dictionary(uniqueKeysWithValues: f.shells(SubagentTracker()).map { ($0.id, $0) })
     #expect(byID["timed"]?.label == "Run the tests")
     #expect(byID["timed"]?.command == "swift test")
@@ -163,6 +206,11 @@ private final class ShellFixture {
     #expect(f.shells(tracker).map(\.id) == ["b1"])
     try f.append(String(end.dropFirst(40)))
     #expect(f.shells(tracker).isEmpty)
+    // A truncated transcript (same inode) is re-indexed from scratch.
+    try FileHandle(forWritingTo: f.transcript).truncate(atOffset: 0)
+    try f.append(bashCall("toolu_3", at: f.at(6), command: "sleep 3"),
+                 backgroundResult("toolu_3", taskID: "b3", at: f.at(6)))
+    #expect(f.shells(tracker).map(\.id) == ["b3"])
     // A rewritten (new inode) transcript is re-indexed from scratch.
     try FileManager.default.removeItem(at: f.transcript)
     try f.home.write("projects/p/s.jsonl", bashCall("toolu_2", at: f.at(6), command: "sleep 9")
@@ -178,6 +226,22 @@ private final class ShellFixture {
     #expect(f.shells(tracker).map(\.id) == ["b1"])
     #expect(tracker.running(transcript: f.transcript, processStart: f.processStart, parentStatus: .idle).isEmpty)
     #expect(f.shells(tracker).map(\.id) == ["b1"])
+}
+
+@Test func anAgentIsDecidedFromANoticeIndexedByTheShellPass() throws {
+    let f = try ShellFixture()
+    try f.home.write("projects/p/s/subagents/agent-a1.meta.json", "{\"agentType\":\"Explore\",\"requestShape\":\"background\"}")
+    try f.home.write("projects/p/s/subagents/agent-a1.jsonl",
+                     json(["type": "user", "timestamp": iso(f.at(0)), "message": ["role": "user", "content": "go"]]) + "\n")
+    let tracker = SubagentTracker()
+    func agents() -> [String] {
+        tracker.running(transcript: f.transcript, processStart: f.processStart, parentStatus: .busy).map(\.id)
+    }
+    #expect(f.shells(tracker).isEmpty)
+    #expect(agents() == ["a1"])
+    try f.append(queueLine("a1", at: f.at(5)))
+    #expect(f.shells(tracker).isEmpty)  // indexes the notice
+    #expect(agents().isEmpty)
 }
 
 @Test func bashRingKeepsOnlyRecentCalls() {

@@ -267,16 +267,19 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   foreground command that timed out, `timedOutAfterMs`, or was backgrounded): the `tool_result`
   user record's `toolUseResult.backgroundTaskId`; label = the call's `description`, else the
   command's first line (the call is found among the last 64 Bash `tool_use`s). Ended by a
-  `<task-notification>` with that `<task-id>` and a `<status>` (completed/failed/killed) in any
-  `queue-operation` (enqueue or remove) or `queued_command` attachment, or a TaskStop result
-  (`toolUseResult.task_id`, message "Successfully stopped task…"). Only shells launched since the
-  process started count (they die with it); 24 h backstop while the session isn't busy. The
-  registry goes idle while the session waits on one, so discovery reports an idle session with
-  running agents or shells as `.busy` (`SessionDiscovery.status(_:runningTasks:)`): Claude Code
-  resumes it when the shell ends. A long-lived one (a dev server) keeps its session busy too.
-  Subagents' own background shells stay in their agent's "waiting on …" activity. The
-  transcript is always indexed (once in full, ~20 ms for 18 MB with byte-searched markers, then
-  appended lines).
+  `<task-notification>` with that `<task-id>` and a `<status>` (completed/failed/killed/stopped)
+  in any `queue-operation` (enqueue or remove), a `queued_command` attachment, or a `user`
+  record with `origin.kind` "task-notification" (parked `bg` sessions may write only that; it is
+  also an agent notice), or by a TaskStop result (`toolUseResult.task_id`, message
+  "Successfully stopped task…"). Ended ids are remembered, so an end seen before its launch
+  holds. Only shells launched since the process started count (they die with it); 24 h display
+  backstop while the session isn't busy. The registry goes idle while the session waits on one,
+  so discovery reports an idle session with running agents, or shells launched within the last
+  hour (`BackgroundShellRules.busyWindow`: past that it's likely a dev server, and the session
+  waits on the user), as `.busy` (`SessionDiscovery.status(_:runningTasks:)`); Claude Code
+  resumes it when the shell ends. Subagents' own background shells stay in their agent's
+  "waiting on …" activity. The transcript is always indexed (once in full, ~30–60 ms for
+  15–18 MB with byte-searched markers, then appended lines).
 - Claude home (`ClaudeHome`, `SessionDiscovery.defaultClaudeHome`): `CLAUDE_CONFIG_DIR` from our
   env, else `launchctl getenv`, else `$SHELL -lic` (value read after a marker, since rc files may
   print anything); 2 s timeout per probe, `~` expanded. Falls back to `~/.claude` only if no

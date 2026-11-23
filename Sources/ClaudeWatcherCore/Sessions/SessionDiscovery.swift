@@ -154,6 +154,7 @@ public actor SessionDiscovery {
             parkedJobs[jobID] = (record, process)
         }
 
+        let now = Date()
         var sessions: [ClaudeSession] = []
         var liveTranscriptPaths: Set<String> = []
         var liveSubagentPaths: Set<String> = []
@@ -183,7 +184,7 @@ public actor SessionDiscovery {
                 info = transcripts.info(at: url)
                 if info != nil { liveTranscriptPaths.insert(url.path) }
                 shells = subagents.backgroundShells(
-                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus)
+                    transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus, now: now)
                 agents = subagents.running(
                     transcript: url, processStart: sessionProcessStart, parentStatus: record.sessionStatus)
                 liveSubagentPaths.insert(url.path)
@@ -208,7 +209,7 @@ public actor SessionDiscovery {
                 title: title,
                 branch: branch,
                 lastPrompt: lastPrompt,
-                status: Self.status(record.sessionStatus, runningTasks: agents.count + shells.count),
+                status: Self.status(record.sessionStatus, runningTasks: agents.count + shells.filter { BackgroundShellRules.keepsBusy($0, now: now) }.count),
                 waitingFor: waitingFor,
                 tty: process.tty,
                 terminal: terminal,
@@ -236,7 +237,8 @@ public actor SessionDiscovery {
     /// The registry's status, except that an idle session with running subagents or background
     /// shells is busy: the registry goes idle once the main turn ends, even while an agent that
     /// stopped with background work of its own, or a background command the session waits on
-    /// (e.g. a CI wait), is still running. Claude Code resumes the session when it ends.
+    /// (e.g. a CI wait), is still running. Claude Code resumes the session when it ends. Callers
+    /// count only shells within `BackgroundShellRules.busyWindow`.
     public static func status(_ registry: SessionStatus, runningTasks: Int) -> SessionStatus {
         registry == .idle && runningTasks > 0 ? .busy : registry
     }

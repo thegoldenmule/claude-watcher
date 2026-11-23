@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let edge: EdgeController
     let menu: MenuModel
     let updates: UpdateModel
+    let usage: UsageModel
     private var terminating = false
 
     /// nil in demo mode, and until `SessionDiscovery.defaultClaudeHome` has been resolved.
@@ -31,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         CodexPaths.prewarm()
         menu = MenuModel()
         updates = UpdateModel(isDemo: DemoMode.isEnabled)
+        // The sources' inits are trivial; all their IO happens in `poll`, on their own actors.
+        usage = DemoMode.isEnabled
+            ? UsageModel(sources: DemoMode.usageSources, isDemo: true, showInMenuBar: DemoMode.usageShownInMenuBar)
+            : UsageModel(sources: [ClaudeUsageSource(), CodexUsageSource()], isDemo: false)
         if DemoMode.isEnabled {
             let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Demo")
             edge = EdgeController(
@@ -62,12 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updates.start()
         }
         edge.start()
+        usage.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         terminating = true
         edge.stop()
         updates.stop()
+        usage.stop()
         store?.stop()
         if !isDemo { TerminalHighlighter.shared.resetAllSync() }
     }

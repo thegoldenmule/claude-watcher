@@ -17,10 +17,10 @@ tab, even across Spaces/desktops.
   Other terminals: the hosting app is brought to the front.
 - Drag the sidebar's right edge to resize it (double-click to reset); the width is kept.
 - Pin the sidebar from its header (`[pin]` / `[pinned]`) or the menu; the pin is kept across relaunches.
-- Plan usage in the menu bar: a small meter per agent (`CC` Claude Code, `CX` Codex) showing the
-  limit closest to running out (5-hour session or weekly), orange from 80% and red from 95%; the
-  menu lists both windows with their reset times. Turn the meters off in Settings › Show Usage in
-  Menu Bar.
+- Plan usage in the sidebar header: one line per agent (Claude Code, Codex) with a bar for the
+  5-hour session and weekly limits, the percent used and when each resets (yellow from 80%, red
+  from 95%). The reset times need a sidebar wider than the default (drag its edge) and are
+  always in the line's tooltip; very narrow sidebars show only the limit closest to running out.
 - Menu bar: Pin Sidebar, Pause Edge Reveal (15 min / 1 h / 4 h / until resumed; while paused
   the item shows until when, with Resume Now, and the icon turns to a moon), Settings, Quit.
   Settings holds the terminal highlight and pulse toggles, Reset Sidebar Width, Launch at Login,

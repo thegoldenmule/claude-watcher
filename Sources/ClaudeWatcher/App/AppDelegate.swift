@@ -33,22 +33,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu = MenuModel()
         updates = UpdateModel(isDemo: DemoMode.isEnabled)
         // The sources' inits are trivial; all their IO happens in `poll`, on their own actors.
-        usage = DemoMode.isEnabled
-            ? UsageModel(sources: DemoMode.usageSources, isDemo: true, showInMenuBar: DemoMode.usageShownInMenuBar)
-            : UsageModel(sources: [ClaudeUsageSource(), CodexUsageSource()], isDemo: false)
+        let usage = UsageModel(sources: DemoMode.isEnabled
+            ? DemoMode.usageSources : [ClaudeUsageSource(), CodexUsageSource()])
+        self.usage = usage
         if DemoMode.isEnabled {
             let logger = Logger(subsystem: "com.thegoldenmule.ClaudeWatcher", category: "Demo")
             edge = EdgeController(
                 sessions: { DemoMode.sessions },
+                usage: { usage.lines },
                 onSelect: { session in
                     logger.notice("demo select: \(session.title, privacy: .public)")
                     return await DemoMode.focusResult(for: session)
-                }
+                },
+                onShow: { usage.tick() }
             )
         } else {
             edge = EdgeController(
                 sessions: { [slot] in slot.store?.sessions ?? [] },
+                usage: { usage.lines },
                 onSelect: Self.focusHandler(focuser),
+                onShow: { usage.tick() },
                 // Never in demo mode: demo sessions have fake ttys.
                 highlighter: .shared)
         }

@@ -83,10 +83,10 @@ enum DemoMode {
         }
     }
 
-    /// Demo plan usage (never the Keychain, network or Codex files): Claude Code 5h 42% /
-    /// week 67%, Codex 5h 18% / week 96% (critical). `CW_DEMO_USAGE=off` turns the menu bar
-    /// meters off, `=stale` makes Claude Code's reading stale, `=error` fails it with no
-    /// reading, `=none` makes both unavailable (no meters, no menu lines).
+    /// Demo plan usage for the sidebar header (never the Keychain, network or Codex files):
+    /// Claude Code 5h 42% / week 67%, Codex 5h 18% / week 96% (critical). `CW_DEMO_USAGE=stale`
+    /// makes Claude Code's reading stale, `=error` fails it with no reading, `=none` makes both
+    /// unavailable (no usage lines).
     static var usageSources: [any UsageSource] {
         let now = Date()
         func window(_ percent: Double, _ resetsIn: TimeInterval) -> UsageWindow {
@@ -113,11 +113,6 @@ enum DemoMode {
             ? AgentUsage(agent: .codex, snapshot: nil, status: .unavailable)
             : AgentUsage(agent: .codex, snapshot: codexSnapshot, status: .ok)
         return [DemoUsageSource(claude), DemoUsageSource(codex)]
-    }
-
-    /// `CW_DEMO_USAGE=off`: the "Show Usage in Menu Bar" toggle starts off.
-    static var usageShownInMenuBar: Bool {
-        ProcessInfo.processInfo.environment["CW_DEMO_USAGE"] != "off"
     }
 
     static var sessions: [ClaudeSession] {

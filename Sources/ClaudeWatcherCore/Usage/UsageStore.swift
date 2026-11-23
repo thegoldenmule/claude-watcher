@@ -6,7 +6,8 @@ import Observation
 /// One independent loop per source: poll, publish, sleep `nextPollIn` (never below
 /// `minimumInterval`), repeat. A source is never polled twice at once: a restarted loop first
 /// waits for the previous one to finish, and the result of a poll whose loop was cancelled
-/// (stop, suspend) is dropped. Each source's next poll is a wall-clock deadline, so restarts
+/// (stop, suspend) is dropped; the poll itself isn't cancelled. Running loops retain the store
+/// until `stop()`. Each source's next poll is a wall-clock deadline, so restarts
 /// (`resume`, `pollOverdue`) honour a source's backoff instead of polling early.
 ///
 /// Sleep/wake is the caller's job (AppKit lives in the app): `suspend()` on will-sleep cancels
@@ -130,7 +131,10 @@ public final class UsageStore {
                 }
                 guard self.generations[agent] == generation else { return }
                 self.polling.insert(agent)
-                let result = await source.poll(now: self.clock())
+                // Unstructured, so `stop`/`suspend` don't cancel the request under the source
+                // (which would count it as a failure); its result is just dropped.
+                let now = self.clock()
+                let result = await Task { await source.poll(now: now) }.value
                 self.polling.remove(agent)
                 guard !Task.isCancelled, self.generations[agent] == generation else { return }
                 self.publish(result, for: agent)

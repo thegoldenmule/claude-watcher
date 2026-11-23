@@ -176,11 +176,21 @@ private actor FakeSource: UsageSource {
     private(set) var polls = 0
     private(set) var inFlight = 0
     private(set) var maxInFlight = 0
+    /// While set, polls wait (ignoring cancellation) until `openGate()`.
+    private var gated: Bool
+    private var gateWaiters: [CheckedContinuation<Void, Never>] = []
 
-    init(_ agent: AgentKind, nextPollIn: TimeInterval, pollDuration: Duration = .zero) {
+    init(_ agent: AgentKind, nextPollIn: TimeInterval, pollDuration: Duration = .zero, gated: Bool = false) {
         self.agent = agent
         self.nextPollIn = nextPollIn
         self.pollDuration = pollDuration
+        self.gated = gated
+    }
+
+    func openGate() {
+        gated = false
+        for waiter in gateWaiters { waiter.resume() }
+        gateWaiters = []
     }
 
     func poll(now: Date) async -> UsagePollResult {
@@ -188,6 +198,7 @@ private actor FakeSource: UsageSource {
         inFlight += 1
         maxInFlight = max(maxInFlight, inFlight)
         let number = polls
+        if gated { await withCheckedContinuation { gateWaiters.append($0) } }
         if pollDuration > .zero {
             // An unstructured task doesn't inherit our cancellation: the "request" always runs out.
             let duration = pollDuration
@@ -259,12 +270,13 @@ private final class TestClock: Sendable {
 }
 
 @MainActor @Test func usageStoreStopCancelsAndDropsInFlightResults() async {
-    let source = FakeSource(.claude, nextPollIn: 0.02, pollDuration: .milliseconds(150))
+    let source = FakeSource(.claude, nextPollIn: 0, gated: true)
     let store = UsageStore(sources: [source], minimumInterval: 0)
     store.start()
     #expect(await waitUntil { await source.inFlight == 1 })
     store.stop()
     store.stop()  // idempotent
+    await source.openGate()
     #expect(await waitUntil { await source.inFlight == 0 })
     try? await Task.sleep(for: .milliseconds(100))
     #expect(await source.polls == 1)

@@ -485,18 +485,29 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   (`Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, UA `ClaudeWatcher/<ver>`,
   ephemeral session, no cache or cookies). The token is read on every poll, never refreshed (that
   would rotate Claude Code's refresh token and log it out), never logged; only the access token
-  and `expiresAt` (ms) are decoded. Source: `/usr/bin/security find-generic-password -s <service>
-  -w` (in the item's ACL, so no prompt; hex output when the JSON isn't printable; exit 44 = not
-  found; private queue, killed after 15 s), then `<claude home>/.credentials.json`. Service
-  (Claude Code 2.1.330): `Claude Code-credentials`, plus `-<sha256(raw CLAUDE_CONFIG_DIR,
+  and `expiresAt` (ms) are decoded; `ClaudeCredentials` redacts it from description and Mirror.
+  Source: `/usr/bin/security find-generic-password -a <user> -s <service> -w` (account = login
+  name if it matches `^[a-zA-Z0-9._-]+$`, else `claude-code-user`, like Claude Code; in the
+  item's ACL, so no prompt; hex output when the JSON isn't printable; exit 44 = not found;
+  private queue, SIGTERM after 15 s, SIGKILL 2 s later; not spawned at all while the default
+  keychain is locked (`SecKeychainGetStatus`), which fails the read: `security` could raise the
+  unlock dialog every poll), and `<claude home>/.credentials.json`. Service (Claude Code
+  2.1.330): `Claude Code-credentials`, plus `-<sha256(raw CLAUDE_CONFIG_DIR,
   NFC).hex.prefix(8)>` whenever that variable is set (even to `~/.claude`). We only have the
-  resolved path, so we hash it with and without a trailing `/`: suffixed first for a non-default
-  home, plain first for the default; a `security` failure stops the search. Response: flat
-  `five_hour`/`seven_day` (`utilization`, `resets_at`) or the `limits` array (`weekly_all`;
-  session = active entry whose kind or group contains `session`/`five_hour`); lenient; ISO dates
-  with any number of fractional digits. Schedule (`nextPollIn`): 5 min; 429 -> max(`retry-after`
+  resolved path, so we hash it with and without a trailing `/`. Every location is read, in tiers
+  (`locationTiers`): the home's own (default home: plain, suffixed, file; other homes: suffixed,
+  file), then, for a non-default home only, the plain item (maybe another account), used only if
+  the first tier has nothing. In a tier the best token wins: not expired, latest `expiresAt` (no
+  expiry ranks below a known one), ties to the earlier location; with no usable token a failed
+  `security` read is `.keychainUnavailable`, else the expired token ("token expired"), else
+  unparseable / not logged in. Requests never follow redirects (task delegate; a 3xx is
+  `.http`). Response: flat `five_hour`/`seven_day` (`utilization`, `resets_at`) or the `limits`
+  array (`weekly_all`; session = active entry whose kind or group contains
+  `session`/`five_hour`); lenient, but a body with none of those three keys is `.decoding`
+  (keeps the old snapshot); ISO dates with any number of fractional digits. Schedule (`nextPollIn`): 5 min; 429 -> max(`retry-after`
   capped at 1 h, 5 min doubling to 30 min), no request until then; network 30 s doubling to 5
   min; Keychain 60 s doubling to 30 min; expired or rejected token -> re-read credentials every
   60 s, but a 401/403 token (kept only as its SHA-256) isn't sent again until it changes or 5 min
-  pass. Not logged in -> `.unavailable`, snapshot cleared (meter hidden); other failures ->
+  pass. A clock going backwards re-anchors these waits at `now` (never longer than set).
+  `URLError.cancelled` is a network error unless the poll's task was cancelled. Not logged in -> `.unavailable`, snapshot cleared (meter hidden); other failures ->
   `.stale` with a snapshot, `.error` without.

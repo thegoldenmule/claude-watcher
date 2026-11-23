@@ -7,12 +7,13 @@ import Foundation
 /// Credentials are re-read on every poll (picking up tokens Claude Code refreshed) and never
 /// refreshed here. A token the server rejected is remembered only by its SHA-256 and not sent
 /// again until it changes or `rejectedTokenRetry` passes. All timing uses the `now` passed to
-/// `poll`, so tests drive it without a clock.
+/// `poll`, so tests drive it without a clock. If that clock goes backwards, a pending wait is
+/// re-anchored at `now` so it never exceeds the delay it was set to.
 public actor ClaudeUsageSource: UsageSource {
     public nonisolated let agent: AgentKind = .claude
 
-    /// Loads Claude Code's credentials. Injected in tests.
-    typealias LoadCredentials = @Sendable () async throws -> ClaudeCredentials
+    /// Loads Claude Code's credentials (`now` ranks candidates by expiry). Injected in tests.
+    typealias LoadCredentials = @Sendable (_ now: Date) async throws -> ClaudeCredentials
 
     // MARK: Tuning
     static let baseInterval: TimeInterval = 300
@@ -34,7 +35,7 @@ public actor ClaudeUsageSource: UsageSource {
     // MARK: State
     private var snapshot: UsageSnapshot?
     private var status: UsageStatus = .loading
-    private var rateLimitedUntil: Date?
+    private var rateLimit: RateLimit?
     private var consecutiveRateLimits = 0
     private var consecutiveKeychainFailures = 0
     private var consecutiveNetworkFailures = 0
@@ -43,14 +44,20 @@ public actor ClaudeUsageSource: UsageSource {
     private struct RejectedToken {
         let hash: SHA256.Digest
         let statusCode: Int
-        let retryAt: Date
+        var retryAt: Date
+    }
+
+    /// No request before `until`, which was set `delay` seconds ahead.
+    private struct RateLimit {
+        var until: Date
+        let delay: TimeInterval
     }
 
     /// Live dependencies: the Keychain / credentials file under the resolved Claude home, and
     /// an ephemeral URLSession.
     public init() {
         let version = AppVersionInfo.main.shortVersion ?? "dev"
-        self.init(loadCredentials: { try await ClaudeCredentialStore.loadLive() },
+        self.init(loadCredentials: { try await ClaudeCredentialStore.loadLive(now: $0) },
                   fetch: ClaudeUsageAPI.defaultFetch,
                   userAgent: "ClaudeWatcher/\(version)")
     }
@@ -62,14 +69,24 @@ public actor ClaudeUsageSource: UsageSource {
     }
 
     public func poll(now: Date) async -> UsagePollResult {
-        // Inside a 429 backoff (e.g. polled early after wake): don't ask again yet.
-        if let until = rateLimitedUntil, until > now {
-            return result(nextPollIn: until.timeIntervalSince(now))
+        if let retryAt = rejectedToken?.retryAt, retryAt.timeIntervalSince(now) > Self.rejectedTokenRetry {
+            rejectedToken?.retryAt = now.addingTimeInterval(Self.rejectedTokenRetry)   // the clock went back
         }
-        let previousStatus = status
+        // Inside a 429 backoff (e.g. polled early after wake): don't ask again yet. A wait that
+        // has passed is dropped, so a later backwards clock jump can't revive it.
+        if let limit = rateLimit {
+            if limit.until <= now {
+                rateLimit = nil
+            } else {
+                if limit.until.timeIntervalSince(now) > limit.delay {
+                    rateLimit?.until = now.addingTimeInterval(limit.delay)   // the clock went back
+                }
+                return result(nextPollIn: min(limit.until.timeIntervalSince(now), limit.delay))
+            }
+        }
         var sentTokenHash: SHA256.Digest?
         do {
-            let credentials = try await loadCredentials()
+            let credentials = try await loadCredentials(now)
             consecutiveKeychainFailures = 0
             guard !credentials.isExpired(now: now) else { throw ClaudeUsageError.tokenExpired }
             let hash = credentials.tokenHash
@@ -82,12 +99,11 @@ public actor ClaudeUsageSource: UsageSource {
             status = .ok
             consecutiveRateLimits = 0
             consecutiveNetworkFailures = 0
-            rateLimitedUntil = nil
+            rateLimit = nil
             rejectedToken = nil
             return result(nextPollIn: Self.baseInterval)
         } catch is CancellationError {
-            // Not a failure: keep what we were showing and try again soon.
-            status = previousStatus
+            // Not a failure: keep what we were showing (nothing above changed it) and try again soon.
             return result(nextPollIn: Self.cancelledRetryInterval)
         } catch let error as ClaudeUsageError {
             if case .unauthorized(let code) = error, let sentTokenHash {
@@ -108,7 +124,7 @@ public actor ClaudeUsageSource: UsageSource {
             consecutiveRateLimits += 1
             let exponential = min(Self.maxBackoff, Self.baseInterval * pow(2, Double(consecutiveRateLimits - 1)))
             delay = max(min(retryAfter ?? 0, Self.maxRetryAfter), exponential)
-            rateLimitedUntil = now.addingTimeInterval(delay)
+            rateLimit = RateLimit(until: now.addingTimeInterval(delay), delay: delay)
             message = "Rate limited: retrying in \(Self.formatMinutes(delay))"
         case .keychainUnavailable:
             // Possibly a locked keychain: back off instead of spawning `security` every minute.

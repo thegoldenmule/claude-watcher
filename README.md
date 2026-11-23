@@ -19,8 +19,8 @@ tab, even across Spaces/desktops.
 - Pin the sidebar from its header (`[pin]` / `[pinned]`) or the menu; the pin is kept across relaunches.
 - Plan usage in the sidebar header: one line per agent (Claude Code, Codex) with a bar for the
   5-hour session and weekly limits, the percent used and when each resets (yellow from 80%, red
-  from 95%). The reset times need a sidebar wider than the default (drag its edge) and are
-  always in the line's tooltip; very narrow sidebars show only the limit closest to running out.
+  from 95%). At the default width only the reset of the limit closest to running out is shown
+  (widen the sidebar to see both); very narrow sidebars show only that limit.
 - Menu bar: Pin Sidebar, Pause Edge Reveal (15 min / 1 h / 4 h / until resumed; while paused
   the item shows until when, with Resume Now, and the icon turns to a moon), Settings, Quit.
   Settings holds the terminal highlight and pulse toggles, Reset Sidebar Width, Launch at Login,

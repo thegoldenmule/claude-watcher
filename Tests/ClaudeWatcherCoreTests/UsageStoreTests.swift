@@ -198,7 +198,7 @@ private final class TestClock: Sendable {
     clock.advance(200)  // slept past the deadline
     let resumed = ContinuousClock.now
     store.resume()
-    // A menu open / minute tick right after wake: the deadline is long past, but the wake
+    // A panel show / minute tick right after wake: the deadline is long past, but the wake
     // hold isn't, so no poll yet.
     store.pollOverdue(tolerance: 0)
     try? await Task.sleep(for: .milliseconds(150))

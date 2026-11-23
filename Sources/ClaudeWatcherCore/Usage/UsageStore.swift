@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Polls each agent's `UsageSource` and publishes its `AgentUsage` for the menu bar.
+/// Polls each agent's `UsageSource` and publishes its `AgentUsage` for the sidebar header.
 ///
 /// One independent loop per source: poll, publish, sleep `nextPollIn` (never below
 /// `minimumInterval`), repeat. A source is never polled twice at once: a restarted loop first

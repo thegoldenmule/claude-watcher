@@ -237,11 +237,14 @@ private struct UsageLines: View {
     }
 }
 
-/// One agent's usage line. Narrow panes drop the reset times, then all but the most
-/// constraining window, then the bar (`claude  67%`); a window never wraps. A stale reading is
-/// drawn faint and uncoloured, with a `stale` marker where it fits (each step is tried with it
-/// first); with no reading, a faint `claude usage: <message>`. The tooltip has the long form
-/// (reset clock times, the error and when the reading was taken).
+/// One agent's usage line. Narrow panes drop the other window's reset time (keeping the most
+/// constraining one's: tooltips may never show in this non-activating panel, so the line must
+/// carry it), then all reset times, then all but the most constraining window (with, then
+/// without its reset), then the bar (`claude  67%`); a window never wraps. A stale reading is
+/// drawn faint and uncoloured, with a `stale` marker that outranks every other detail (all
+/// steps are tried with it before any without it); with no reading, a faint
+/// `claude usage: <message>`. The tooltip has the long form (reset clock times, the error and
+/// when the reading was taken).
 private struct UsageLineView: View {
     let line: UsageLine
     let labelCells: Int
@@ -260,16 +263,9 @@ private struct UsageLineView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             } else {
-                let constraining = line.constraining.map { [$0] } ?? []
                 ViewThatFits(in: .horizontal) {
-                    if line.isStale { meters(line.windows, showReset: true, marker: true) }
-                    meters(line.windows, showReset: true)
-                    if line.isStale { meters(line.windows, showReset: false, marker: true) }
-                    meters(line.windows, showReset: false)
-                    if line.isStale { meters(constraining, showReset: false, marker: true) }
-                    meters(constraining, showReset: false)
-                    if line.isStale { compact(marker: true) }
-                    compact(marker: false)
+                    if line.isStale { steps(marker: true) }
+                    steps(marker: false)
                 }
                 .lineLimit(1)
             }
@@ -292,12 +288,28 @@ private struct UsageLineView: View {
         }
     }
 
-    private func meters(_ windows: [UsageWindowDisplay], showReset: Bool, marker: Bool = false) -> some View {
+    /// The degrade steps, most detailed first (see the type's doc).
+    @ViewBuilder private func steps(marker: Bool) -> some View {
+        let all = Set(line.windows.map(\.kind))
+        let constraining = line.constraining.map { [$0] } ?? []
+        let constrainingKind = Set(constraining.map(\.kind))
+        meters(line.windows, resetsFor: all, marker: marker)
+        if line.windows.count > 1 { meters(line.windows, resetsFor: constrainingKind, marker: marker) }
+        meters(line.windows, resetsFor: [], marker: marker)
+        if line.windows.count > 1 {
+            meters(constraining, resetsFor: constrainingKind, marker: marker)
+            meters(constraining, resetsFor: [], marker: marker)
+        }
+        compact(marker: marker)
+    }
+
+    private func meters(_ windows: [UsageWindowDisplay], resetsFor: Set<UsageWindowKind>,
+                        marker: Bool) -> some View {
         HStack(spacing: 0) {
             label
             HStack(spacing: cells(2)) {
                 ForEach(windows, id: \.kind) { window in
-                    meter(window, showReset: showReset && resetCells > 0)
+                    meter(window, showReset: resetsFor.contains(window.kind) && resetCells > 0)
                 }
             }
             staleMarker(marker)

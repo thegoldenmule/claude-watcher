@@ -124,8 +124,10 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   + 2), per window the kind, a `MeterBar` (the bar `ContextMeter` also draws; fill green, yellow
   from 80%, red from 95%), the percent (warning/critical in that color) and reset, both in
   reserves as wide as the widest value on any line, so lines with as many windows align;
-  `ViewThatFits` drops the other window's reset (keeping the `constraining` one's: tooltips
-  likely never show in the non-activating panel), then all resets, then all but the
+  `ViewThatFits` drops the other window's reset (keeping the `constraining` one's, its reserve
+  sized from constraining resets only, and only while every two-window line is limited by the
+  same window kind, so bars still align: tooltips likely never show in the non-activating
+  panel), then all resets, then all but the
   `constraining` window (with, then without its reset), then the bar (`claude  67%`), never
   wrapping a window; stale lines are faint and uncoloured with a `stale` marker (all steps tried
   with it before any without it); a message-only line is a faint `claude
@@ -556,7 +558,9 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   seen); the newest `state_N.sqlite` is trusted even if half-migrated; only `limit_id`
   "codex"/null is read; a window without `resets_at` never shows as reset. UI: the header's
   relative resets can read up to a minute long (minute-truncated clock); at the default panel
-  width (38 columns) two windows don't fit with both resets, so only the constraining window's
-  shows until the panel is widened (both in the tooltip, which may never show: the panel never
-  becomes active); a stale line's marker can make its bars shorter than the
-  other lines'.
+  width (38 columns) two windows don't fit with both resets, so usually only the constraining
+  window's shows until the panel is widened, and none when a percent reaches 100% or a reset needs
+  6 characters (`23h59m`, `Nov 30`), or the lines are limited by different window kinds (both
+  are in the tooltip, which may never show: the panel never becomes active); a stale line's
+  marker can make its bars shorter than the other lines', and at default width can cost it its
+  second window.

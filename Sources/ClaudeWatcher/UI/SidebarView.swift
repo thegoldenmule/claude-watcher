@@ -228,10 +228,18 @@ private struct UsageLines: View {
         let windows = lines.flatMap(\.windows)
         let percentCells = max(3, windows.map(\.percentText.count).max() ?? 3)
         let resetCells = windows.compactMap(\.resetText?.count).max() ?? 0
+        // The steps showing only the constraining window's reset size it from those resets
+        // alone, and the both-windows one is offered only while every two-window line is
+        // limited by the same kind of window (else their bars wouldn't line up).
+        let constraining = lines.compactMap(\.constraining)
+        let oneResetCells = constraining.compactMap(\.resetText?.count).max() ?? 0
+        let pairs = lines.filter { $0.windows.count > 1 }
+        let alignedOneReset = Set(pairs.compactMap(\.constraining?.kind)).count <= 1
         VStack(alignment: .leading, spacing: 0) {
             ForEach(lines) { line in
                 UsageLineView(line: line, labelCells: Self.labelCells, percentCells: percentCells,
-                              resetCells: resetCells)
+                              resetCells: resetCells, oneResetCells: oneResetCells,
+                              alignedOneReset: alignedOneReset)
             }
         }
     }
@@ -250,6 +258,10 @@ private struct UsageLineView: View {
     let labelCells: Int
     let percentCells: Int
     let resetCells: Int
+    /// The reset reserve when only constraining windows' resets show.
+    let oneResetCells: Int
+    /// Whether both windows with only the constraining one's reset may show (see `UsageLines`).
+    let alignedOneReset: Bool
 
     @Environment(\.terminalStyle) private var style
 
@@ -293,23 +305,25 @@ private struct UsageLineView: View {
         let all = Set(line.windows.map(\.kind))
         let constraining = line.constraining.map { [$0] } ?? []
         let constrainingKind = Set(constraining.map(\.kind))
-        meters(line.windows, resetsFor: all, marker: marker)
-        if line.windows.count > 1 { meters(line.windows, resetsFor: constrainingKind, marker: marker) }
-        meters(line.windows, resetsFor: [], marker: marker)
+        meters(line.windows, resetsFor: all, resetCells: resetCells, marker: marker)
+        if line.windows.count > 1, alignedOneReset {
+            meters(line.windows, resetsFor: constrainingKind, resetCells: oneResetCells, marker: marker)
+        }
+        meters(line.windows, resetsFor: [], resetCells: 0, marker: marker)
         if line.windows.count > 1 {
-            meters(constraining, resetsFor: constrainingKind, marker: marker)
-            meters(constraining, resetsFor: [], marker: marker)
+            meters(constraining, resetsFor: constrainingKind, resetCells: oneResetCells, marker: marker)
+            meters(constraining, resetsFor: [], resetCells: 0, marker: marker)
         }
         compact(marker: marker)
     }
 
     private func meters(_ windows: [UsageWindowDisplay], resetsFor: Set<UsageWindowKind>,
-                        marker: Bool) -> some View {
+                        resetCells: Int, marker: Bool) -> some View {
         HStack(spacing: 0) {
             label
             HStack(spacing: cells(2)) {
                 ForEach(windows, id: \.kind) { window in
-                    meter(window, showReset: resetsFor.contains(window.kind) && resetCells > 0)
+                    meter(window, resetCells: resetsFor.contains(window.kind) ? resetCells : 0)
                 }
             }
             staleMarker(marker)
@@ -318,7 +332,8 @@ private struct UsageLineView: View {
 
     /// `5h ━━━━░░░  42% 2h10m`: the percent right-aligned and the reset left-aligned in their
     /// reserves; the bar takes the rest.
-    private func meter(_ window: UsageWindowDisplay, showReset: Bool) -> some View {
+    /// No reset when `resetCells` is 0.
+    private func meter(_ window: UsageWindowDisplay, resetCells: Int) -> some View {
         HStack(spacing: style.cellWidth) {
             Text(window.kind.shortLabel).foregroundStyle(style.faint).fixedSize()
             MeterBar(fraction: window.fillFraction, fill: fill(window), track: style.faint)
@@ -327,7 +342,7 @@ private struct UsageLineView: View {
                 .foregroundStyle(textColor(window))
                 .fixedSize()
                 .frame(minWidth: cells(percentCells), alignment: .trailing)
-            if showReset {
+            if resetCells > 0 {
                 Text(window.resetText ?? "")
                     .foregroundStyle(style.faint)
                     .fixedSize()

@@ -3,11 +3,13 @@ import ClaudeWatcherCore
 import SwiftUI
 
 /// The sidebar's content, drawn as a Ghostty pane: the theme's background and font, a prompt
-/// header with status counts, then one block per session. Waiting sessions sort to the top and
+/// header with status counts and plan usage, then one block per session. Waiting sessions sort to the top and
 /// are marked in the palette's yellow, since that's when the user needs to act; stopped (idle)
 /// sessions get the same treatment in magenta, so a finished turn is just as easy to spot.
 struct SidebarView: View {
     let sessions: [ClaudeSession]
+    /// Plan usage lines for the header, one per visible agent (shown with or without sessions).
+    var usage: [UsageLine] = []
     var isPinned: Bool = false
     /// Row whose focus request is in flight.
     var pendingSessionID: String? = nil
@@ -49,7 +51,7 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            SidebarHeader(sessions: sessions, isPinned: isPinned, onTogglePin: onTogglePin)
+            SidebarHeader(sessions: sessions, usage: usage, isPinned: isPinned, onTogglePin: onTogglePin)
                 .padding(.horizontal, style.paddingX)
                 .padding(.top, style.paddingY)
                 .padding(.bottom, style.lineHeight * 0.5)
@@ -144,9 +146,11 @@ private struct PaneBackground: View {
 // MARK: - Header
 
 /// `❯ claude sessions` (`❯ agent sessions` once a Codex session is listed) plus a line of
-/// colored counts, like a prompt and its output. The `[pin]`/`[pinned]` control toggles pinning.
+/// colored counts, like a prompt and its output, then one plan usage line per agent. The
+/// `[pin]`/`[pinned]` control toggles pinning.
 private struct SidebarHeader: View {
     let sessions: [ClaudeSession]
+    let usage: [UsageLine]
     let isPinned: Bool
     let onTogglePin: () -> Void
 
@@ -177,6 +181,9 @@ private struct SidebarHeader: View {
             if !sessions.isEmpty {
                 summary.lineLimit(2).truncationMode(.tail)
             }
+            if !usage.isEmpty {
+                UsageLines(lines: usage)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -199,6 +206,152 @@ private struct SidebarHeader: View {
         let shells = sessions.reduce(0) { $0 + $1.backgroundShells.count }
         if shells > 0 { parts.append(part("$ \(shells) shell\(shells == 1 ? "" : "s")", style.green)) }
         return Text(parts.dropFirst().reduce(parts.first ?? "") { $0 + .span("  ") + $1 })
+    }
+}
+
+// MARK: - Plan usage
+
+/// The header's plan usage, one line per agent:
+///
+///     claude  5h ━━━━━━░░░░  42% 2h10m  wk ━━━━━━━░░░  67% Thu
+///     codex   wk ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  96% Tue
+///
+/// The label column and the percent and reset reserves are as wide as the widest value among
+/// all lines, so lines with as many windows have bars of the same length.
+private struct UsageLines: View {
+    let lines: [UsageLine]
+
+    /// The longest agent label plus two spaces.
+    private static let labelCells = (AgentKind.allCases.map(\.label.count).max() ?? 6) + 2
+
+    var body: some View {
+        let windows = lines.flatMap(\.windows)
+        let percentCells = max(3, windows.map(\.percentText.count).max() ?? 3)
+        let resetCells = windows.compactMap(\.resetText?.count).max() ?? 0
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(lines) { line in
+                UsageLineView(line: line, labelCells: Self.labelCells, percentCells: percentCells,
+                              resetCells: resetCells)
+            }
+        }
+    }
+}
+
+/// One agent's usage line. Narrow panes drop the reset times, then all but the most
+/// constraining window, then the bar (`claude  67%`); a window never wraps. A stale reading is
+/// drawn faint and uncoloured, with a `stale` marker where it fits (each step is tried with it
+/// first); with no reading, a faint `claude usage: <message>`. The tooltip has the long form
+/// (reset clock times, the error and when the reading was taken).
+private struct UsageLineView: View {
+    let line: UsageLine
+    let labelCells: Int
+    let percentCells: Int
+    let resetCells: Int
+
+    @Environment(\.terminalStyle) private var style
+
+    private func cells(_ count: Int) -> CGFloat { style.cellWidth * CGFloat(count) }
+
+    var body: some View {
+        Group {
+            if line.windows.isEmpty {
+                Text("\(line.agent.label) usage: \(line.message ?? "unavailable")")
+                    .foregroundStyle(style.faint)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            } else {
+                let constraining = line.constraining.map { [$0] } ?? []
+                ViewThatFits(in: .horizontal) {
+                    if line.isStale { meters(line.windows, showReset: true, marker: true) }
+                    meters(line.windows, showReset: true)
+                    if line.isStale { meters(line.windows, showReset: false, marker: true) }
+                    meters(line.windows, showReset: false)
+                    if line.isStale { meters(constraining, showReset: false, marker: true) }
+                    meters(constraining, showReset: false)
+                    if line.isStale { compact(marker: true) }
+                    compact(marker: false)
+                }
+                .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(line.help)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(line.accessibilityText)
+    }
+
+    private var label: some View {
+        Text(line.agent.label)
+            .foregroundStyle(line.isStale ? style.faint : style.foreground)
+            .frame(width: cells(labelCells), alignment: .leading)
+    }
+
+    @ViewBuilder private func staleMarker(_ shown: Bool) -> some View {
+        if shown {
+            Text("stale").foregroundStyle(style.faint).fixedSize().padding(.leading, style.cellWidth)
+        }
+    }
+
+    private func meters(_ windows: [UsageWindowDisplay], showReset: Bool, marker: Bool = false) -> some View {
+        HStack(spacing: 0) {
+            label
+            HStack(spacing: cells(2)) {
+                ForEach(windows, id: \.kind) { window in
+                    meter(window, showReset: showReset && resetCells > 0)
+                }
+            }
+            staleMarker(marker)
+        }
+    }
+
+    /// `5h ━━━━░░░  42% 2h10m`: the percent right-aligned and the reset left-aligned in their
+    /// reserves; the bar takes the rest.
+    private func meter(_ window: UsageWindowDisplay, showReset: Bool) -> some View {
+        HStack(spacing: style.cellWidth) {
+            Text(window.kind.shortLabel).foregroundStyle(style.faint).fixedSize()
+            MeterBar(fraction: window.fillFraction, fill: fill(window), track: style.faint)
+                .frame(minWidth: cells(4))
+            Text(window.percentText)
+                .foregroundStyle(textColor(window))
+                .fixedSize()
+                .frame(minWidth: cells(percentCells), alignment: .trailing)
+            if showReset {
+                Text(window.resetText ?? "")
+                    .foregroundStyle(style.faint)
+                    .fixedSize()
+                    .frame(minWidth: cells(resetCells), alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// `claude  67%`: the most constraining window's percent alone.
+    private func compact(marker: Bool) -> some View {
+        HStack(spacing: 0) {
+            label
+            if let window = line.constraining {
+                Text(window.percentText).foregroundStyle(textColor(window)).fixedSize()
+            }
+            staleMarker(marker)
+        }
+    }
+
+    private func fill(_ window: UsageWindowDisplay) -> Color {
+        if line.isStale { return style.faint }
+        switch window.level {
+        case .normal: return style.green
+        case .warning: return style.yellow
+        case .critical: return style.red
+        }
+    }
+
+    private func textColor(_ window: UsageWindowDisplay) -> Color {
+        if line.isStale { return style.faint }
+        switch window.level {
+        case .normal: return style.foreground
+        case .warning: return style.yellow
+        case .critical: return style.red
+        }
     }
 }
 
@@ -565,12 +718,25 @@ private struct ContextMeter: View {
         }
     }
 
-    /// Drawn, not `█░` text: block glyphs show seams between cells in many fonts, fall back to
-    /// another font's widths when the configured one lacks them, and only fill in eighths of a
-    /// cell. Square ends at about a block glyph's height still read as a run of cells.
     private var bar: some View {
+        MeterBar(fraction: fraction, fill: fill, track: textColor)
+    }
+}
+
+/// A meter's bar, one line high: a `track`-tinted run with `fraction` of it in `fill`.
+/// Drawn, not `█░` text: block glyphs show seams between cells in many fonts, fall back to
+/// another font's widths when the configured one lacks them, and only fill in eighths of a
+/// cell. Square ends at about a block glyph's height still read as a run of cells.
+private struct MeterBar: View {
+    let fraction: Double
+    let fill: Color
+    let track: Color
+
+    @Environment(\.terminalStyle) private var style
+
+    var body: some View {
         Rectangle()
-            .fill(textColor.opacity(0.22))
+            .fill(track.opacity(0.22))
             .overlay {
                 Rectangle().fill(fill).scaleEffect(x: fraction, anchor: .leading)
             }

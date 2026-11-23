@@ -12,8 +12,9 @@ import SwiftUI
 /// the panel stays up while it's visible, with an "Open Settings" button when Automation
 /// permission is missing.
 ///
-/// The `sessions` closure is evaluated inside SwiftUI's `body`, so reading an `@Observable`
-/// property there (like `SessionStore.sessions`) re-renders the list whenever it changes.
+/// The `sessions` and `usage` closures are evaluated inside SwiftUI's `body`, so reading an
+/// `@Observable` property there (like `SessionStore.sessions` or `UsageModel.lines`) re-renders
+/// the pane whenever it changes.
 /// `isPinned` keeps the panel visible (no auto-hide); bind it to a menu toggle.
 ///
 /// With a `TerminalHighlighter` (nil in demo mode), resting the pointer on a row for
@@ -72,6 +73,9 @@ final class EdgeController {
     private var pinned = !DemoMode.isEnabled && UserDefaults.standard.bool(forKey: Keys.isPinned)
 
     @ObservationIgnored private let sessionsSource: @MainActor () -> [ClaudeSession]
+    @ObservationIgnored private let usageSource: @MainActor () -> [UsageLine]
+    /// Runs whenever the panel is shown (the usage clock catches up).
+    @ObservationIgnored private let showHandler: @MainActor () -> Void
     @ObservationIgnored private let selectHandler: @MainActor (ClaudeSession) async -> FocusResult
     @ObservationIgnored private var noticeTask: Task<Void, Never>?
     @ObservationIgnored private var panel: SidebarPanel?
@@ -105,10 +109,14 @@ final class EdgeController {
 
     init(
         sessions: @escaping @MainActor () -> [ClaudeSession],
+        usage: @escaping @MainActor () -> [UsageLine] = { [] },
         onSelect: @escaping @MainActor (ClaudeSession) async -> FocusResult,
+        onShow: @escaping @MainActor () -> Void = {},
         highlighter: TerminalHighlighter? = nil
     ) {
         self.sessionsSource = sessions
+        self.usageSource = usage
+        self.showHandler = onShow
         self.selectHandler = onSelect
         self.highlighter = highlighter
     }
@@ -178,6 +186,7 @@ final class EdgeController {
     // MARK: - Used by the hosted view
 
     fileprivate func currentSessions() -> [ClaudeSession] { sessionsSource() }
+    fileprivate func currentUsage() -> [UsageLine] { usageSource() }
 
     fileprivate func select(_ session: ClaudeSession) {
         guard pendingSessionID == nil else { return }  // one focus at a time
@@ -585,6 +594,7 @@ final class EdgeController {
         isVisible = true
         transitionGeneration += 1
         rearmHover()
+        showHandler()
 
         guard animated else {
             panel.alphaValue = 1
@@ -698,14 +708,15 @@ struct FocusNotice: Identifiable, Equatable {
     var duration: Duration { needsAutomationPermission ? .seconds(10) : .seconds(4) }
 }
 
-/// Root of the hosted SwiftUI tree. Reading `controller.currentSessions()` inside `body` lets
-/// Observation track whatever the source closure reads.
+/// Root of the hosted SwiftUI tree. Reading `controller.currentSessions()` and
+/// `currentUsage()` inside `body` lets Observation track whatever the source closures read.
 private struct SidebarRoot: View {
     let controller: EdgeController
 
     var body: some View {
         SidebarView(
             sessions: controller.currentSessions(),
+            usage: controller.currentUsage(),
             isPinned: controller.isPinned,
             pendingSessionID: controller.pendingSessionID,
             notice: controller.notice,

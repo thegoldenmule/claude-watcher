@@ -4,11 +4,11 @@ import Foundation
 public enum UsageWindowKind: Sendable, Equatable {
     case session, weekly
 
-    /// Short label for the menu ("5h", "Week").
+    /// Short label for the sidebar header and tooltips ("5h", "wk").
     public var shortLabel: String {
         switch self {
         case .session: "5h"
-        case .weekly: "Week"
+        case .weekly: "wk"
         }
     }
 
@@ -22,68 +22,93 @@ public enum UsageWindowKind: Sendable, Equatable {
 }
 
 extension AgentKind {
-    /// Product name for the menu ("Claude Code", "Codex").
+    /// Product name for tooltips and accessibility ("Claude Code", "Codex").
     public var productName: String {
         switch self {
         case .claude: "Claude Code"
         case .codex: "Codex"
         }
     }
-
-    /// Two-letter caption for the menu bar meter ("CC", "CX").
-    public var meterCaption: String {
-        switch self {
-        case .claude: "CC"
-        case .codex: "CX"
-        }
-    }
 }
 
-/// What one agent's menu bar meter shows: its most constraining window.
-public struct UsageMeter: Sendable, Equatable {
-    public var agent: AgentKind
+/// One window of an agent's usage line, ready to draw.
+public struct UsageWindowDisplay: Sendable, Equatable {
     public var kind: UsageWindowKind
-    /// 0 once the window has reset; may exceed 100.
-    public var percent: Double
+    /// Whole percent (`UsageDisplay.wholePercent` of `displayPercent(at:)`): 0 once reset, may exceed 100.
+    public var percent: Int
+    /// From the rounded percent, so the color agrees with the label.
     public var level: UsageLevel
-    /// The latest poll failed (`.stale`): drawn dimmed, never coloured.
-    public var isStale: Bool
+    /// "2h10m", "45m", "Thu", "Nov 30"; nil if the source gave no reset time or it has passed.
+    public var resetText: String?
+    /// "in 2 hours 10 minutes", "Thursday", "November 30"; nil like `resetText`.
+    public var resetSpoken: String?
 
-    public init(agent: AgentKind, kind: UsageWindowKind, percent: Double, level: UsageLevel, isStale: Bool) {
-        self.agent = agent
+    public init(kind: UsageWindowKind, percent: Int, level: UsageLevel, resetText: String?, resetSpoken: String?) {
         self.kind = kind
         self.percent = percent
         self.level = level
-        self.isStale = isStale
+        self.resetText = resetText
+        self.resetSpoken = resetSpoken
     }
 
-    /// Whole percent for display, as the menu shows it (`UsageDisplay.wholePercent`).
-    public var roundedPercent: Int { UsageDisplay.wholePercent(percent) }
+    /// "42%".
+    public var percentText: String { "\(percent)%" }
 
-    /// How much of the bar to fill, 0...1. Follows `roundedPercent`, so the bar and its label
-    /// agree: a value that reads "0%" draws no fill (and any fill reads at least "1%").
-    public var fillFraction: Double { min(Double(roundedPercent) / 100, 1) }
+    /// How much of the bar to fill, 0...1. Follows `percent`, so the bar and its label agree: a
+    /// value that reads "0%" draws no fill (and any fill reads at least "1%").
+    public var fillFraction: Double { min(Double(percent) / 100, 1) }
 
-    /// "Claude Code session usage 42 percent", plus ", warning"/", critical" and ", out of date".
+    /// "session 42 percent, resets in 2 hours 10 minutes", plus ", warning"/", critical".
     public var accessibilityText: String {
-        var text = "\(agent.productName) \(kind.spokenName) usage \(roundedPercent) percent"
+        var text = "\(kind.spokenName) \(percent) percent"
+        if let resetSpoken { text += ", resets \(resetSpoken)" }
         switch level {
         case .normal: break
         case .warning: text += ", warning"
         case .critical: text += ", critical"
         }
-        if isStale { text += ", out of date" }
         return text
     }
 }
 
-/// Pure display rules for plan usage (menu bar meters and menu lines).
+/// One agent's line in the sidebar header: its windows (`claude  5h ━━━░ 42% 2h10m  wk …`), or
+/// only a message when there's no reading to show.
+public struct UsageLine: Sendable, Equatable, Identifiable {
+    public var agent: AgentKind
+    /// Session first. Empty for a message-only line (`.error`, or `.stale` with no windows).
+    public var windows: [UsageWindowDisplay]
+    /// The most constraining window (higher display percent; session wins ties); nil iff
+    /// `windows` is empty.
+    public var constraining: UsageWindowDisplay?
+    /// The latest poll failed but a reading is shown (`.stale`): drawn dimmed, never coloured.
+    public var isStale: Bool
+    /// The failure message for `.stale`/`.error`.
+    public var message: String?
+    /// Tooltip: the long form of every window, then the message with the reading's time.
+    public var help: String
+    /// One spoken summary for the whole line.
+    public var accessibilityText: String
+
+    public var id: AgentKind { agent }
+
+    public init(agent: AgentKind, windows: [UsageWindowDisplay], constraining: UsageWindowDisplay?,
+                isStale: Bool, message: String?, help: String, accessibilityText: String) {
+        self.agent = agent
+        self.windows = windows
+        self.constraining = constraining
+        self.isStale = isStale
+        self.message = message
+        self.help = help
+        self.accessibilityText = accessibilityText
+    }
+}
+
+/// Pure display rules for plan usage (the sidebar header's usage lines).
 ///
-/// Visibility: an agent's meter shows iff it has a snapshot with at least one window and its
+/// Visibility: an agent's windows show iff it has a snapshot with at least one window and its
 /// status isn't `.unavailable` or `.error` (`.ok`, `.stale`, or `.loading` with a snapshot).
-/// Its menu lines show iff the meter does (plus an error line for `.stale`), or the status is
-/// `.error`/`.stale` (the error line only). So `.unavailable`, and `.loading` with no snapshot,
-/// show nothing anywhere.
+/// Otherwise `.error` and `.stale` show a message-only line, and `.unavailable` or `.loading`
+/// with no snapshot show nothing at all.
 public enum UsageDisplay {
     /// Largest whole percent shown; a bigger (malformed) value reads as this.
     public static let maxWholePercent = 9999
@@ -95,49 +120,74 @@ public enum UsageDisplay {
         return Int(min(max(percent, 0), Double(maxWholePercent)).rounded())
     }
 
-    /// The meter for `usage` at `now`, or nil if hidden. Shows whichever window has the higher
-    /// `displayPercent(at:)` (a reset window counts 0); the session window wins a tie.
-    public static func meter(for usage: AgentUsage, now: Date) -> UsageMeter? {
-        guard let (kind, window) = mostConstraining(usage, now: now) else { return nil }
-        let percent = window.displayPercent(at: now)
-        return UsageMeter(agent: usage.agent, kind: kind, percent: percent,
-                          level: UsageLevel(percent: Double(wholePercent(percent))), isStale: isStale(usage.status))
+    /// The header lines to draw, in `agents` order (hidden agents left out).
+    public static func lines(_ usage: [AgentKind: AgentUsage], agents: [AgentKind], now: Date,
+                             calendar: Calendar = .current, locale: Locale = .current) -> [UsageLine] {
+        agents.compactMap { agent in
+            usage[agent].flatMap { line(for: $0, now: now, calendar: calendar, locale: locale) }
+        }
     }
 
-    /// The meters to draw, in `agents` order.
-    public static func meters(_ usage: [AgentKind: AgentUsage], agents: [AgentKind], now: Date) -> [UsageMeter] {
-        agents.compactMap { agent in usage[agent].flatMap { meter(for: $0, now: now) } }
-    }
-
-    /// The menu's disabled info lines for one agent: the usage line, plus an error line when the
-    /// latest poll failed. Empty when the agent is hidden.
-    ///
-    /// `Claude Code: 5h 42% (resets in 2h 10m) · Week 67% (resets Thu 9:00 AM)`
-    /// `Claude Code: Couldn't reach the usage server (as of 3:05 PM)` (stale)
-    /// `Codex: Couldn't read usage` (error, no snapshot)
-    public static func menuLines(for usage: AgentUsage, now: Date, calendar: Calendar = .current,
-                                 locale: Locale = .current) -> [String] {
+    /// The header line for `usage` at `now`, or nil if the agent is hidden.
+    public static func line(for usage: AgentUsage, now: Date, calendar: Calendar = .current,
+                            locale: Locale = .current) -> UsageLine? {
         let name = usage.agent.productName
-        var lines: [String] = []
-        if let windows = windows(usage), isShown(usage.status) {
-            let parts = windows.map { kind, window in
-                windowText(kind: kind, window: window, now: now, calendar: calendar, locale: locale)
-            }
-            lines.append("\(name): " + parts.joined(separator: " · "))
-        }
+        let message: String?
         switch usage.status {
-        case .stale(let message) where !lines.isEmpty:
-            let asOf = usage.snapshot.map { clockText($0.asOf, now: now, calendar: calendar, locale: locale) }
-            lines.append("\(name): \(message)" + (asOf.map { " (as of \($0))" } ?? ""))
-        case .error(let message), .stale(let message):
-            lines.append("\(name): \(message)")
-        case .unavailable, .loading, .ok:
-            break
+        case .stale(let text), .error(let text): message = text
+        case .unavailable, .loading, .ok: message = nil
         }
-        return lines
+
+        guard isShown(usage.status), let windows = windows(usage) else {
+            guard let message else { return nil }
+            return UsageLine(agent: usage.agent, windows: [], constraining: nil, isStale: false, message: message,
+                             help: "\(name): \(message)", accessibilityText: "\(name) usage unavailable: \(message)")
+        }
+
+        let displays = windows.map { kind, window in
+            windowDisplay(kind: kind, window: window, now: now, calendar: calendar, locale: locale)
+        }
+        // Session first, and only a strictly higher weekly replaces it.
+        let best = windows.indices.dropFirst().reduce(0) { best, next in
+            windows[next].1.displayPercent(at: now) > windows[best].1.displayPercent(at: now) ? next : best
+        }
+        let stale = message != nil
+
+        var help = "\(name): " + windows.map { kind, window in
+            windowText(kind: kind, window: window, now: now, calendar: calendar, locale: locale)
+        }.joined(separator: " · ")
+        if let message {
+            let asOf = usage.snapshot.map { clockText($0.asOf, now: now, calendar: calendar, locale: locale) }
+            help += "\n\(message)" + (asOf.map { " (as of \($0))" } ?? "")
+        }
+        var spoken = "\(name) usage: " + displays.map(\.accessibilityText).joined(separator: "; ")
+        if stale { spoken += "; out of date" }
+
+        return UsageLine(agent: usage.agent, windows: displays, constraining: displays[best], isStale: stale,
+                         message: message, help: help, accessibilityText: spoken)
     }
 
-    /// "5h 42% (resets in 2h 10m)", "Week 67% (resets Thu 9:00 AM)", "5h 0% (reset)", "Week 12%".
+    /// One window's display data at `now`.
+    public static func windowDisplay(kind: UsageWindowKind, window: UsageWindow, now: Date,
+                                     calendar: Calendar = .current, locale: Locale = .current) -> UsageWindowDisplay {
+        let percent = wholePercent(window.displayPercent(at: now))
+        let reset = window.resetsAt.flatMap { resetMoment($0, now: now, calendar: calendar) }
+        return UsageWindowDisplay(
+            kind: kind, percent: percent, level: UsageLevel(percent: Double(percent)),
+            resetText: reset.map { shortText($0, calendar: calendar, locale: locale) },
+            resetSpoken: reset.map { spokenText($0, calendar: calendar, locale: locale) })
+    }
+
+    /// The header's short reset: "2h10m" / "2h" / "45m" under a day away (minutes rounded up,
+    /// so never "0m"); else the weekday "Thu" within the next 6 calendar days (never today's
+    /// weekday, which would be ambiguous); else the date "Nov 30". Nil once `date` has passed.
+    public static func shortResetText(_ date: Date, now: Date, calendar: Calendar = .current,
+                                      locale: Locale = .current) -> String? {
+        resetMoment(date, now: now, calendar: calendar).map { shortText($0, calendar: calendar, locale: locale) }
+    }
+
+    /// "5h 42% (resets in 2h 10m)", "wk 67% (resets Thu 9:00 AM)", "5h 0% (reset)", "wk 12%":
+    /// the tooltip's long form of one window.
     public static func windowText(kind: UsageWindowKind, window: UsageWindow, now: Date,
                                   calendar: Calendar = .current, locale: Locale = .current) -> String {
         let percent = wholePercent(window.displayPercent(at: now))
@@ -147,33 +197,80 @@ public enum UsageDisplay {
         return head + " (resets \(resetText(resetsAt, now: now, calendar: calendar, locale: locale)))"
     }
 
-    /// Under a day away: "in 2h 10m" / "in 45m" (minutes rounded up, so never "in 0m");
-    /// else the clock time: "Thu 9:00 AM" within the next 6 days (never today's weekday, which
-    /// would be ambiguous), "Dec 2, 9:00 AM" beyond.
+    /// The tooltip's long reset: "in 2h 10m" / "in 45m" under a day away (or later the same
+    /// day, on a 25-hour DST day); else the clock time: "Thu 9:00 AM" within the next 6 days
+    /// (never today's weekday, which would be ambiguous), "Dec 2, 9:00 AM" beyond.
     public static func resetText(_ date: Date, now: Date, calendar: Calendar = .current,
                                  locale: Locale = .current) -> String {
-        let remaining = date.timeIntervalSince(now)
-        if remaining < 24 * 3600 {
-            let minutes = max(1, Int((remaining / 60).rounded(.up)))
+        var style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
+        switch resetMoment(date, now: now, calendar: calendar) ?? .minutes(1) {
+        case .minutes(let minutes):
             let hours = minutes / 60, rest = minutes % 60
             if hours == 0 { return "in \(rest)m" }
             return rest == 0 ? "in \(hours)h" : "in \(hours)h \(rest)m"
+        case .weekday(let rounded):
+            style = style.weekday(.abbreviated).hour().minute()
+            return rounded.formatted(style)
+        case .date(let rounded):
+            style = style.month(.abbreviated).day().hour().minute()
+            return rounded.formatted(style)
         }
-        // Reset timestamps drift by fractions of a second between readings: round to the minute.
-        let rounded = Date(timeIntervalSinceReferenceDate: (date.timeIntervalSinceReferenceDate / 60).rounded() * 60)
-        var style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
-        let days = calendar.dateComponents(
-            [.day], from: calendar.startOfDay(for: now), to: calendar.startOfDay(for: rounded)).day ?? 7
-        style = days < 7
-            ? style.weekday(.abbreviated).hour().minute()
-            : style.month(.abbreviated).day().hour().minute()
-        return rounded.formatted(style)
     }
 
     // MARK: Rules
 
-    private static func isStale(_ status: UsageStatus) -> Bool {
-        if case .stale = status { true } else { false }
+    /// How far away a reset is.
+    private enum ResetMoment {
+        /// Under a day away (or later today): whole minutes, rounded up (at least 1).
+        case minutes(Int)
+        /// 1...6 calendar days away (the date rounded to the minute).
+        case weekday(Date)
+        /// 7 or more calendar days away (rounded to the minute).
+        case date(Date)
+    }
+
+    /// Nil once `date` has passed (as `UsageWindow.hasReset`).
+    private static func resetMoment(_ date: Date, now: Date, calendar: Calendar) -> ResetMoment? {
+        let remaining = date.timeIntervalSince(now)
+        guard remaining > 0 else { return nil }
+        // Reset timestamps drift by fractions of a second between readings: round to the minute.
+        let rounded = Date(timeIntervalSinceReferenceDate: (date.timeIntervalSinceReferenceDate / 60).rounded() * 60)
+        // Start of day to start of day: DST-safe.
+        let days = calendar.dateComponents(
+            [.day], from: calendar.startOfDay(for: now), to: calendar.startOfDay(for: rounded)).day ?? 7
+        if remaining < 24 * 3600 || days < 1 {
+            return .minutes(max(1, Int((remaining / 60).rounded(.up))))
+        }
+        return days < 7 ? .weekday(rounded) : .date(rounded)
+    }
+
+    private static func shortText(_ moment: ResetMoment, calendar: Calendar, locale: Locale) -> String {
+        let style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
+        switch moment {
+        case .minutes(let minutes):
+            let hours = minutes / 60, rest = minutes % 60
+            if hours == 0 { return "\(rest)m" }
+            return rest == 0 ? "\(hours)h" : "\(hours)h\(rest)m"
+        case .weekday(let date):
+            return date.formatted(style.weekday(.abbreviated))
+        case .date(let date):
+            return date.formatted(style.month(.abbreviated).day())
+        }
+    }
+
+    private static func spokenText(_ moment: ResetMoment, calendar: Calendar, locale: Locale) -> String {
+        let style = Date.FormatStyle(locale: locale, calendar: calendar, timeZone: calendar.timeZone)
+        switch moment {
+        case .minutes(let minutes):
+            let hours = minutes / 60, rest = minutes % 60
+            func unit(_ n: Int, _ word: String) -> String { "\(n) \(word)\(n == 1 ? "" : "s")" }
+            let parts = [hours > 0 ? unit(hours, "hour") : nil, rest > 0 ? unit(rest, "minute") : nil]
+            return "in " + parts.compactMap { $0 }.joined(separator: " ")
+        case .weekday(let date):
+            return date.formatted(style.weekday(.wide))
+        case .date(let date):
+            return date.formatted(style.month(.wide).day())
+        }
     }
 
     /// Statuses whose snapshot (if any) is shown.
@@ -190,14 +287,6 @@ public enum UsageDisplay {
         let windows = [(UsageWindowKind.session, snapshot.session), (.weekly, snapshot.weekly)]
             .compactMap { kind, window in window.map { (kind, $0) } }
         return windows.isEmpty ? nil : windows
-    }
-
-    private static func mostConstraining(_ usage: AgentUsage, now: Date) -> (UsageWindowKind, UsageWindow)? {
-        guard isShown(usage.status), let windows = windows(usage) else { return nil }
-        // Session first, and only a strictly higher weekly replaces it.
-        return windows.dropFirst().reduce(windows[0]) { best, next in
-            next.1.displayPercent(at: now) > best.1.displayPercent(at: now) ? next : best
-        }
     }
 
     /// "3:05 PM" today, else "Nov 22, 3:05 PM".

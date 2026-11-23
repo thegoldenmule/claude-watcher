@@ -61,7 +61,7 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   release wins over a later failure; a build >= latest is up to date; no version = no claim).
   Outgoing HTTPS needs no entitlement: the app is unsandboxed (`network.client` is a sandbox
   entitlement) and the hardened runtime doesn't gate network access.
-- `Sources/ClaudeWatcherCore/Usage/`: plan usage (session ~5 h + weekly limits) for the menu bar.
+- `Sources/ClaudeWatcherCore/Usage/`: plan usage (session ~5 h + weekly limits) for the sidebar header.
   `UsageTypes` (shared contract: `UsageWindow` (`displayPercent(at:)` 0 once reset),
   `UsageSnapshot` session/weekly + `asOf`, `UsageLevel` 80/95, `UsageStatus`
   unavailable|loading|ok|stale|error, `UsageSource` protocol: `poll(now:)` -> usage + `nextPollIn`,
@@ -78,29 +78,33 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   awake, since dark wakes/Power Nap add up to more than 5 min over a night); a hold a backward clock step left
   more than the wake delay ahead is clamped to now + delay, never dropped); a loop sleeps at most
   1 h before polling (a backward wall-clock jump can't stall it). `UsageDisplay` (pure):
-  the meter = the window with the higher display percent (session wins ties); shown iff a
-  snapshot has a window and the status is ok/stale (or loading with a snapshot); menu lines iff
-  the meter shows, plus the error line for stale/error; `.unavailable` and snapshot-less
-  `.loading` show nothing. Menu text `Claude Code: 5h 42% (resets in 2h 10m) · Week 67% (resets
-  Thu 9:00 AM)` (relative < 24 h, else weekday within 6 days, else date; `(reset)` once passed);
-  stale adds `Claude Code: <message> (as of 3:05 PM)`. Percents display via `wholePercent`
-  (rounded, clamped 0...9999, NaN 0: a malformed value can't trap); the meter's bar fill
-  (`fillFraction`) follows that rounded value, so "0%" draws no fill.
+  `lines(_:agents:now:)` -> one `UsageLine` per agent: its windows (`UsageWindowDisplay`:
+  session first, rounded percent, level, short reset) iff a snapshot has a window and the status
+  is ok/stale (or loading with a snapshot); else a message-only line for error/stale;
+  `.unavailable` and snapshot-less `.loading` show nothing. `constraining` = the window with the
+  higher display percent (session wins ties). Short reset (`shortResetText`): `2h10m`/`2h`/`45m`
+  under a day (minutes rounded up, never `0m`; also later the same day on a 25 h DST day), else
+  weekday `Thu` 1-6 calendar days away (start of day to start of day), else `Nov 30`; nil once
+  passed (the window then reads 0%). Tooltip `help`: `Claude Code: 5h 42% (resets in 2h 10m) ·
+  wk 67% (resets Thu 9:00 AM)`, stale adds `<message> (as of 3:05 PM)`; one spoken
+  `accessibilityText` per line. Percents display via `wholePercent` (rounded, clamped 0...9999,
+  NaN 0: a malformed value can't trap); the bar fill (`fillFraction`) and level follow that
+  rounded value, so "0%" draws no fill.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
   `EdgeController`, `MenuModel`, `UpdateModel`, `UsageModel`), `ClaudeWatcherApp` (menu bar
   extra), `DemoMode`.
-  Menu layout (`ClaudeWatcherApp`): top level is the usage lines (one disabled line per visible
-  agent, plus its error line, then a divider), Pin Sidebar, Pause Edge Reveal, Settings, Quit,
+  Menu layout (`ClaudeWatcherApp`): top level is Pin Sidebar, Pause Edge Reveal, Settings, Quit,
   plus attention items only when needed (Install/Update Claude Code Hook, Approve Launch at Login,
-  `lastError`, Update Available); everything else is in the Settings submenu (incl. "Show Usage
-  in Menu Bar", before Launch at Login).
+  `lastError`, Update Available); everything else is in the Settings submenu. The status item
+  is the plain `sidebar.left` symbol (`moon.zzz` while paused); usage is in the sidebar header.
   `UsageModel`: owns the `UsageStore` (`ClaudeUsageSource` + `CodexUsageSource`; demo: canned
   sources), a minute clock (`now`, truncated to the minute and set only when it changes, so the
-  label image isn't redrawn per tick; also on wake and menu open; each tick `pollOverdue()`: a
-  TimelineView in a MenuBarExtra label isn't re-evaluated), the "Show Usage in Menu Bar" pref
-  (UserDefaults `menuBarUsage`, default on, not persisted in demo) and NSWorkspace sleep/wake
-  (`suspend`/`resume`). No App Nap activity: it would un-nap the whole app (session poll, panel
-  timers); deadlines are wall-clock and the minute tick/menu open catch up.
+  panel isn't re-rendered per tick; also on wake and whenever the panel shows (`EdgeController`'s
+  `onShow`); each `tick()` also `pollOverdue()`; no TimelineView, so nothing to pause while the
+  panel is hidden), `lines` (the header's `UsageLine`s, read by `EdgeController`'s `usage`
+  closure inside `body`, so usage and clock changes re-render the pane) and NSWorkspace
+  sleep/wake (`suspend`/`resume`). No App Nap activity: it would un-nap the whole app (session
+  poll, panel timers); deadlines are wall-clock and the minute tick/panel show catch up.
   `UpdateModel`: version line + update status + "Check for Updates" at the end of Settings;
   first check 10 s after launch, a 15 min wall-clock tick and every menu open check when due;
   the answer is cached in UserDefaults `updateCheckCache` (JSON `UpdateCache`). Links to the
@@ -115,7 +119,15 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   magentas are darker), a 3 pt left bar and an inverse-video ` waiting `/` stopped ` tag line;
   their glyphs keep their color under the selection; only waiting rows sort first (status
   flips must not reorder rows); the header counts `● N waiting  ■ N stopped` first, bold in those
-  colors; a session with running subagents or background shells gets a
+  colors, then (with or without sessions) one plan usage line per visible agent (`UsageLines`):
+  `claude  5h ━━━░ 42% 2h10m  wk ━━━━░ 67% Thu`, agent label in a fixed column (longest label
+  + 2), per window the kind, a `MeterBar` (the bar `ContextMeter` also draws; fill green, yellow
+  from 80%, red from 95%), the percent (warning/critical in that color) and reset, both in
+  reserves as wide as the widest value on any line, so lines with as many windows align;
+  `ViewThatFits` drops the resets, then all but the `constraining` window, then the bar
+  (`claude  67%`), never wrapping a window; stale lines are faint and uncoloured with a `stale`
+  marker (each step tried with it first, then without); a message-only line is a faint `claude
+  usage: <message>`; `.help` has the long form, one accessibility element per line; a session with running subagents or background shells gets a
   `▸ N agents · N shells running` line (either count alone when the other is 0) that toggles a
   tree under it (agents in pre-order, then the background shells as `shell · <description>`
   roots with a `$ <command>` line; prefixes from `SubagentTree.prefixes(depths:)`): sibling buttons in one
@@ -137,13 +149,7 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   width. It reports hover/drag to `EdgeController`'s `ResizeEdge`, which draws a 2 pt line inside
   the border; `tick()` ignores the drag (`isResizing`) and runs once it ends. The header's
   `[pin]`/`[pinned]` toggles `isPinned` (persisted as `sidebarPinned`, not in demo); pinning an
-  auto-shown panel keeps it on its screen. `StatusItemRenderer`: the MenuBarExtra label as one
-  NSImage: the symbol, then per visible agent `CC`/`CX`, a 16x7 pt pill and the percent (small
-  "%", "100%" width reserved, ~61 pt per meter). Template unless a fresh meter is
-  warning/critical (then labelColor with an orange/red fill); stale meters dimmed (0.4), never
-  coloured. No meters (or the pref off): the label is the plain `Image(systemName:)`.
-  `image(symbol:meters:)` is nonisolated on purpose: NSImage may run the drawing handler off
-  main, and a `@MainActor`-inferred handler would trap there.
+  auto-shown panel keeps it on its screen.
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `hooks/codex-watcher-hook.sh`: the Codex hook (bundled too; see "Codex hook" below).
   `CodexHookInstaller` registers it in `$CODEX_HOME/hooks.json` via `HookInstaller` with
@@ -188,9 +194,9 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   rows' agent trees; demo-1 has a nested one and a background shell, demo-3 and demo-codex one
   agent), `CW_DEMO_EMPTY=1`,
   `CW_DEMO_UPDATE=X.Y.Z|fail|checking` (menu update line; default "Up to Date"),
-  `CW_DEMO_USAGE=off|stale|error|none` (demo usage is Claude Code 5h 42% / week 67%, Codex
-  5h 18% / week 96% critical; `off` starts with the menu bar meters off, `stale` makes Claude
-  Code's reading stale, `error` fails it with no reading, `none` makes both unavailable).
+  `CW_DEMO_USAGE=stale|error|none` (header usage lines; demo usage is Claude Code 5h 42% /
+  week 67%, Codex 5h 18% / week 96% critical; `stale` makes Claude Code's reading stale,
+  `error` fails it with no reading, `none` makes both unavailable).
 - Theme overrides: `CW_GHOSTTY_CONFIG=<path>` (read only that config),
   `CW_GHOSTTY_THEME=<name or light:A,dark:B>` (preview a theme, ignoring config colors).
 - Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery` (Codex threads and TUIs:
@@ -537,15 +543,17 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   min; Keychain 60 s doubling to 30 min; expired or rejected token -> re-read credentials every
   60 s, but a 401/403 token (kept only as its SHA-256) isn't sent again until it changes or 5 min
   pass. A clock going backwards re-anchors these waits at `now` (never longer than set).
-  `URLError.cancelled` is a network error unless the poll's task was cancelled. Not logged in -> `.unavailable`, snapshot cleared (meter hidden); other failures ->
+  `URLError.cancelled` is a network error unless the poll's task was cancelled. Not logged in -> `.unavailable`, snapshot cleared (usage line hidden); other failures ->
   `.stale` with a snapshot, `.error` without.
 - Usage known gaps (reviewed, accepted): Claude: a usage key present with a renamed inner schema
-  parses as "no windows" (meter hidden, no error line); a `.credentials.json` read error counts as
-  no file; after unlocking a locked keychain the meter can take up to 30 min (Keychain backoff)
+  parses as "no windows" (usage line hidden, no error); a `.credentials.json` read error counts as
+  no file; after unlocking a locked keychain the usage line can take up to 30 min (Keychain backoff)
   to return; with `CLAUDE_CONFIG_DIR=~/.claude` plus a leftover plain item of another account,
   freshest-token-wins can switch accounts; `CLAUDE_SECURESTORAGE_CONFIG_DIR` (overrides the
   suffixed service name) isn't handled. Codex: in-place rollout rewrites aren't detected (never
   seen); the newest `state_N.sqlite` is trusted even if half-migrated; only `limit_id`
-  "codex"/null is read; a window without `resets_at` never shows as reset. UI: menu "resets in"
-  can read up to a minute long (minute-truncated clock); the coloured (warning/critical) status
-  item draws in `labelColor`, unverified on macOS 26's wallpaper-tinted menu bar.
+  "codex"/null is read; a window without `resets_at` never shows as reset. UI: the header's
+  relative resets can read up to a minute long (minute-truncated clock); at the default panel
+  width (38 columns) two windows don't fit with their resets, so those show only when the panel
+  is widened (always in the tooltip); a stale line's marker can make its bars shorter than the
+  other lines'.

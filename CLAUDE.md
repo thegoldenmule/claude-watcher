@@ -61,11 +61,37 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   release wins over a later failure; a build >= latest is up to date; no version = no claim).
   Outgoing HTTPS needs no entitlement: the app is unsandboxed (`network.client` is a sandbox
   entitlement) and the hardened runtime doesn't gate network access.
+- `Sources/ClaudeWatcherCore/Usage/`: plan usage (session ~5 h + weekly limits) for the menu bar.
+  `UsageTypes` (shared contract: `UsageWindow` (`displayPercent(at:)` 0 once reset),
+  `UsageSnapshot` session/weekly + `asOf`, `UsageLevel` 80/95, `UsageStatus`
+  unavailable|loading|ok|stale|error, `UsageSource` protocol: `poll(now:)` -> usage + `nextPollIn`,
+  each source keeps its own backoff), the sources `ClaudeUsageSource` and `CodexUsageSource` (see
+  "Claude usage" and Codex "Usage" below; their inits do no I/O), `UsageStore` (`@MainActor
+  @Observable`): one loop per source (poll, publish, sleep `nextPollIn`, floored at 5 s),
+  wall-clock deadlines; never two polls of a source at once (a restarted loop awaits the old one;
+  a superseded loop's result is dropped; the poll runs unstructured so stop/suspend don't cancel
+  it under the source); `suspend()`/`resume()` (each source polls at its deadline but no sooner
+  than 5 s after resume), `pollOverdue()` (deadline > 2 s past: poll now). `UsageDisplay` (pure):
+  the meter = the window with the higher display percent (session wins ties); shown iff a
+  snapshot has a window and the status is ok/stale (or loading with a snapshot); menu lines iff
+  the meter shows, plus the error line for stale/error; `.unavailable` and snapshot-less
+  `.loading` show nothing. Menu text `Claude Code: 5h 42% (resets in 2h 10m) · Week 67% (resets
+  Thu 9:00 AM)` (relative < 24 h, else weekday within 6 days, else date; `(reset)` once passed);
+  stale adds `Claude Code: <message> (as of 3:05 PM)`.
 - `Sources/ClaudeWatcher/App/`: `AppDelegate` (owns the store, the single `RoutingFocuser`,
-  `EdgeController`, `MenuModel`, `UpdateModel`), `ClaudeWatcherApp` (menu bar extra), `DemoMode`.
-  Menu layout (`ClaudeWatcherApp`): top level is Pin Sidebar, Pause Edge Reveal, Settings, Quit,
+  `EdgeController`, `MenuModel`, `UpdateModel`, `UsageModel`), `ClaudeWatcherApp` (menu bar
+  extra), `DemoMode`.
+  Menu layout (`ClaudeWatcherApp`): top level is the usage lines (one disabled line per visible
+  agent, plus its error line, then a divider), Pin Sidebar, Pause Edge Reveal, Settings, Quit,
   plus attention items only when needed (Install/Update Claude Code Hook, Approve Launch at Login,
-  `lastError`, Update Available); everything else is in the Settings submenu.
+  `lastError`, Update Available); everything else is in the Settings submenu (incl. "Show Usage
+  in Menu Bar", before Launch at Login).
+  `UsageModel`: owns the `UsageStore` (`ClaudeUsageSource` + `CodexUsageSource`; demo: canned
+  sources), a minute clock (`now`, also on wake and menu open; each tick `pollOverdue()`: a
+  TimelineView in a MenuBarExtra label isn't re-evaluated), the "Show Usage in Menu Bar" pref
+  (UserDefaults `menuBarUsage`, default on, not persisted in demo) and NSWorkspace sleep/wake
+  (`suspend`/`resume`). No App Nap activity: it would un-nap the whole app (session poll, panel
+  timers); deadlines are wall-clock and the minute tick/menu open catch up.
   `UpdateModel`: version line + update status + "Check for Updates" at the end of Settings;
   first check 10 s after launch, a 15 min wall-clock tick and every menu open check when due;
   the answer is cached in UserDefaults `updateCheckCache` (JSON `UpdateCache`). Links to the
@@ -102,7 +128,11 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   width. It reports hover/drag to `EdgeController`'s `ResizeEdge`, which draws a 2 pt line inside
   the border; `tick()` ignores the drag (`isResizing`) and runs once it ends. The header's
   `[pin]`/`[pinned]` toggles `isPinned` (persisted as `sidebarPinned`, not in demo); pinning an
-  auto-shown panel keeps it on its screen.
+  auto-shown panel keeps it on its screen. `StatusItemRenderer`: the MenuBarExtra label as one
+  NSImage: the symbol, then per visible agent `CC`/`CX`, a 16x7 pt pill and the percent (small
+  "%", "100%" width reserved, ~61 pt per meter). Template unless a fresh meter is
+  warning/critical (then labelColor with an orange/red fill); stale meters dimmed (0.4), never
+  coloured. No meters (or the pref off): the label is the plain `Image(systemName:)`.
 - `hooks/claude-watcher-hook.sh`: the Claude Code hook; bundled into Contents/Resources.
 - `hooks/codex-watcher-hook.sh`: the Codex hook (bundled too; see "Codex hook" below).
   `CodexHookInstaller` registers it in `$CODEX_HOME/hooks.json` via `HookInstaller` with
@@ -146,13 +176,17 @@ macOS 26, Swift 6 language mode, SwiftPM (no Xcode project).
   `CW_DEMO_HOVER=<id>`, `CW_DEMO_PENDING=<id>`, `CW_DEMO_COLLAPSED=<id>[,<id>…]` (collapse those
   rows' agent trees; demo-1 has a nested one and a background shell, demo-3 and demo-codex one
   agent), `CW_DEMO_EMPTY=1`,
-  `CW_DEMO_UPDATE=X.Y.Z|fail|checking` (menu update line; default "Up to Date").
+  `CW_DEMO_UPDATE=X.Y.Z|fail|checking` (menu update line; default "Up to Date"),
+  `CW_DEMO_USAGE=off|stale|error|none` (demo usage is Claude Code 5h 42% / week 67%, Codex
+  5h 18% / week 96% critical; `off` starts with the menu bar meters off, `stale` makes Claude
+  Code's reading stale, `error` fails it with no reading, `none` makes both unavailable).
 - Theme overrides: `CW_GHOSTTY_CONFIG=<path>` (read only that config),
   `CW_GHOSTTY_THEME=<name or light:A,dark:B>` (preview a theme, ignoring config colors).
 - Live discovery dump: `CW_LIVE=1 swift test --filter liveDiscovery` (Codex threads and TUIs:
   `--filter liveCodexDiscovery`). Live update check against
   GitHub (repo's Info.plist version vs `releases/latest`, plus an ETag revalidation):
-  `CW_LIVE=1 swift test --filter liveUpdateCheck`.
+  `CW_LIVE=1 swift test --filter liveUpdateCheck`. Live usage polls (one real poll each, no
+  token printed): `--filter liveClaudeUsage`, `--filter liveCodexUsage`.
 - Logs: `/usr/bin/log stream --predicate 'subsystem == "com.thegoldenmule.ClaudeWatcher"'`
   (in zsh, bare `log` is a builtin). Focus lines show the resolver and the hook id.
 - Signing (dev): `$CODESIGN_IDENTITY`, else first "Apple Development" identity, else ad-hoc
@@ -449,3 +483,33 @@ releases take plain `MAJOR.MINOR.PATCH` (dry runs also accept `X.Y.Z-suffix`).
   - Terminal side: Codex sets OSC 0 titles (`<spinner> <thread> | <project>`), queries OSC
     10/11 once at startup (never sets 11/111), never sends OSC 7; also OSC 7501 status for
     supporting terminals. Focus/highlight need nothing Codex-specific (pid + tty).
+  - Usage (`CodexUsageSource`, `Usage/CodexUsage*.swift`): plan limits from rollouts' `token_count`
+    `payload.rate_limits` (`limit_id` "codex"/null only; `primary`/`secondary` `{used_percent,
+    window_minutes, resets_at}` epoch s, classified by length: < 3 days = session, else weekly; seen
+    in 0.169: only `primary` 10080 min, `secondary` null; `rate_limits` may be null). `rate_limits`
+    follows `info`, so the 512-byte prefix rule only gates the type; the line is decoded whole. Newest
+    reading by event timestamp across the 3 most recently updated threads (`updated_at_ms`, any kind;
+    up to 10 while none has one): not by date dir, long threads write to old ones. DB opened read-only
+    per pass and closed; files cached by (inode, size, mtime), backward chunked scan (≤ 8 MB), grown
+    files scan only the new bytes; work on a private queue. Never rolls back to an older reading.
+    No home/DB/reading = `.unavailable` (5 min); read error after a reading = `.stale`; else 30 s.
+- Claude usage (`ClaudeUsageSource`, `Usage/Claude*.swift`): `GET
+  https://api.anthropic.com/api/oauth/usage` with Claude Code's own OAuth access token
+  (`Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, UA `ClaudeWatcher/<ver>`,
+  ephemeral session, no cache or cookies). The token is read on every poll, never refreshed (that
+  would rotate Claude Code's refresh token and log it out), never logged; only the access token
+  and `expiresAt` (ms) are decoded. Source: `/usr/bin/security find-generic-password -s <service>
+  -w` (in the item's ACL, so no prompt; hex output when the JSON isn't printable; exit 44 = not
+  found; private queue, killed after 15 s), then `<claude home>/.credentials.json`. Service
+  (Claude Code 2.1.330): `Claude Code-credentials`, plus `-<sha256(raw CLAUDE_CONFIG_DIR,
+  NFC).hex.prefix(8)>` whenever that variable is set (even to `~/.claude`). We only have the
+  resolved path, so we hash it with and without a trailing `/`: suffixed first for a non-default
+  home, plain first for the default; a `security` failure stops the search. Response: flat
+  `five_hour`/`seven_day` (`utilization`, `resets_at`) or the `limits` array (`weekly_all`;
+  session = active entry whose kind or group contains `session`/`five_hour`); lenient; ISO dates
+  with any number of fractional digits. Schedule (`nextPollIn`): 5 min; 429 -> max(`retry-after`
+  capped at 1 h, 5 min doubling to 30 min), no request until then; network 30 s doubling to 5
+  min; Keychain 60 s doubling to 30 min; expired or rejected token -> re-read credentials every
+  60 s, but a 401/403 token (kept only as its SHA-256) isn't sent again until it changes or 5 min
+  pass. Not logged in -> `.unavailable`, snapshot cleared (meter hidden); other failures ->
+  `.stale` with a snapshot, `.error` without.
